@@ -76,6 +76,8 @@ import kcore.threads.{
     ThreadState,
     frame_slot,
     live_threads,
+    lock_raise,
+    lock_recompute,
     ready_above,
     ready_peek,
     ready_pop,
@@ -296,9 +298,10 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// for one when none is ready, and give way to its process's section
 /// (`section_displaces`).
 ///
-/// Nothing runnable is one of two things. With a bound IRQ line or an armed
-/// Timer (`has_external_wake_source`), readiness can still arrive from outside
-/// the set of runnable threads, so the kernel waits for it in the idle path.
+/// Nothing runnable is one of two things. With a bound IRQ line, an armed
+/// Timer or a thread parked with a deadline (`has_external_wake_source`),
+/// readiness can still arrive from outside the set of runnable threads, so the
+/// kernel waits for it in the idle path.
 /// With neither, every thread is blocked on something no thread can now
 /// deliver: a deadlock, which stops the machine. No process is ended, since
 /// which thread blocked last is timing.
@@ -330,8 +333,8 @@ func take_next() unsafe -> ThreadIndex {
 /// the queue and a wake in progress is never mistaken for none.
 ///
 /// No preemption point: this loop is delivery, and the bounded scans beside it
-/// (`has_external_wake_source`) are `MAX_INTERRUPTS` + `MAX_TIMERS` iterations
-/// of O(1) work.
+/// (`has_external_wake_source`) are a walk of the Interrupt, Timer and thread
+/// slabs, of O(1) work per slot.
 func idle_until_runnable() unsafe {
     while READY_BITS == 0 {
         idle_once()
@@ -563,66 +566,15 @@ func ready_sibling(t: ThreadIndex, p: Int) -> Bool {
 //
 // No wait closes a cycle: the wait's walk refuses one that would come back to
 // the caller, and one that would pass `LOCK_CHAIN_MAX` holders, as the
-// `LockChain` fault. So every walk below, which follows the chain from a
-// thread to the holder it is parked behind, ends. A raise stops within
-// `LOCK_CHAIN_MAX` holders, its wait's own walk; a lowering follows the chain
-// as far as levels change, which can be further, since the bound is on each
-// wait's walk and not on a chain's length.
-
-/// Raise thread `holder`, and each holder along the chain it is parked in, to
-/// at least `level`.
-///
-/// It stops at the first thread already at or above `level`: a holder is
-/// always at least the level of every thread parked behind it, so the rest of
-/// the chain is too.
-public(package) func lock_raise(holder: ThreadIndex, level: UInt8) {
-    var h = holder
-    while threads().at(h).level < level {
-        set_level(h, level)
-        h = borrow var thread = threads().at(h) {
-            if thread.lock_holder == 0 {
-                return
-            }
-            ThreadIndex(thread.lock_holder - 1)
-        }
-    }
-}
-
-/// The level thread `t` is owed: the highest of its base level and the level
-/// of every thread parked on a lock naming it as the holder. A scan of the
-/// thread slab, since the kernel keeps no list of a holder's waiters.
-func lock_owed(t: ThreadIndex) -> UInt8 {
-    var level = threads().at(t).base_level
-    var w: Int = 0
-    while w < threads().capacity() {
-        borrow var waiter = threads().at(ThreadIndex(w)) {
-            if waiter.lock_holder == t + 1 && waiter.level > level {
-                level = waiter.level
-            }
-        }
-        w = w + 1
-    }
-    level
-}
-
-/// Bring thread `t`'s level to what it is owed, and so on along the chain it
-/// is parked in, until a thread's level does not change.
-func lock_recompute(t: ThreadIndex) {
-    var h = t
-    while {
-        let owed = lock_owed(h)
-        if owed == threads().at(h).level {
-            return
-        }
-        set_level(h, owed)
-        h = borrow var thread = threads().at(h) {
-            if thread.lock_holder == 0 {
-                return
-            }
-            ThreadIndex(thread.lock_holder - 1)
-        }
-    }
-}
+// `LockChain` fault. So every walk that follows the chain from a thread to
+// the holder it is parked behind ends. A raise stops within `LOCK_CHAIN_MAX`
+// holders, its wait's own walk; a lowering follows the chain as far as levels
+// change, which can be further, since the bound is on each wait's walk and
+// not on a chain's length.
+//
+// The walks that move levels (`lock_raise`, `lock_recompute`) are in
+// `threads`, below the interrupt path: a lock wait that ends at its deadline
+// is answered from the timer's interrupt, and its holder is lowered there.
 
 /// Answer thread `w`, parked on a lock, with `result`, and ready it.
 ///
@@ -784,7 +736,10 @@ func invalidate_thread(t: ThreadIndex, p: Int) unsafe {
                             joiners: 0, link: 0, wait_buf: 0, call_pipe: 0,
                             call_claim: 0, call_src: 0, call_len: 0,
                             latency_irq: 0, latency_from: 0, lock_at: 0,
-                            lock_holder: 0, refs: refs,
+                            lock_holder: 0, wait_word: 0,
+                            wait_clock: false, wake_latched: false,
+                            park_wakeable: false, park_deadline: UInt64.max,
+                            refs: refs,
                             generation: thread.generation)
     }
 }

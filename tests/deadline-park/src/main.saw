@@ -1,0 +1,108 @@
+// A bare park's deadline and its latch (spec §2.6, §7), at the C altitude:
+// the wait word is this program's own memory, and the Clock's word is what
+// registers it. The image holds this one thread and arms no tick, no Timer and
+// no line, so a park's own deadline is the only thing that can wake the
+// machine. Each line is one park:
+//
+//   deadline   registered with a Monotonic Clock, a park until `DELAY_NS`
+//              past the clock's reading answers `TimedOut`, and the clock
+//              read after it is at or past that instant. The kernel idles
+//              until the deadline rather than reporting a deadlock.
+//   past       a word of 1, an instant already passed, answers `TimedOut`
+//              at once
+//   latched    the thread wakes itself, which latches, and a park whose
+//              deadline has passed answers `Woken`: the latch is asked before
+//              the deadline
+//   no clock   registered again with no Clock, a park whose word is 0 and
+//              then one whose word is `UInt64.max`, each after a wake of
+//              itself, answer `Woken`. Neither word names an instant, so
+//              neither needs a Clock
+//
+// No line says how long a park took, only that its deadline passed.
+
+import sos.{System, ClockType, SosStatus, sos_system_clock_get,
+            sos_clock_now, sos_wait_word, sos_park, sos_thread_wake,
+            sos_thread_id}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+/// How far past the clock's reading the first park's deadline is.
+static DELAY_NS: UInt64 = 20_000_000
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The wait word.
+unsafe static var WORD: UInt64 = 0
+
+func word() unsafe -> UInt {
+    ((&var WORD) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading through `clock`.
+func now(clock: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(clock, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinepark: no process handle: {}", error)
+        return
+    }
+    var clock: UInt = NONE
+    if sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var clock) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS deadlinepark: no clock")
+        return
+    }
+    print("SOS deadlinepark: register: {}", named(sos_wait_word(word(), clock)))
+
+    let deadline = now(clock) + DELAY_NS
+    WORD = deadline
+    let timed = sos_park()
+    print("SOS deadlinepark: deadline: {}, at or past it: {}", named(timed),
+          now(clock) >= deadline)
+
+    WORD = 1
+    print("SOS deadlinepark: past: {}", named(sos_park()))
+
+    let me = sos_thread_id()
+    print("SOS deadlinepark: wake itself: {}", named(sos_thread_wake(me)))
+    print("SOS deadlinepark: latched: {}", named(sos_park()))
+
+    print("SOS deadlinepark: no clock: {}",
+          named(sos_wait_word(word(), NONE)))
+    WORD = 0
+    let _ = sos_thread_wake(me)
+    print("SOS deadlinepark: no clock, word 0: {}", named(sos_park()))
+    WORD = NEVER
+    let _ = sos_thread_wake(me)
+    print("SOS deadlinepark: no clock, word max: {}", named(sos_park()))
+
+    print("SOS deadlinepark: done")
+    let _ = proc.exit(EXIT_OK)
+}

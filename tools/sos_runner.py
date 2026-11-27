@@ -262,6 +262,15 @@ SECTION_OTHER_PKG = os.path.join(TESTS_DIR, "section-other")
 LOCK_ROOT_PKG = os.path.join(TESTS_DIR, "lock-root")
 LOCK_CHILD_PKG = os.path.join(TESTS_DIR, "lock-child")
 LOCK_RAW_PKG = os.path.join(TESTS_DIR, "lock-raw")
+WAIT_WORD_ROOT_PKG = os.path.join(TESTS_DIR, "wait-word-root")
+WAIT_WORD_CHILD_PKG = os.path.join(TESTS_DIR, "wait-word-child")
+DEADLINE_WAITER_PKG = os.path.join(TESTS_DIR, "deadline-waiter")
+DEADLINE_JOIN_PKG = os.path.join(TESTS_DIR, "deadline-join")
+DEADLINE_LOCK_PKG = os.path.join(TESTS_DIR, "deadline-lock")
+DEADLINE_PARK_PKG = os.path.join(TESTS_DIR, "deadline-park")
+THREAD_WAKE_PKG = os.path.join(TESTS_DIR, "thread-wake")
+PARK_RECORD_PKG = os.path.join(TESTS_DIR, "park-record")
+DEADLINE_TIMER_PKG = os.path.join(TESTS_DIR, "deadline-timer")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -4065,6 +4074,229 @@ TEST_CASES = [
         ],
         "expect_clean_exit": True,
     },
+    # Deadlines and wakes on parks (spec §2.6, §7). Every image arms no tick,
+    # so every switch is one a thread makes, and each order is made by
+    # construction. A deadline's line says only that the clock read after
+    # the park is at or past the deadline, never how long the park took.
+    {
+        # The wait word's refusals and the Clock's rule: `wait-word-child`
+        # once per round, `tests/wait-word-child` says what each does. A
+        # status word is `Exited` (1) << 16 with the code, or `Faulted` (2)
+        # << 16 with the reason: `BadHandle` 1, `AccessDenied` 3, `BadArg` 9,
+        # `BadAlign` 10, `BadBuffer` 11.
+        "name": "wait_word_refusals",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WAIT_WORD_ROOT_PKG,
+        "children": [WAIT_WORD_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS waitword: unaligned: a word four bytes past a doubleword",
+            "SOS: process fault: buffer is not word-aligned process={one}",
+            "SOS waitwords: unaligned ended status=131082",
+            "SOS waitword: no row: a word in no row of this process",
+            "SOS: process fault: buffer is outside the process's memory "
+            "process={one}",
+            "SOS waitwords: no row ended status=131083",
+            "SOS waitword: not a clock: the Process handle as the Clock",
+            "SOS: process fault: bad handle process={one}",
+            "SOS waitwords: not a clock ended status=131073",
+            "SOS waitword: no handle: a released Clock word",
+            "SOS: process fault: bad handle process={one}",
+            "SOS waitwords: no handle ended status=131073",
+            "SOS waitword: no read: a Clock without Read",
+            "SOS: process fault: access denied process={one}",
+            "SOS waitwords: no read ended status=131075",
+            "SOS waitword: clock first: a released Clock, an odd word",
+            "SOS: process fault: bad handle process={one}",
+            "SOS waitwords: clock first ended status=131073",
+            "SOS waitword: unregister: Ok",
+            "SOS waitwords: unregister ended status=65536",
+            "SOS waitword: foreign wake: the launcher's thread",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS waitwords: foreign wake ended status=131081",
+            "SOS waitword: no clock: register Ok",
+            "SOS: process fault: access denied process={one}",
+            "SOS waitwords: no clock ended status=131075",
+            "SOS waitword: clock: register Ok",
+            "SOS waitword: clock: park TimedOut",
+            "SOS waitwords: clock ended status=65536",
+            "SOS waitword: latched: register Ok, wake itself Ok",
+            "SOS: process fault: access denied process={one}",
+            "SOS waitwords: latched ended status=131075",
+            "SOS waitwords: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `Waiter.Wait`'s deadline: `TimedOut` at a deadline the kernel
+        # expires and at one already passed, nothing consumed by the early
+        # end, and readiness before the deadline. `tests/deadline-waiter`
+        # says how each is made.
+        "name": "deadline_waiter",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_WAITER_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinewait: register: Ok",
+            "SOS deadlinewait: deadline: TimedOut, at or past it: true",
+            "SOS deadlinewait: consumed: Ok key=1 bits=7",
+            "SOS deadlinewait: past: TimedOut",
+            "SOS deadlinewait: ready: Ok key=1 bits=5",
+            "SOS deadlinewait: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `Join`'s deadline, of a thread parked plain on an Event:
+        # `TimedOut` with the target untouched, and an exited target's code
+        # before the deadline. `tests/deadline-join` says how each is made.
+        "name": "deadline_join",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_JOIN_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinejoin: register: Ok",
+            "SOS deadlinejoin: T parks on its Event",
+            "SOS deadlinejoin: deadline: TimedOut, at or past it: true",
+            "SOS deadlinejoin: past: TimedOut",
+            "SOS deadlinejoin: T's wait: Ok",
+            "SOS deadlinejoin: code: Ok code=7",
+            "SOS deadlinejoin: exited: Ok code=7",
+            "SOS deadlinejoin: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A lock wait's early end lowers its holder again: L's line comes
+        # before the main thread's while H's wait raises L, and after it once
+        # the wake, and then the deadline, ended H's wait. A raised L that
+        # wakes H, or is running when H's deadline comes, is lowered below H
+        # and gives H the processor at once. A latch answers a lock wait
+        # `Woken`, and a free lock answers `Ok` whatever the word or the
+        # latch. `tests/deadline-lock` says how each is made.
+        "name": "deadline_lock",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_LOCK_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinelock: L runs",
+            "SOS deadlinelock: raised: the main thread after the signal",
+            "SOS deadlinelock: H's first wait: Woken",
+            "SOS deadlinelock: wake H: Ok",
+            "SOS deadlinelock: lowered after the wake: the main thread "
+            "after the signal",
+            "SOS deadlinelock: L runs",
+            "SOS deadlinelock: H's second wait: TimedOut, at or past its "
+            "deadline: true",
+            "SOS deadlinelock: lowered after the timeout: the main thread "
+            "after the signal",
+            "SOS deadlinelock: L runs",
+            "SOS deadlinelock: H's third wait: Woken",
+            "SOS deadlinelock: L woke H: Ok",
+            "SOS deadlinelock: H's fourth wait: TimedOut, at or past its "
+            "deadline: true",
+            "SOS deadlinelock: L saw H's line",
+            "SOS deadlinelock: H's latched wait: Woken",
+            "SOS deadlinelock: H's wait for a free lock, passed word: Ok",
+            "SOS deadlinelock: H's wait for a free lock, latched wake: Ok",
+            "SOS deadlinelock: H's park after them: Woken",
+            "SOS deadlinelock: L gives the lock: Ok",
+            "SOS deadlinelock: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A bare park, alone in its image: its own deadline is the only wake
+        # source, so the kernel idles until it rather than reporting a
+        # deadlock. The latch is asked before a passed deadline, and a word
+        # of 0 or `UInt64.max` needs no Clock. `tests/deadline-park` says how
+        # each is made.
+        "name": "deadline_park",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_PARK_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinepark: register: Ok",
+            "SOS deadlinepark: deadline: TimedOut, at or past it: true",
+            "SOS deadlinepark: past: TimedOut",
+            "SOS deadlinepark: wake itself: Ok",
+            "SOS deadlinepark: latched: Woken",
+            "SOS deadlinepark: no clock: Ok",
+            "SOS deadlinepark: no clock, word 0: Woken",
+            "SOS deadlinepark: no clock, word max: Woken",
+            "SOS deadlinepark: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # `THREAD_WAKE_OP`: a wakeable park ended `Woken`, a wake latched
+        # while its thread ran and while it was parked plain, a plain wait
+        # that neither reads nor clears a latch set before it, a latch
+        # answering a `Wait` and a `Join` at once, a wake of an exited thread
+        # `Revoked`, a stale ID waking nothing in its slot's next thread, and
+        # a latch left by a thread that exited gone from that thread.
+        # `tests/thread-wake` says how each is made.
+        "name": "thread_wake",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_WAKE_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS threadwake: main wakes T in its wait: Ok",
+            "SOS threadwake: T's wakeable wait: Woken",
+            "SOS threadwake: main wakes T while it runs: Ok",
+            "SOS threadwake: T's park after a wake while it ran: Woken",
+            "SOS threadwake: main wakes T in its plain wait: Ok",
+            "SOS threadwake: T's plain wait: Ok bits=9",
+            "SOS threadwake: T's park after its plain wait: Woken",
+            "SOS threadwake: T's plain wait after a wake of itself: Ok "
+            "bits=3",
+            "SOS threadwake: T's park after that wait: Woken",
+            "SOS threadwake: T's wakeable wait after a wake of itself: Woken",
+            "SOS threadwake: T's wakeable join after a wake of itself: Woken",
+            "SOS threadwake: T exited code=5",
+            "SOS threadwake: main wakes the exited T: Revoked",
+            "SOS threadwake: main wakes the freed T: Revoked",
+            "SOS threadwake: main wakes T's ID with U in its slot: Revoked",
+            "SOS threadwake: U, in T's slot: true, parks: TimedOut",
+            "SOS threadwake: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A park's record lasts only as long as the park: a wakeable wait a
+        # delivery answered leaves nothing that makes the plain call after it
+        # wakeable, so a wake made while the call is parked latches, the call
+        # is answered by its reply, and the next park answers `Woken`.
+        # `tests/park-record` says how it is made.
+        "name": "park_record_cleared",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PARK_RECORD_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS parkrecord: the main thread's wakeable wait: Ok",
+            "SOS parkrecord: S wakes the main thread in its call: Ok",
+            "SOS parkrecord: the main thread's call: Ok",
+            "SOS parkrecord: the main thread's park after the call: Woken",
+            "SOS parkrecord: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Timer and a parked deadline at or after it: the wait answers with
+        # the Timer's record, readiness first at the op and the Timers
+        # expired first at a fire. `tests/deadline-timer` says how both are
+        # brought to one fire, and why that is not certain.
+        "name": "deadline_timer_first",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_TIMER_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinetimer: register: Ok",
+            "SOS deadlinetimer: wait: Ok key=5 fired=true",
+            "SOS deadlinetimer: done",
+        ],
+        "expect_clean_exit": True,
+    },
     {
         # A band map is the whole register: on a 64-bit profile, the simple
         # map with bit 32 set is the `BadArg` fault, not the simple map. A
@@ -7767,7 +7999,7 @@ TEST_CASES = [
     },
     {
         # A give refused for capacity hands an Interrupt back usable, as
-        # `give_waitable_returns` does a Waiter. `gave 12` is the child's handle
+        # `give_waitable_returns` does a Waiter. `gave 16` is the child's handle
         # budget. The refusal released nothing, so the returned Interrupt is
         # the live one: it attaches, and releasing it frees the line.
         "name": "give_interrupt_returns",
@@ -7776,7 +8008,7 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS irqreturns: gave 12 siblings then refused: this "
+                       "SOS irqreturns: gave 16 siblings then refused: this "
                        "process is at its quota",
                        "SOS irqreturns: the Interrupt give was refused: this "
                        "process is at its quota",
@@ -8051,7 +8283,7 @@ TEST_CASES = [
         "expect_out": ["{banner}"] + [
             line
             for kind, own in ((0, 4), (1, 4), (2, 2), (3, 4), (4, 4),
-                              (5, 2), (7, 12), (8, 2))
+                              (5, 2), (7, 16), (8, 2))
             for line in (
                 f"SOS quotalauncher: kind {kind} at its own {own}: taken",
                 f"SOS quotalauncher: setting kind {kind} one above its own",
@@ -8132,7 +8364,7 @@ TEST_CASES = [
         "root_pkg": QUOTA_SET_HANDLES_PKG,
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
-                       "SOS quotahandles: child handle row limit=12 used=0",
+                       "SOS quotahandles: child handle row limit=16 used=0",
                        "SOS quotahandles: limit 32, the body's entries, "
                        "taken",
                        "SOS quotahandles: limit 33: no room for what was "
@@ -8151,7 +8383,7 @@ TEST_CASES = [
         "limits": {"slabs": {"handle-blocks": 1}},
         "expect_out": ["{banner}",
                        "SOS: slab area kind={thirteen} slots={one}",
-                       "SOS quotahandles: child handle row limit=12 used=0",
+                       "SOS quotahandles: child handle row limit=16 used=0",
                        "SOS quotahandles: limit 32, the body's entries, "
                        "taken",
                        "SOS quotahandles: limit 33: taken",
@@ -8192,7 +8424,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS blocksshort: A limit 64: no room for what was "
                        "asked",
-                       "SOS blocksshort: A's row still reads limit=12",
+                       "SOS blocksshort: A's row still reads limit=16",
                        "SOS blocksshort: B limit 48 taken",
                        "SOS blocksshort: done"],
         "expect_clean_exit": True,
@@ -8209,7 +8441,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS blockslongest: limit 129: no room for what was "
                        "asked",
-                       "SOS blockslongest: the row still reads limit=12",
+                       "SOS blockslongest: the row still reads limit=16",
                        "SOS blockslongest: limit 128 taken, reads limit=128",
                        "SOS blocksfill: held=128 limit=128, the last "
                        "printed=1, then over its quota",
@@ -8375,7 +8607,7 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG, CHILD_QUOTA_LAUNCHER_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
-                       "SOS quotalauncher: own handle limit=12",
+                       "SOS quotalauncher: own handle limit=16",
                        "SOS quotalauncher: setting handle limit 33, past own "
                        "and table",
                        "SOS: process fault: argument outside its domain "
@@ -8434,11 +8666,11 @@ TEST_CASES = [
                        "SOS quotaget: child event row limit=4 used=0",
                        "SOS quotaget: child event row after a create "
                        "through its handle limit=4 used=1",
-                       "SOS quotaget: child handle row limit=12 used=0",
+                       "SOS quotaget: child handle row limit=16 used=0",
                        "SOS quotaget: child handle row after a give "
-                       "limit=12 used=1",
+                       "limit=16 used=1",
                        "SOS quotaget: through a sibling with Stats alone "
-                       "limit=12 used=1",
+                       "limit=16 used=1",
                        "SOS: process fault: bad handle process={one}",
                        "SOS quotaget: a gone child's row: what this call was "
                        "waiting for is gone",
@@ -10365,7 +10597,7 @@ TEST_CASES = [
         # A give refused for capacity hands the object back. Root gives masked
         # System siblings to a child it never starts until the child's handle
         # budget, `DEFAULT_QUOTA_HANDLES`, refuses one with `QuotaExceeded`;
-        # `gave 12` is that budget. The refused sibling comes back in the error
+        # `gave 16` is that budget. The refused sibling comes back in the error
         # payload and prints, which only a live handle can do.
         #
         # `handles={seven}` in root's teardown is the count the same program
@@ -10387,7 +10619,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS givefull: created",
-                       "SOS givefull: gave 12 then refused: this process is "
+                       "SOS givefull: gave 16 then refused: this process is "
                        "at its quota",
                        "SOS givefull: the refused System still speaks",
                        "SOS givefull: exiting",
@@ -10414,7 +10646,7 @@ TEST_CASES = [
     },
     {
         # A give refused for capacity hands an Event back usable, as
-        # `give_full_returns` does a System. `gave 12` is the child's handle
+        # `give_full_returns` does a System. `gave 16` is the child's handle
         # budget, `DEFAULT_QUOTA_HANDLES`; the Event give meets the same
         # refusal, and the Event comes back in the error payload and reads the
         # bits root signalled.
@@ -10424,7 +10656,7 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS eventreturns: gave 12 siblings then refused: this "
+                       "SOS eventreturns: gave 16 siblings then refused: this "
                        "process is at its quota",
                        "SOS eventreturns: the Event give was refused: this "
                        "process is at its quota",
@@ -10662,7 +10894,7 @@ TEST_CASES = [
     },
     {
         # A give refused for capacity hands a Thread back usable, as
-        # `give_event_returns` does an Event: `gave 12` is the child's handle
+        # `give_event_returns` does an Event: `gave 16` is the child's handle
         # budget, and the returned thread starts and joins for its code, `7`.
         # Root's teardown frees both its threads, its own and the returned one,
         # since nothing else names either.
@@ -10672,7 +10904,7 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS threadreturns: gave 12 siblings then refused: this "
+                       "SOS threadreturns: gave 16 siblings then refused: this "
                        "process is at its quota",
                        "SOS threadreturns: the Thread give was refused: this "
                        "process is at its quota",
@@ -10769,7 +11001,7 @@ TEST_CASES = [
     },
     {
         # A give refused for capacity hands a Waiter and a Timer back usable,
-        # as `give_event_returns` does an Event: `gave 12` is the child's
+        # as `give_event_returns` does an Event: `gave 16` is the child's
         # handle budget, and the returned Timer attached to the returned Waiter
         # fires once. Root's teardown frees both, since nothing else names
         # either.
@@ -10779,7 +11011,7 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS waitablereturns: gave 12 siblings then refused: "
+                       "SOS waitablereturns: gave 16 siblings then refused: "
                        "this process is at its quota",
                        "SOS waitablereturns: the Waiter give was refused: "
                        "this process is at its quota",
@@ -24121,6 +24353,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "heap_wrong_free", "heap_zero_spent", "heap_main_err",
                      "heap_sizing", "handle_blocks_quota",
                      "root_blocks_rows", "latency_counts",
+                     "wait_word_refusals", "deadline_waiter", "deadline_join",
+                     "deadline_lock", "deadline_park", "thread_wake",
+                     "park_record_cleared", "deadline_timer_first",
                      *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES]]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]

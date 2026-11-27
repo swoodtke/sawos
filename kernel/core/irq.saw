@@ -1,7 +1,8 @@
 //! What the machine interrupts for (spec §7, §9): the scheduler tick, the
-//! Timers that come due, a device line, and the idle poll.
+//! Timers and the parked threads' deadlines that come due, a device line, and
+//! the idle poll.
 //!
-//! One comparator, two customers, composed here: a fire says only that
+//! One comparator, three customers, composed here: a fire says only that
 //! something may be due, so every customer is asked out of one reading of the
 //! clock and the tick is asked first.
 //!
@@ -11,7 +12,8 @@
 //! tick raises.
 
 import hal
-import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT}
+import sosabi.{SosStatus}
+import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT, ThreadIndex}
 import kcore.diag.{console}
 import kcore.threads.{
     NEED_RESCHED,
@@ -19,11 +21,12 @@ import kcore.threads.{
     SLICE_LEFT,
     SLICE_TICKS,
     a_thread_is_running,
+    threads,
 }
-import kcore.time.{NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS, reprogram_timer,
-    timer_programming_spent}
+import kcore.time.{NEVER_NS, NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS,
+    reprogram_timer, timer_programming_spent}
 import kcore.waitables.{INTERRUPTS, WaitableKind, interrupt_by_line}
-import kcore.refs.{notify_ready}
+import kcore.refs.{end_park, notify_ready}
 
 /// Fire every Timer whose deadline `now` has reached.
 ///
@@ -46,6 +49,22 @@ func expire_timers(now: UInt64) unsafe {
             case Free -> {},
         }
         i = i + 1
+    }
+}
+
+/// End every wakeable park whose deadline `now` has reached, answering it
+/// `TimedOut` (spec §2.6, §7).
+///
+/// No preemption point, for `expire_timers`' reason. The bound is the thread
+/// slab's `capacity()`, and each due thread's unlink (`end_park`) is a bounded
+/// walk of the lists it can be on.
+func expire_parks(now: UInt64) unsafe {
+    var t: Int = 0
+    while t < threads().capacity() {
+        if threads().at(ThreadIndex(t)).deadline_due(now) {
+            end_park(ThreadIndex(t), SosStatus.TimedOut)
+        }
+        t = t + 1
     }
 }
 
@@ -179,9 +198,13 @@ public func timer_ticks() unsafe -> UInt {
 /// A fire says only that something may be due, so every customer is asked out
 /// of one reading of the clock, and the tick is asked first (a timeslice charge
 /// that a Timer's servicing delayed would be a scheduler bug in a Timer's
-/// clothes). Using one `now` for both means the tick and every Timer are judged
-/// against the same instant: a Timer cannot be late because the tick ran first,
-/// and the tick cannot slip because several Timers came due together.
+/// clothes). Using one `now` for all three means the tick, every Timer and
+/// every parked thread's deadline are judged against the same instant: a Timer
+/// cannot be late because the tick ran first, and the tick cannot slip because
+/// several Timers came due together. The Timers are expired before the parked
+/// deadlines, so a thread whose `Wait` a Timer's fire would answer is
+/// delivered the record rather than `TimedOut`: readiness first, as at a
+/// park.
 /// Programming the next deadline is last, and it also lowers the line (both
 /// machines' timer condition is a level). What the hardware was programmed for
 /// is forgotten first, because this service spends it, so the next deadline
@@ -205,6 +228,7 @@ public(package) func on_timer_interrupt(pc: UInt) unsafe {
     }
 
     expire_timers(now)
+    expire_parks(now)
     reprogram_timer()
 }
 
@@ -345,12 +369,13 @@ public(package) func service_irq(frame_addr: UInt, cause: UInt) unsafe {
 // is readiness from outside that set, so the same state has two readings and
 // the kernel has to tell them apart.
 //
-// The rule: idle if any Interrupt is bound or any Timer is armed, deadlock
-// otherwise. It is deliberately conservative: the kernel does not try to prove
-// a specific blocked thread is reachable by a specific line, which would mean
-// walking attachment sets to answer a question that a wrong answer only makes
-// slower to diagnose (a hang at the harness timeout instead of a report). What
-// it never does is call a real wait a deadlock.
+// The rule: idle if any Interrupt is bound, any Timer is armed or any thread
+// is parked with a deadline, deadlock otherwise. It is deliberately
+// conservative: the kernel does not try to prove a specific blocked thread is
+// reachable by a specific line, which would mean walking attachment sets to
+// answer a question that a wrong answer only makes slower to diagnose (a hang
+// at the harness timeout instead of a report). What it never does is call a
+// real wait a deadlock.
 //
 // The idle loop polls instead of delivering from a trap. Interrupts are
 // delivered from user mode only, enforced by the machines, so an interrupt
@@ -372,9 +397,12 @@ func idle_poll() unsafe {
 
 /// Is there a source of readiness outside the set of runnable threads?
 ///
-/// Two kinds answer yes. A bound IRQ line is readiness a device will deliver;
-/// an armed timer is readiness the clock will deliver. Neither needs a thread
-/// to run for it to arrive.
+/// Three kinds answer yes. A bound IRQ line is readiness a device will
+/// deliver; an armed timer is readiness the clock will deliver, and so is a
+/// thread parked with a deadline, which the clock readies as it readies an
+/// armed Timer's waiter. None needs a thread to run for it to arrive. A thread
+/// parked wakeable with no deadline is no such source: only another thread
+/// can wake it.
 ///
 /// An armed timer counts and a merely existing one does not: a disarmed Timer
 /// will never fire, so a system holding only those is as deadlocked as one
@@ -422,6 +450,13 @@ public(package) func has_external_wake_source() unsafe -> Bool {
             case Free -> {},
         }
         t = t + 1
+    }
+    var th: Int = 0
+    while th < threads().capacity() {
+        if threads().at(ThreadIndex(th)).deadline_before(NEVER_NS) {
+            return true
+        }
+        th = th + 1
     }
     false
 }

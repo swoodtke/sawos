@@ -141,6 +141,9 @@ import sosabi.{
     THREAD_ID_OP,
     LOCK_WAIT_OP,
     LOCK_WAKE_OP,
+    WAIT_WORD_OP,
+    THREAD_WAKE_OP,
+    PARK_OP,
     PANIC_TEXT_BYTES,
     HandleInfo,
     HandleKind,
@@ -262,7 +265,7 @@ import kcore.diag.{ExitCode, console, fatal_kernel}
 import kcore.stackdepth.{report_stack_peak}
 import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
                     stats_pin_raise, stats_pin_lower, stats_region_phys, stats_region_len}
-import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
+import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment, end_park,
                    hold_staged, is_outlet_of, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
                    notify_ready, ref_object, ref_waitable, release_carried,
@@ -285,6 +288,7 @@ import kcore.threads.{
     GENERATION_MODULUS,
     id_generation,
     id_index,
+    lock_raise,
     ready_above,
     thread_id,
     ready_push,
@@ -363,7 +367,6 @@ import kcore.sched.{
     exit_thread,
     fault_process,
     fault_trap,
-    lock_raise,
     lock_wake,
     pick_next,
     section_held,
@@ -1678,7 +1681,10 @@ func process_start(caller: Int, child: Int,
                                exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, latency_irq: 0, latency_from: 0,
-                               lock_at: 0, lock_holder: 0, refs: 0,
+                               lock_at: 0, lock_holder: 0, wait_word: 0,
+                               wait_clock: false, wake_latched: false,
+                               park_wakeable: false, park_deadline: UInt64.max,
+                               refs: 0,
                                generation: slot_generation(slot))
     quota_charge(ProcessIndex(child), QuotaKind.Thread)
     ready_push(slot)
@@ -2117,7 +2123,10 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, latency_irq: 0, latency_from: 0,
-                               lock_at: 0, lock_holder: 0, refs: 1,
+                               lock_at: 0, lock_holder: 0, wait_word: 0,
+                               wait_clock: false, wake_latched: false,
+                               park_wakeable: false, park_deadline: UInt64.max,
+                               refs: 1,
                                generation: slot_generation(slot))
     quota_charge(ProcessIndex(owner), QuotaKind.Thread)
     op_value(handle)
@@ -2203,8 +2212,15 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
                 // and nothing will ever exit.
                 case Invalid -> op_status(SosStatus.Revoked),
                 case Free -> fault_process(p, FaultReason.BadState),
+                // The park reads the joiner's wait word (spec §7, §8): a
+                // wakeable join ends at its deadline or a wake, taken off
+                // the list with the target untouched.
                 case _ -> {
+                    let park = try park_plan(p, CURRENT_THREAD, false) catch {
+                        return op_status(error)
+                    }
                     block_on_join(CURRENT_THREAD, ThreadIndex(target))
+                    record_park(CURRENT_THREAD, park)
                     op_blocked()
                 },
             }
@@ -2272,19 +2288,24 @@ func lock_pair_check(p: Int, addr: UInt) unsafe {
 ///     `Ok` without parking, and the caller swaps again.
 ///   - the caller's own ID: the `BadState` fault, since the kernel's lock is
 ///     not recursive.
-///   - otherwise the word is decoded as an ID (`lock_holder_of`): the
+///   - otherwise the word is decoded as an ID (`thread_named`): the
 ///     holder, or `Revoked` without parking when the holder has exited, or
 ///     the `BadArg` fault.
 ///   - a holder whose chain (each holder parked on a lock the next holds)
 ///     comes back to the caller, or would pass `LOCK_CHAIN_MAX` holders: the
 ///     `LockChain` fault.
+///   - the caller's wait word (`park_plan`): on a wakeable word, `Woken` for
+///     a latched wake or `TimedOut` for a deadline passed, without parking
+///     and with the flag left as it was.
 ///
 /// Otherwise the caller parks: the waiters flag is written nonzero, the lock
 /// and the holder are recorded in its slot, and the chain is raised to its
 /// level. A parked waiter is answered by a wake with `Ok` or by its holder's
-/// exit with `Revoked`. A park while the caller's section is held is `ktrap`'s
-/// `SectionHeld`, as every park is. A caller with no thread, a harness
-/// kernel's, has nothing to wait with: the `BadState` fault.
+/// exit with `Revoked`, and a wakeable one by its deadline or another
+/// thread's wake (`end_park`), which lowers the holder again. A park while
+/// the caller's section is held is `ktrap`'s `SectionHeld`, as every park is.
+/// A caller with no thread, a harness kernel's, has nothing to wait with: the
+/// `BadState` fault.
 ///
 /// The read of the owner and the park are one trap with interrupts masked,
 /// so a give cannot slip between them: one that swapped the owner to 0 before
@@ -2307,11 +2328,12 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
     if owner == thread_id(me) {
         fault_process(p, FaultReason.BadState)
     }
-    let holder = lock_holder_of(p, owner)
+    let holder = thread_named(p, owner, true)
     if holder == NO_THREAD {
         return op_status(SosStatus.Revoked)
     }
     lock_chain_check(p, holder)
+    let park = try park_plan(p, me, false) catch { return op_status(error) }
 
     let one: UInt = 1
     if let why = copy_out(ProcessIndex(p), addr + word_bytes(),
@@ -2327,12 +2349,14 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
         thread.level
     }
     lock_raise(ThreadIndex(holder), level)
+    record_park(me, park)
     op_blocked()
 }
 
-/// The thread a lock's owner word `owner` names as its holder, for a wait by
-/// process `p`, or `NO_THREAD` when that holder has exited: the wait answers
-/// `Revoked`. Any other owner faults `p` (spec §7):
+/// The thread ID `id` names, for an op by process `p` that acts on a thread of
+/// its own (spec §7): the thread, or `NO_THREAD` when it has exited, which the
+/// op answers `Revoked`. Any other ID faults `p`. `LOCK_WAIT_OP` decodes its
+/// owner word here, with `line` set, and `THREAD_WAKE_OP` its target, without:
 ///
 ///   - a slot field of zero, or naming a slot the thread slab does not have,
 ///     or a generation wider than the board's field: no thread there ever
@@ -2341,25 +2365,24 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
 ///     range: the slot was freed since, so its thread exited; `Revoked`. One
 ///     ahead of it was never given out: the `BadArg` fault;
 ///   - the slot's current thread, by its state. Runnable, running or parked:
-///     the holder if it is the caller's process's, else the `BadArg` fault
-///     after a console line naming both processes, since a lock shared
-///     across processes is a mistake no wait could otherwise see; only the
-///     waiter's process ends. Exited: `Revoked` if it is the caller's
-///     process's or its process has died and disowned it (`NO_PROCESS`), as
-///     an exited holder answers whether or not its slot is still held; else
-///     the same line and fault. Anything else (a free slot, a thread never
-///     started, an invalid one) holds nothing: the `BadArg` fault, with no
-///     line, since it names no process that holds a lock.
+///     the thread if it is the caller's process's, else the `BadArg` fault.
+///     Exited: `Revoked` if it is the caller's process's or its process has
+///     died and disowned it (`NO_PROCESS`), as an exited thread answers
+///     whether or not its slot is still held; else the same fault. Anything
+///     else (a free slot, a thread never started, an invalid one) is no
+///     thread there is: the `BadArg` fault.
 ///
-/// The running thread is the caller, whose own ID is answered before this,
-/// and no other word decodes to its slot at its generation, so the `Running`
-/// arm is never taken; it is there because a running thread is live.
+/// With `line` set, a thread of another live process is reported with a
+/// console line naming both processes before the fault, since a lock shared
+/// across processes is a mistake no wait could otherwise see; only the
+/// caller's process ends. A wake writes no line: no memory is shared that
+/// the line would diagnose, and the fault line names the process.
 ///
 /// `unsafe` though it names nothing unsafe: `p` must be the calling process,
 /// the one `fault_process` ends.
-func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
-    let index = id_index(owner) as Int
-    let generation = id_generation(owner)
+func thread_named(p: Int, id: UInt, line: Bool) unsafe -> Int {
+    let index = id_index(id) as Int
+    let generation = id_generation(id)
     if index == 0 || index > threads().capacity() ||
        generation >= GENERATION_MODULUS {
         fault_process(p, FaultReason.BadArg)
@@ -2378,12 +2401,12 @@ func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
         (thread.process, thread.state)
     }
     match state {
-        case Runnable -> lock_live_holder(p, q, t),
-        case Running -> lock_live_holder(p, q, t),
-        case Blocked -> lock_live_holder(p, q, t),
+        case Runnable -> live_thread_named(p, q, t, line),
+        case Running -> live_thread_named(p, q, t, line),
+        case Blocked -> live_thread_named(p, q, t, line),
         case Exited -> {
             if q != p && q != NO_PROCESS {
-                lock_owner_elsewhere(p, q)
+                thread_elsewhere(p, q, line)
             }
             NO_THREAD
         },
@@ -2391,27 +2414,28 @@ func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
     }
 }
 
-/// Live thread `t` of process `q`, a wait by process `p` names: the holder
-/// when `q` is `p`, else the waiter's fault after the line naming both.
-func lock_live_holder(p: Int, q: Int, t: Int) unsafe -> Int {
+/// Live thread `t` of process `q`, an op by process `p` names: the thread
+/// when `q` is `p`, else the caller's fault (`thread_elsewhere`).
+func live_thread_named(p: Int, q: Int, t: Int, line: Bool) unsafe -> Int {
     if q != p {
-        lock_owner_elsewhere(p, q)
+        thread_elsewhere(p, q, line)
     }
     t
 }
 
-/// The console line a wait by process `p` writes when the lock's owner is a
-/// thread of live process `q`, a lock shared across processes, and then the
-/// waiter's `BadArg` fault. `q` is a live process's record, never
-/// `NO_PROCESS`: a live thread's process is never disowned, and the exited
-/// arm leaves a disowned slot out.
-func lock_owner_elsewhere(p: Int, q: Int) unsafe -> Never {
-    let out = console()
-    out.write_str("SOS: lock wait: the owner is a thread of another process waiter=")
-    out.write_hex(p as UInt)
-    out.write_str(" holder=")
-    out.write_hex(q as UInt)
-    out.write_str("\n")
+/// The caller's `BadArg` fault for an ID naming a thread of live process `q`,
+/// after, with `line` set, the lock wait's console line naming both. `q` is a
+/// live process's record, never `NO_PROCESS`: a live thread's process is
+/// never disowned, and the exited arm leaves a disowned slot out.
+func thread_elsewhere(p: Int, q: Int, line: Bool) unsafe -> Never {
+    if line {
+        let out = console()
+        out.write_str("SOS: lock wait: the owner is a thread of another process waiter=")
+        out.write_hex(p as UInt)
+        out.write_str(" holder=")
+        out.write_hex(q as UInt)
+        out.write_str("\n")
+    }
     fault_process(p, FaultReason.BadArg)
 }
 
@@ -2475,6 +2499,204 @@ func lock_wake_op(p: Int, addr: UInt) unsafe -> SyscallResult {
         NEED_RESCHED = true
     }
     op_ok()
+}
+
+// -----------------------------------------------------------------------------
+// Deadlines and wakes: the wait word (spec §7)
+// -----------------------------------------------------------------------------
+//
+// A thread registers one doubleword in its own memory, and every park the
+// kernel offers reads it once per op, at the op's first park: 0 parks plain,
+// `NEVER_NS` parks wakeable with no deadline, and anything else parks wakeable
+// until that instant on the Monotonic clock. The kernel keeps only the
+// address, whether a Clock came with it, and the latch, and records each
+// wakeable park's deadline in the slot, where the comparator's schedule
+// (`reprogram_timer`) and the interrupt's expiry (`kcore.irq`) find it.
+
+/// How a park the caller is about to make ends: whether it can end early, and
+/// at what deadline (`NEVER_NS` for none).
+struct Park {
+    wakeable: Bool,
+    deadline: UInt64,
+}
+
+/// The size of the wait word, a doubleword whatever the word size.
+static WAIT_WORD_BYTES: UInt = 8
+
+/// Read the running thread `me`'s wait word for a park it is about to make
+/// (spec §7's order at an op that would park), after the op found nothing it
+/// could answer at once. `bare` is `PARK_OP`'s, which is wakeable whatever
+/// its word.
+///
+/// A word the copy-in door refuses now is that door's fault, and a finite
+/// deadline from a thread registered with no Clock is `AccessDenied`. Then,
+/// on a wakeable word, a latched wake is cleared and answers `Woken`, and
+/// failing that a deadline at or before the clock's reading answers
+/// `TimedOut`: both in the error channel, since neither is a park, and the
+/// op answers the status without parking. Otherwise the park.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process
+/// and `me` its running thread.
+func park_plan(p: Int, me: ThreadIndex,
+               bare: Bool) unsafe -> Result<Park, SosStatus> {
+    let (addr, clock) = borrow var thread = threads().at(me) {
+        (thread.wait_word, thread.wait_clock)
+    }
+    var word: UInt64 = 0
+    if addr != 0 {
+        if let why = copy_in(ProcessIndex(p),
+                             ((&var word) as UnsafePointer<UInt64>) as UInt,
+                             addr, WAIT_WORD_BYTES) {
+            fault_process(p, why)
+        }
+    }
+    if word != 0 && word != NEVER_NS && not clock {
+        fault_process(p, FaultReason.AccessDenied)
+    }
+    if word == 0 && not bare {
+        return Park(wakeable: false, deadline: NEVER_NS)
+    }
+    let deadline = if word == 0 { NEVER_NS } else { word }
+    let latched = borrow var thread = threads().at(me) {
+        let latched = thread.wake_latched
+        thread.wake_latched = false
+        latched
+    }
+    if latched {
+        return SosStatus.Woken
+    }
+    if deadline != NEVER_NS && deadline <= hal.timer_now_ns() {
+        return SosStatus.TimedOut
+    }
+    Park(wakeable: true, deadline: deadline)
+}
+
+/// Record `park` in parked thread `t`'s slot, and bring the comparator's
+/// schedule to a deadline it carries: the parked threads are its third
+/// customer (spec §2.6), and a deadline can only move it earlier.
+func record_park(t: ThreadIndex, park: Park) unsafe {
+    borrow var thread = threads().at(t) {
+        thread.park_wakeable = park.wakeable
+        thread.park_deadline = park.deadline
+    }
+    if park.wakeable && park.deadline != NEVER_NS {
+        reprogram_timer()
+    }
+}
+
+/// `WAIT_WORD_OP(addr, clock)`: register the calling thread's wait word
+/// (spec §7). Made with no handle: it acts only on the calling thread. The
+/// answers, in the order they are decided:
+///
+///   - an `addr` of 0 unregisters the word, and `clock` is not read;
+///   - `clock`: `NO_HANDLE` registers with no Clock; a word that names
+///     nothing or names no Clock is the `BadHandle` fault, and a Clock handle
+///     without `ClockRight.Read` the `AccessDenied` fault;
+///   - `addr`: one that is not eight-aligned is the `BadAlign` fault, and a
+///     doubleword the copy-in door refuses is that door's fault.
+///
+/// It answers `Ok`, and a later registration replaces the earlier one, its
+/// Clock or the lack of one included. The right is asked here and never
+/// again: the slot keeps the address and whether a Clock came with it, so a
+/// release of the Clock handle later changes nothing. A caller with no
+/// thread, a harness kernel's, has no word to register: the `BadState`
+/// fault.
+func wait_word_op(p: Int, addr: UInt, clock: UInt) unsafe -> SyscallResult {
+    let me = CURRENT_THREAD
+    if me == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    if addr == 0 {
+        borrow var thread = threads().at(me) {
+            thread.wait_word = 0
+            thread.wait_clock = false
+        }
+        return op_ok()
+    }
+    var with_clock = false
+    if clock != NO_HANDLE {
+        let entry = lookup_handle(ProcessIndex(p), clock)
+        match entry.obj_type {
+            case Clock -> {},
+            case _ -> fault_process(p, FaultReason.BadHandle),
+        }
+        let obj = ClockObject(handle: ClockHandle(clock), rights: entry.rights,
+                              slot: entry.target)
+        if not obj.allows(ClockRight.Read) {
+            fault_process(p, FaultReason.AccessDenied)
+        }
+        // A deadline is an instant on the Monotonic clock, so the Clock
+        // registered is that domain's; a second domain fails to compile here
+        // until somebody says what its deadline would mean.
+        match CLOCKS[obj.slot].kind {
+            case Monotonic -> {},
+        }
+        with_clock = true
+    }
+    if (addr % WAIT_WORD_BYTES) != 0 {
+        fault_process(p, FaultReason.BadAlign)
+    }
+    if let why = copy_in_check(ProcessIndex(p), addr, WAIT_WORD_BYTES) {
+        fault_process(p, why)
+    }
+    borrow var thread = threads().at(me) {
+        thread.wait_word = addr
+        thread.wait_clock = with_clock
+    }
+    op_ok()
+}
+
+/// `THREAD_WAKE_OP(id)`: wake thread `id` of the caller's process (spec §7).
+/// Made with no handle and needing no right, on `LOCK_WAKE_OP`'s terms: it
+/// acts only inside the caller's process, whose threads already share every
+/// byte.
+///
+/// The ID is decoded as a lock's owner is (`thread_named`), with no line: a
+/// thread that has exited answers `Revoked`, and anything that is no thread
+/// of the caller's process is the `BadArg` fault. A thread parked wakeable has
+/// that park ended `Woken` and is readied (`end_park`); any other, the caller
+/// itself included, has its latch set. It answers `Ok`. A caller with no
+/// thread, a harness kernel's, is the `BadState` fault.
+func thread_wake_op(p: Int, id: UInt) unsafe -> SyscallResult {
+    if CURRENT_THREAD == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    let t = thread_named(p, id, false)
+    if t == NO_THREAD {
+        return op_status(SosStatus.Revoked)
+    }
+    let parked = borrow var thread = threads().at(ThreadIndex(t)) {
+        let parked = match thread.state {
+            case Blocked -> thread.park_wakeable,
+            case _ -> false,
+        }
+        if not parked {
+            thread.wake_latched = true
+        }
+        parked
+    }
+    if parked {
+        end_park(ThreadIndex(t), SosStatus.Woken)
+    }
+    op_ok()
+}
+
+/// `PARK_OP`: park the calling thread on nothing (spec §7), until its word's
+/// deadline or a wake. It is always wakeable, whatever its word, so a latched
+/// wake answers `Woken` at once; no word, 0 and `NEVER_NS` all mean no
+/// deadline. It never answers `Ok`. A park while the caller's section is held
+/// is `ktrap`'s `SectionHeld`, as every park is, and a caller with no thread,
+/// a harness kernel's, is the `BadState` fault.
+func park_op(p: Int) unsafe -> SyscallResult {
+    let me = CURRENT_THREAD
+    if me == NO_THREAD {
+        fault_process(p, FaultReason.BadState)
+    }
+    let park = try park_plan(p, me, true) catch { return op_status(error) }
+    threads().at(me).state = ThreadState.Blocked
+    NEED_RESCHED = true
+    record_park(me, park)
+    op_blocked()
 }
 
 /// The Event object's ops (spec §2.4).
@@ -3176,7 +3398,9 @@ func waiter_remove(p: Int, w: Int, key: UInt) unsafe -> SyscallResult {
 ///
 /// The scan comes first (the level-triggered guarantee): a signal that arrived
 /// before this call is still in the word, so the wait returns immediately. Only
-/// an empty set parks.
+/// an empty set parks, and the park reads the caller's wait word (spec §2.2,
+/// §7): it can answer `Woken` or `TimedOut` instead, at once or by ending
+/// early (`end_park`), with no record written.
 func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // A capacity below the record's size is outside the argument's domain; the
     // size is published, so the caller could have checked.
@@ -3204,7 +3428,11 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
+    let park = try park_plan(p, CURRENT_THREAD, false) catch {
+        return op_status(error)
+    }
     block_on_wait(CURRENT_THREAD, w, dst)
+    record_park(CURRENT_THREAD, park)
     op_blocked()
 }
 
@@ -5627,11 +5855,11 @@ func detach_watcher(watched: WaitableKind, target: Int) unsafe {
 /// entry and not yet its kind, which is the altitude a kind-independent op
 /// belongs at.
 ///
-/// The panic op, the thread ID op and the lock's two ops are intercepted
-/// before the lookup, and only with `NO_HANDLE` in the handle register: they
-/// name no object, so a process or a thread that holds no handle can still
-/// make them. With any other word they go the way of every op, and no kind's
-/// table reaches their numbers.
+/// The panic op, the thread ID op, the lock's two ops and the wait word's
+/// three are intercepted before the lookup, and only with `NO_HANDLE` in the
+/// handle register: they name no object, so a process or a thread that holds
+/// no handle can still make them. With any other word they go the way of
+/// every op, and no kind's table reaches their numbers.
 func dispatch(handle: UInt, op: UInt,
               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
@@ -5647,6 +5875,15 @@ func dispatch(handle: UInt, op: UInt,
         }
         if op == LOCK_WAKE_OP {
             return lock_wake_op(p, arg0)
+        }
+        if op == WAIT_WORD_OP {
+            return wait_word_op(p, arg0, arg1)
+        }
+        if op == THREAD_WAKE_OP {
+            return thread_wake_op(p, arg0)
+        }
+        if op == PARK_OP {
+            return park_op(p)
         }
     }
     let entry = lookup_handle(ProcessIndex(p), handle)

@@ -150,6 +150,15 @@
 /// `NoResource` because the same op answers `NoResource` for a full Memory
 /// slab, and a program does different things about its budget running out
 /// and the machine's.
+///
+/// `TimedOut` (12) and `Woken` (13) end a wakeable park early (spec §7): the
+/// park's deadline came first, or had passed at the op, or another thread of
+/// the process woke it, or a wake was latched at the op. Neither consumes what
+/// the op waited for. They are statuses because the clock or another thread
+/// decided, and neither is `WouldBlock`, a poll op's "not now" with no park,
+/// nor `Revoked`, what was waited on gone, nor `PeerClosed`, the far end gone.
+/// A park made with the caller's wait word at 0 answers neither, so a caller
+/// that never writes a word never sees them, `PARK_OP`'s caller aside.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
@@ -160,6 +169,8 @@ public enum SosStatus: UInt8 {
     case PeerClosed = 9,
     case WouldBlock = 10,
     case NoMemory = 11,
+    case TimedOut = 12,
+    case Woken = 13,
     case Unknown = 255,
 }
 
@@ -179,6 +190,8 @@ extension SosStatus {
             // empty one, because one tag answers both.
             case WouldBlock -> "not right now — try again",
             case NoMemory -> "this pool has no free range that long",
+            case TimedOut -> "the wait's deadline came first",
+            case Woken -> "another thread woke this wait",
             case Unknown -> "unknown status",
         }
     }

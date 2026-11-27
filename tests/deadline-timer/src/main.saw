@@ -1,0 +1,134 @@
+// A Timer's fire and a parked deadline due together (spec §2.6, §7), at the C
+// altitude. The one thread waits on a Waiter holding a one-shot Timer, with
+// its wait word's deadline at or after the Timer's: the wait answers with the
+// Timer's record, `Ok`, never `TimedOut`, whichever way the two come due.
+// Readiness comes first at the op, and a fire expires the Timers before the
+// parked deadlines.
+//
+// The Timer's deadline is `AFTER_NS` past the kernel's reading at the arm,
+// between the two readings this thread takes around the arm, and the word's
+// deadline is `AFTER_NS` past the second, so it is never before the Timer's.
+// The arm programs the comparator no sooner than `LEAD_NS` past its own
+// reading, and the park keeps that instant, so when the word's deadline is
+// within that lead of the first reading and the thread parks before the fire,
+// both deadlines are due at the one fire. The arm is retried, disarmed, until
+// the readings are that close or `TRIES` arms have been made. Whether the
+// thread parks before the fire is the host's timing, which no reading here
+// can make certain: the answer is `Ok` either way.
+
+import sos.{System, ClockType, SosStatus, ALL_RIGHTS, sos_system_clock_get,
+            sos_system_process_self, sos_clock_now, sos_clock_timer_create,
+            sos_timer_arm, sos_timer_disarm, sos_wait_word,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_TIMER: UInt = 5
+
+/// The Timer's delay, and how close the word's deadline must be to the first
+/// reading for both to fall at one fire: the kernel's least lead.
+static AFTER_NS: UInt64 = 25_000
+static LEAD_NS: UInt64 = 50_000
+
+/// How many arms the case makes before it waits on the last one anyway.
+static TRIES: Int = 64
+
+/// Where a wait record carries the payload: a Timer's fire count.
+static PAYLOAD_WORD: Int = 2
+
+/// The wait word.
+unsafe static var WORD: UInt64 = 0
+
+/// A wait record, over-provisioned for every profile.
+static RECORD_WORDS: Int = 128
+unsafe static var BUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading through `clock`.
+func now(clock: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(clock, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+/// Arm `timer` one-shot `AFTER_NS` out.
+func arm(timer: UInt) unsafe -> UInt {
+    var rec: [UInt64; 2] = [AFTER_NS, 0]
+    sos_timer_arm(timer, (&var rec) as UnsafePointer<UInt64>, 16)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinetimer: no process handle: {}", error)
+        return
+    }
+    var raw_proc: UInt = NONE
+    var clock: UInt = NONE
+    var timer: UInt = NONE
+    var waiter: UInt = NONE
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var raw_proc) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_system_clock_get(
+           boot_handle, ClockType.Monotonic as UInt,
+           (&var clock) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_clock_timer_create(
+           clock, (&var timer) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(
+           raw_proc, (&var waiter) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(waiter, timer, KEY_TIMER, 0) != STATUS_OK {
+        print("SOS deadlinetimer: setup refused")
+        return
+    }
+    print("SOS deadlinetimer: register: {}",
+          named(sos_wait_word(((&var WORD) as UnsafePointer<UInt64>) as UInt,
+                              clock)))
+
+    var deadline: UInt64 = 0
+    var tries: Int = 0
+    while {
+        let first = now(clock)
+        if arm(timer) != STATUS_OK {
+            print("SOS deadlinetimer: the arm was refused")
+            return
+        }
+        let second = now(clock)
+        deadline = second + AFTER_NS
+        tries = tries + 1
+        if deadline - first <= LEAD_NS || tries == TRIES {
+            break
+        }
+        let _ = sos_timer_disarm(timer)
+    }
+
+    WORD = deadline
+    let status = sos_waiter_wait(
+        waiter, (&var BUF) as UnsafePointer<UInt>,
+        (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt))
+    WORD = 0
+    print("SOS deadlinetimer: wait: {} key={} fired={}", named(status), BUF[0],
+          BUF[PAYLOAD_WORD] > 0)
+    print("SOS deadlinetimer: done")
+    let _ = proc.exit(EXIT_OK)
+}

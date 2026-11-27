@@ -194,6 +194,29 @@ public static THREAD_ID_OP: UInt = 0xFFFB
 public static LOCK_WAIT_OP: UInt = 0xFFFA
 public static LOCK_WAKE_OP: UInt = 0xFFF9
 
+/// WAIT WORD: register the calling thread's wait word (spec §7), the
+/// eight-aligned doubleword at the address in the first argument, which the
+/// kernel reads at each op's first park: 0 parks plain, `UInt64.max` parks
+/// wakeable with no deadline, and anything else is a deadline on the
+/// Monotonic clock. The second argument is a Monotonic Clock handle carrying
+/// `ClockRight.Read`, or `NO_HANDLE`; only a thread registered with a Clock
+/// may write a finite deadline. An address of 0 unregisters the word.
+///
+/// THREAD WAKE: wake the thread of the caller's process whose ID is the first
+/// argument. A thread parked wakeable has its park ended with `Woken`; any
+/// other has its latch set, which its next wakeable park answers `Woken` at
+/// once.
+///
+/// PARK: park the caller on nothing until its word's deadline (`TimedOut`) or
+/// a wake (`Woken`). It is always wakeable, and never answers `Ok`.
+///
+/// All three are made with `NO_HANDLE`, as the lock's ops are: they act only
+/// on the calling thread or a thread of its own process. The one authority
+/// they touch is the clock's, which `WAIT_WORD_OP` takes as its argument.
+public static WAIT_WORD_OP: UInt = 0xFFF8
+public static THREAD_WAKE_OP: UInt = 0xFFF7
+public static PARK_OP: UInt = 0xFFF6
+
 /// The most of a panic's text the kernel reads, in bytes. A longer text is cut
 /// there. The kernel writes its console with interrupts masked, so the bound
 /// is what caps the latency one panic adds.
@@ -1204,14 +1227,14 @@ public enum ReplyWaitLeg: UInt {
 }
 
 // Every op table is dense from zero, and stays below the universal ops and the
-// no-handle ops. That is what makes those numbers safe: none can collide with
-// a per-kind op, because no kind is allowed to reach it. The bound tested is
+// no-handle ops. That is what makes those numbers safe: none can collide with a
+// per-kind op, because no kind is allowed to reach it. The bound tested is
 // `OP_BAND_FLOOR`, the lowest of the band, so one assert per table covers all,
-// and adding another number below it tightens every one of these at once. There is
-// one assert per table, on its highest case, in the spirit of the rights
+// and adding another number below it tightens every one of these at once. There
+// is one assert per table, on its highest case, in the spirit of the rights
 // asserts above: the repetition is the check, and a table growing toward the
-// top of the space fails to build rather than failing as a band op that
-// quietly ran somebody's op.
+// top of the space fails to build rather than failing as a band op that quietly
+// ran somebody's op.
 //
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
@@ -1219,7 +1242,7 @@ public enum ReplyWaitLeg: UInt {
 
 /// The lowest number of the band no op table may reach: the universal ops and
 /// the ops made with `NO_HANDLE`.
-static OP_BAND_FLOOR: UInt = LOCK_WAKE_OP
+static OP_BAND_FLOOR: UInt = PARK_OP
 static_assert((SystemOp.ProcessByPid as UInt) < OP_BAND_FLOOR,
               "an op table must stay below the no-handle and universal ops")
 static_assert((ProcessOp.SectionWord as UInt) < OP_BAND_FLOOR,

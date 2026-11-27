@@ -11,6 +11,7 @@ import hal
 import sosabi.{ClockType}
 import kcore.limits.{CLOCK_KINDS, MAX_SLAB_EXTENTS, MAX_TIMERS, NO_TIMER}
 import kcore.slab.{Slab}
+import kcore.threads.{earliest_park_deadline}
 
 /// One Clock (spec §2.6): a granted time source, and a kernel-eternal one.
 ///
@@ -340,25 +341,27 @@ func earliest_timer_deadline(soonest: UInt64) unsafe -> UInt64 {
 }
 
 // -----------------------------------------------------------------------------
-// One hardware timer, two customers
+// One hardware timer, three customers
 // -----------------------------------------------------------------------------
 //
-// The machine has one comparator, and two things want it: the scheduler tick
-// (spec §7's timeslice) and the Timer objects (spec §2.6) a process arms. The
-// composition is arch-free:
+// The machine has one comparator, and three things want it: the scheduler
+// tick (spec §7's timeslice), the Timer objects (spec §2.6) a process arms,
+// and the deadline of every thread parked wakeable on one (spec §7's wait
+// word). The composition is arch-free:
 //
 //   the kernel keeps every deadline it owes in nanoseconds (the next tick in
-//   `NEXT_TICK_NS`, each armed Timer's in its own slot) and programs the
-//   hardware with the earliest of them. A fire means "something may be due":
-//   the handler asks what actually is, services it, and programs the next
-//   earliest. Nothing else touches the comparator.
+//   `NEXT_TICK_NS`, each armed Timer's in its own slot, each parked thread's
+//   in its thread slot) and programs the hardware with the earliest of them.
+//   A fire means "something may be due": the handler asks what actually is,
+//   services it, and programs the next earliest. Nothing else touches the
+//   comparator.
 //
-// The tick is inviolate. A Timer deadline can only move the hardware earlier
-// than the tick, never later, so the tick's cadence is unchanged by any number
-// of Timers. A fire that turns out to be a Timer's still checks the tick, and a
-// tick that comes due while a Timer is being serviced is taken in the same
-// pass; both are read out of the same `now`, so there is no ordering to get
-// wrong.
+// The tick is inviolate. A Timer's or a parked thread's deadline can only move
+// the hardware earlier than the tick, never later, so the tick's cadence is
+// unchanged by any number of them. A fire that turns out to be a Timer's still
+// checks the tick, and a tick that comes due while a Timer is being serviced
+// is taken in the same pass; all are read out of the same `now`, so there is
+// no ordering to get wrong.
 //
 // The HAL seam is `timer_now_ns()` + `timer_set_deadline_ns(at)`, hardware and
 // nothing else. The tick's period is scheduler policy and lives here.
@@ -436,6 +439,7 @@ public func start_tick(period_us: UInt) unsafe {
 ///   - `on_timer_interrupt`, after servicing whatever came due;
 ///   - `timer_arm` and `timer_disarm`, when a process changes what it owes;
 ///   - `catch_up_timer`, when a wait's or an attach's look counts a fire;
+///   - a park that records a deadline (`kcore.dispatch`'s `record_park`);
 ///   - `free_object`'s Timer arm, when the last reference to a Timer goes;
 ///   - `end_process`, whose teardown frees or invalidates a dying process's
 ///     Timers.
@@ -458,6 +462,7 @@ public(package) func reprogram_timer() unsafe {
         next = NEXT_TICK_NS
     }
     next = earliest_timer_deadline(next)
+    next = earliest_park_deadline(next)
 
     // Nothing owed programs never, and remembers none.
     var target = NEVER_NS

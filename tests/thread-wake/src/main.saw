@@ -1,0 +1,303 @@
+// `THREAD_WAKE_OP` and the latch (spec §7). The wait words, the Events and the
+// Waiters are at the C altitude, and the thread is typed. T runs at the main
+// thread's level and registers its word with no Clock, so it writes only 0
+// (plain) and `UInt64.max` (wakeable with no deadline). The image arms no
+// tick, so every switch is one a thread makes, and each wake is made where
+// the line before it put T:
+//
+//   in its wait    T waits wakeable on its Event, and the main thread, which
+//                  yielded until T parked, wakes it: T's wait answers `Woken`
+//   while it runs  T yields after telling the main thread, which wakes it
+//                  while it is runnable: the wake latches, and T's next park
+//                  answers `Woken` at once
+//   plain wait     T waits plain on its Event; the main thread wakes it and
+//                  then signals the Event: the wait answers `Ok` with the
+//                  record, and T's next park answers `Woken` at once, since a
+//                  plain park neither ends at a wake nor clears the latch
+//   plain after    T wakes itself and then waits plain; the main thread
+//                  signals the Event: `Ok` with the record, and T's next park
+//                  answers `Woken`, since the plain wait neither read the
+//                  latch nor cleared it
+//   at each park   T wakes itself before a wakeable `Wait` and before a
+//                  wakeable `Join` of the main thread: each answers `Woken`
+//                  at once
+//   exited         a wake of T once it has exited, through a handle that still
+//                  names it and again once that handle is released and its
+//                  slot freed, answers `Revoked`
+//   reused slot    T woke itself last, so it exited with its latch set. U,
+//                  made in T's freed slot and registered with a Clock, is
+//                  ready when the main thread wakes T's ID: `Revoked`, the ID
+//                  is stale. U parks on a deadline already passed: `TimedOut`,
+//                  since a slot's latch is reset when the slot is reused and
+//                  the stale ID woke nothing
+
+import sos.{System, ClockType, SosStatus, ALL_RIGHTS, sos_system_process_self,
+            sos_system_clock_get,
+            sos_wait_word, sos_thread_wake, sos_thread_id, sos_park,
+            sos_process_event_create, sos_process_waiter_create,
+            sos_process_thread_self, sos_thread_yield, sos_waiter_add,
+            sos_waiter_wait, sos_event_signal, sos_handle_release,
+            sos_thread_join}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+
+/// What the main thread signals T's Event with in `plain wait`, and in
+/// `plain after`.
+static BITS: UInt = 9
+static BITS_AFTER: UInt = 3
+
+/// T's exit code.
+static T_CODE: UInt = 5
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// T's wait word, and U's. The main thread registers none.
+unsafe static var WORD_T: UInt64 = 0
+unsafe static var WORD_U: UInt64 = 0
+
+/// The bits of a thread ID that carry its slot, as every board splits an ID
+/// today (`hal.THREAD_ID_INDEX_BITS`). A program never decodes an ID: this
+/// one only compares two IDs' slots.
+static ID_SLOT_MASK: UInt = 0xFFF
+
+unsafe static var PROC: UInt = 0
+/// The main thread's own Thread handle, which T joins.
+unsafe static var MAIN_THREAD: UInt = 0
+unsafe static var CLOCK: UInt = 0
+unsafe static var T_ID: UInt = 0
+unsafe static var U_ID: UInt = 0
+unsafe static var EVENT_T: UInt = 0
+unsafe static var WAITER_T: UInt = 0
+unsafe static var EVENT_MAIN: UInt = 0
+unsafe static var WAITER_MAIN: UInt = 0
+
+/// A wait record for each thread, over-provisioned for every profile.
+static RECORD_WORDS: Int = 128
+unsafe static var BUF_T: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var BUF_MAIN: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+/// Where a wait record carries an Event's bits.
+static PAYLOAD_WORD: Int = 2
+
+/// T's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func record_bytes() -> UInt {
+    (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func word_t() unsafe -> UInt {
+    ((&var WORD_T) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    if status == code(SosStatus.Revoked) {
+        return "Revoked"
+    }
+    "unexpected"
+}
+
+/// An Event and a Waiter holding it, or false.
+func made(event: UnsafePointer<UInt>,
+          waiter: UnsafePointer<UInt>) unsafe -> Bool {
+    sos_process_event_create(PROC, 0, event) == STATUS_OK &&
+        sos_process_waiter_create(PROC, waiter) == STATUS_OK &&
+        sos_waiter_add(waiter[0], event[0], KEY_EVENT, 0) == STATUS_OK
+}
+
+func t_entry(arg: UInt) sync -> UInt {
+    t_run()
+}
+
+/// T's rounds, each ended by a park made after a wake.
+func t_run() unsafe sync -> UInt {
+    T_ID = sos_thread_id()
+    let _ = sos_wait_word(word_t(), NONE)
+
+    WORD_T = NEVER
+    let woken = sos_waiter_wait(WAITER_T, (&var BUF_T) as UnsafePointer<UInt>,
+                                record_bytes())
+    WORD_T = 0
+    print("SOS threadwake: T's wakeable wait: {}", named(woken))
+    let _ = sos_event_signal(EVENT_MAIN, 1)
+    var me: UInt = NONE
+    let _ = sos_process_thread_self(PROC, (&var me) as UnsafePointer<UInt>)
+    let _ = sos_thread_yield(me)
+    let _ = sos_handle_release(me)
+
+    WORD_T = NEVER
+    let latched = sos_park()
+    WORD_T = 0
+    print("SOS threadwake: T's park after a wake while it ran: {}",
+          named(latched))
+    let _ = sos_event_signal(EVENT_MAIN, 1)
+
+    let plain = sos_waiter_wait(WAITER_T, (&var BUF_T) as UnsafePointer<UInt>,
+                                record_bytes())
+    print("SOS threadwake: T's plain wait: {} bits={}", named(plain),
+          BUF_T[PAYLOAD_WORD])
+    WORD_T = NEVER
+    let kept = sos_park()
+    WORD_T = 0
+    print("SOS threadwake: T's park after its plain wait: {}", named(kept))
+
+    let _ = sos_thread_wake(T_ID)
+    let _ = sos_event_signal(EVENT_MAIN, 1)
+    let after = sos_waiter_wait(WAITER_T, (&var BUF_T) as UnsafePointer<UInt>,
+                                record_bytes())
+    print("SOS threadwake: T's plain wait after a wake of itself: {} bits={}",
+          named(after), BUF_T[PAYLOAD_WORD])
+    WORD_T = NEVER
+    let still = sos_park()
+    WORD_T = 0
+    print("SOS threadwake: T's park after that wait: {}", named(still))
+
+    let _ = sos_thread_wake(T_ID)
+    WORD_T = NEVER
+    let at_wait = sos_waiter_wait(WAITER_T,
+                                  (&var BUF_T) as UnsafePointer<UInt>,
+                                  record_bytes())
+    WORD_T = 0
+    print("SOS threadwake: T's wakeable wait after a wake of itself: {}",
+          named(at_wait))
+    let _ = sos_thread_wake(T_ID)
+    WORD_T = NEVER
+    var joined: UInt = 0
+    let at_join = sos_thread_join(MAIN_THREAD,
+                                  (&var joined) as UnsafePointer<UInt>)
+    WORD_T = 0
+    print("SOS threadwake: T's wakeable join after a wake of itself: {}",
+          named(at_join))
+    let _ = sos_thread_wake(T_ID)
+    T_CODE
+}
+
+func u_entry(arg: UInt) sync -> UInt {
+    u_run()
+}
+
+/// U: park on a deadline already passed, with a Clock.
+func u_run() unsafe sync -> UInt {
+    U_ID = sos_thread_id()
+    let _ = sos_wait_word(((&var WORD_U) as UnsafePointer<UInt64>) as UInt,
+                          CLOCK)
+    WORD_U = 1
+    let status = sos_park()
+    WORD_U = 0
+    print("SOS threadwake: U, in T's slot: {}, parks: {}",
+          (U_ID & ID_SLOT_MASK) == (T_ID & ID_SLOT_MASK), named(status))
+    0
+}
+
+/// Wait on the main thread's Event.
+func main_wait() unsafe {
+    let _ = sos_waiter_wait(WAITER_MAIN, (&var BUF_MAIN) as UnsafePointer<UInt>,
+                            record_bytes())
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS threadwake: no process handle: {}", error)
+        return
+    }
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var PROC) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var CLOCK) as UnsafePointer<UInt>) != STATUS_OK ||
+       not made((&var EVENT_T) as UnsafePointer<UInt>,
+                (&var WAITER_T) as UnsafePointer<UInt>) ||
+       not made((&var EVENT_MAIN) as UnsafePointer<UInt>,
+                (&var WAITER_MAIN) as UnsafePointer<UInt>) ||
+       sos_process_thread_self(
+           PROC, (&var MAIN_THREAD) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS threadwake: setup refused")
+        return
+    }
+    let me = try proc.thread_self() catch {
+        print("SOS threadwake: no thread handle: {}", error)
+        return
+    }
+    let stack_top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+                    (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let t = try proc.thread_create(run: t_entry, arg: 0,
+                                   stack_top: stack_top) catch {
+        print("SOS threadwake: no thread: {}", error)
+        return
+    }
+    try t.start() catch {
+        print("SOS threadwake: T did not start: {}", error)
+        return
+    }
+    // T runs at the yield until it parks in its wakeable wait.
+    try me.yield_now() catch {
+        print("SOS threadwake: no yield: {}", error)
+        return
+    }
+    print("SOS threadwake: main wakes T in its wait: {}",
+          named(sos_thread_wake(T_ID)))
+    main_wait()
+
+    // T told the main thread and yielded, so it is runnable and not parked.
+    print("SOS threadwake: main wakes T while it runs: {}",
+          named(sos_thread_wake(T_ID)))
+    main_wait()
+
+    // T told the main thread and went on to its plain wait, where it is
+    // parked now.
+    print("SOS threadwake: main wakes T in its plain wait: {}",
+          named(sos_thread_wake(T_ID)))
+    let _ = sos_event_signal(EVENT_T, BITS)
+    main_wait()
+
+    // T woke itself, told the main thread and went on to a plain wait.
+    let _ = sos_event_signal(EVENT_T, BITS_AFTER)
+    match t.join() {
+        case Ok(exit) -> print("SOS threadwake: T exited code={}", exit),
+        case Err(status) -> {
+            print("SOS threadwake: T's join: {}", named(code(status)))
+        },
+    }
+
+    print("SOS threadwake: main wakes the exited T: {}",
+          named(sos_thread_wake(T_ID)))
+    let _ = move t
+    print("SOS threadwake: main wakes the freed T: {}",
+          named(sos_thread_wake(T_ID)))
+    let u = try proc.thread_create(run: u_entry, arg: 0,
+                                   stack_top: stack_top) catch {
+        print("SOS threadwake: no U: {}", error)
+        return
+    }
+    try u.start() catch {
+        print("SOS threadwake: U did not start: {}", error)
+        return
+    }
+    print("SOS threadwake: main wakes T's ID with U in its slot: {}",
+          named(sos_thread_wake(T_ID)))
+    let _ = try u.join() catch { 0 }
+    print("SOS threadwake: done")
+    let _ = proc.exit(EXIT_OK)
+}

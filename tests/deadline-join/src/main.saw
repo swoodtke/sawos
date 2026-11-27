@@ -1,0 +1,179 @@
+// A `ThreadOp.Join`'s deadline (spec §7, §8). The wait word, the Clock's word,
+// the Event and the Waiter are at the C altitude, and the thread is typed. T,
+// at this thread's level, parks plain on an Event only this thread signals,
+// and the image arms no tick, so the joiner's own deadline is the only thing
+// that can wake the machine while both are parked. Each line is one join:
+//
+//   deadline   T runs at the main thread's yield and parks on its Event;
+//              then a join until `DELAY_NS` past the clock's reading answers
+//              `TimedOut`, and the clock read after it is at or past that
+//              instant
+//   past       a word of 1, an instant already passed, answers `TimedOut`
+//              at once
+//   code       the Event signalled, a plain join (word 0) reads T's code:
+//              the early ends took the joiner off T's list and left T
+//              untouched
+//   exited     a join of the exited T with the passed word reads its code
+//              again: an exited thread answers before the deadline
+//
+// No line says how long a join took, only that its deadline passed.
+
+import sos.{System, ClockType, SosStatus, Thread, ALL_RIGHTS,
+            sos_system_clock_get, sos_system_process_self, sos_clock_now,
+            sos_wait_word, sos_process_event_create, sos_process_waiter_create,
+            sos_waiter_add, sos_waiter_wait, sos_event_signal}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+
+/// T's exit code.
+static T_CODE: UInt = 7
+
+/// How far past the clock's reading the first join's deadline is.
+static DELAY_NS: UInt64 = 20_000_000
+
+/// The main thread's wait word. T registers none, so its park is plain.
+unsafe static var WORD: UInt64 = 0
+
+/// The Waiter T parks on.
+unsafe static var T_WAITER: UInt = 0
+
+/// A wait record, over-provisioned for every profile.
+static RECORD_WORDS: Int = 128
+unsafe static var WAIT_BUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+/// T's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func word() unsafe -> UInt {
+    ((&var WORD) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading through `clock`.
+func now(clock: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(clock, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+/// Join `t` and print what the join answered under `round`.
+func join_and_show(t: &Thread, round: String) {
+    match t.join() {
+        case Ok(exit) -> print("SOS deadlinejoin: {}: Ok code={}", round, exit),
+        case Err(status) -> {
+            print("SOS deadlinejoin: {}: {}", round, named(code(status)))
+        },
+    }
+}
+
+func t_entry(arg: UInt) sync -> UInt {
+    t_run()
+}
+
+/// T: park plain on the Event, then exit with `T_CODE`.
+func t_run() unsafe sync -> UInt {
+    print("SOS deadlinejoin: T parks on its Event")
+    let status = sos_waiter_wait(
+        T_WAITER, (&var WAIT_BUF) as UnsafePointer<UInt>,
+        (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt))
+    print("SOS deadlinejoin: T's wait: {}", named(status))
+    T_CODE
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinejoin: no process handle: {}", error)
+        return
+    }
+    var raw_proc: UInt = NONE
+    var clock: UInt = NONE
+    var event: UInt = NONE
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var raw_proc) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_system_clock_get(
+           boot_handle, ClockType.Monotonic as UInt,
+           (&var clock) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_event_create(
+           raw_proc, 0, (&var event) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(
+           raw_proc, (&var T_WAITER) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(T_WAITER, event, KEY_EVENT, 0) != STATUS_OK {
+        print("SOS deadlinejoin: setup refused")
+        return
+    }
+    let t = try proc.thread_create(run: t_entry, arg: 0,
+                                   stack_top: top()) catch {
+        print("SOS deadlinejoin: no thread: {}", error)
+        return
+    }
+    try t.start() catch {
+        print("SOS deadlinejoin: T did not start: {}", error)
+        return
+    }
+    print("SOS deadlinejoin: register: {}",
+          named(sos_wait_word(word(), clock)))
+    // T runs at the yield until it parks on its Event, so the deadline is
+    // read with T already parked and the join parks behind it whatever the
+    // host's speed.
+    let me = try proc.thread_self() catch {
+        print("SOS deadlinejoin: no thread handle: {}", error)
+        return
+    }
+    try me.yield_now() catch {
+        print("SOS deadlinejoin: no yield: {}", error)
+        return
+    }
+
+    let deadline = now(clock) + DELAY_NS
+    WORD = deadline
+    match t.join() {
+        case Ok(exit) -> print("SOS deadlinejoin: deadline: Ok code={}", exit),
+        case Err(status) -> {
+            print("SOS deadlinejoin: deadline: {}, at or past it: {}",
+                  named(code(status)), now(clock) >= deadline)
+        },
+    }
+
+    WORD = 1
+    join_and_show(&t, "past")
+
+    let _ = sos_event_signal(event, 1)
+    WORD = 0
+    join_and_show(&t, "code")
+
+    WORD = 1
+    join_and_show(&t, "exited")
+
+    print("SOS deadlinejoin: done")
+    let _ = proc.exit(EXIT_OK)
+}

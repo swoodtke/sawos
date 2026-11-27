@@ -1,0 +1,203 @@
+// Test child for `wait_word_refusals`, at the C altitude: the wait word's
+// address and the Clock's word are its own to pick, which a typed caller
+// never names. The role its launcher gives it, as the bits of an Event under
+// `TAG_ROLE`, says which call it makes; each but the last two ends it.
+//
+//   UNALIGNED      registers a word four bytes past an eight-aligned one,
+//                  which is word-aligned on a 32-bit profile and not
+//                  doubleword-aligned on any: the `BadAlign` fault
+//   NO ROW         registers a word at an address in no row of its own: the
+//                  copy-in door's fault, `BadBuffer`
+//   NOT A CLOCK    registers with its Process handle's word as the Clock: the
+//                  `BadHandle` fault
+//   NO HANDLE      registers with a Clock word it has released: `BadHandle`
+//   NO READ        registers with a Clock sibling minted without
+//                  `ClockRight.Read`: the `AccessDenied` fault
+//   CLOCK FIRST    a bad Clock word with an unaligned address: the Clock is
+//                  decided first, `BadHandle`
+//   UNREGISTER     an address of 0 with a Clock word naming nothing: the word
+//                  is unregistered and the Clock word is not read, `Ok`
+//   FOREIGN WAKE   wakes its launcher's thread by ID: the `BadArg` fault
+//   NO CLOCK       registered with no Clock, parks on a finite deadline: the
+//                  `AccessDenied` fault at the park
+//   CLOCK          registered with a Clock, parks on the same deadline: it
+//                  has passed, `TimedOut`
+//   LATCHED        registered with no Clock, wakes itself and parks on the
+//                  same deadline: the `AccessDenied` fault, which is decided
+//                  before the latch
+
+import sos.{System, ClockType, ClockRight, SosStatus, ALL_RIGHTS,
+            sos_system_process_self, sos_system_clock_get,
+            sos_process_boot_handle_next, sos_process_exit, sos_event_receive,
+            sos_handle_mint, sos_handle_release, sos_wait_word,
+            sos_thread_wake, sos_thread_id, sos_park}
+
+static TAG_ROLE: UInt = 40
+static TAG_ROOT_ID: UInt = 41
+
+static ROLE_UNALIGNED: UInt = 1
+static ROLE_NO_ROW: UInt = 2
+static ROLE_NOT_A_CLOCK: UInt = 3
+static ROLE_NO_HANDLE: UInt = 4
+static ROLE_NO_READ: UInt = 5
+static ROLE_CLOCK_FIRST: UInt = 6
+static ROLE_UNREGISTER: UInt = 7
+static ROLE_FOREIGN_WAKE: UInt = 8
+static ROLE_NO_CLOCK: UInt = 9
+static ROLE_CLOCK: UInt = 10
+static ROLE_LATCHED: UInt = 11
+
+/// A call came back where it was to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// A step before the one under test was refused, or no role was given.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// An address in no row of any process: below every image.
+static NO_ROW_ADDR: UInt = 0x10
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+unsafe static var ROLE: UInt = 0
+unsafe static var ROOT_ID: UInt = 0
+
+/// The wait word, and a doubleword after it so that four bytes past it is
+/// still this process's memory.
+unsafe static var WORDS: [UInt64; 2] = [0; 2]
+
+func word() unsafe -> UInt {
+    ((&var WORDS) as UnsafePointer<UInt64>) as UInt
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        if rec[0] == TAG_ROLE {
+            ROLE = event_word(rec[2])
+        } else if rec[0] == TAG_ROOT_ID {
+            ROOT_ID = event_word(rec[2])
+        }
+    }
+}
+
+/// A Monotonic Clock's word, or `NONE`.
+func clock(boot_handle: UInt) unsafe -> UInt {
+    var c: UInt = NONE
+    if sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var c) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    c
+}
+
+/// A Clock word that names nothing: one minted and released.
+func released_clock(boot_handle: UInt) unsafe -> UInt {
+    let c = clock(boot_handle)
+    let _ = sos_handle_release(c)
+    c
+}
+
+/// Run this process's role, and answer the exit code a survivor ends with.
+func run_role(boot_handle: UInt, proc: UInt) unsafe -> UInt {
+    if ROLE == ROLE_UNALIGNED {
+        print("SOS waitword: unaligned: a word four bytes past a doubleword")
+        let _ = sos_wait_word(word() + 4, NONE)
+    } else if ROLE == ROLE_NO_ROW {
+        print("SOS waitword: no row: a word in no row of this process")
+        let _ = sos_wait_word(NO_ROW_ADDR, NONE)
+    } else if ROLE == ROLE_NOT_A_CLOCK {
+        print("SOS waitword: not a clock: the Process handle as the Clock")
+        let _ = sos_wait_word(word(), proc)
+    } else if ROLE == ROLE_NO_HANDLE {
+        print("SOS waitword: no handle: a released Clock word")
+        let _ = sos_wait_word(word(), released_clock(boot_handle))
+    } else if ROLE == ROLE_NO_READ {
+        print("SOS waitword: no read: a Clock without Read")
+        var narrow: UInt = NONE
+        if sos_handle_mint(clock(boot_handle),
+                           ClockRight.TimerCreate as UInt,
+                           (&var narrow) as UnsafePointer<UInt>) != STATUS_OK {
+            return EXIT_SETUP
+        }
+        let _ = sos_wait_word(word(), narrow)
+    } else if ROLE == ROLE_CLOCK_FIRST {
+        print("SOS waitword: clock first: a released Clock, an odd word")
+        let _ = sos_wait_word(word() + 4, released_clock(boot_handle))
+    } else if ROLE == ROLE_UNREGISTER {
+        print("SOS waitword: unregister: {}",
+              named(sos_wait_word(0, released_clock(boot_handle))))
+        return 0
+    } else if ROLE == ROLE_FOREIGN_WAKE {
+        print("SOS waitword: foreign wake: the launcher's thread")
+        let _ = sos_thread_wake(ROOT_ID)
+    } else if ROLE == ROLE_NO_CLOCK {
+        print("SOS waitword: no clock: register {}",
+              named(sos_wait_word(word(), NONE)))
+        WORDS[0] = 1
+        let _ = sos_park()
+    } else if ROLE == ROLE_CLOCK {
+        print("SOS waitword: clock: register {}",
+              named(sos_wait_word(word(), clock(boot_handle))))
+        WORDS[0] = 1
+        print("SOS waitword: clock: park {}", named(sos_park()))
+        return 0
+    } else if ROLE == ROLE_LATCHED {
+        print("SOS waitword: latched: register {}, wake itself {}",
+              named(sos_wait_word(word(), NONE)),
+              named(sos_thread_wake(sos_thread_id())))
+        WORDS[0] = 1
+        print("SOS waitword: latched: park {}", named(sos_park()))
+    } else {
+        return EXIT_SETUP
+    }
+    EXIT_SURVIVED
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    var proc: UInt = NONE
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS waitword: no process handle\n")
+        return
+    }
+    drain(proc)
+    let _ = sos_process_exit(proc, run_role(boot_handle, proc))
+}

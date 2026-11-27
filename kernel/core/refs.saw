@@ -85,8 +85,9 @@ import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
                      ThreadIndex}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
-import kcore.threads.{threads, ThreadState, frame_slot, free_thread_slot,
-                      ready_push}
+import kcore.threads.{CURRENT_THREAD, NEED_RESCHED, threads, ThreadState,
+                      a_thread_is_running, frame_slot, free_thread_slot,
+                      lock_recompute, ready_above, ready_push, unjoin_thread}
 import kcore.pslot.{HandleEntry, process_records}
 import kcore.objects.{
     EXCHANGES,
@@ -148,6 +149,7 @@ import kcore.waitables.{
     clear_pending_call,
     tie_call_reply,
     detach_attachment,
+    unblock_thread,
     interrupt_names,
     set_waitable_attachment,
     waitable_answer,
@@ -541,6 +543,55 @@ public(package) func revoke_blocked(w: Int) unsafe {
         write_result(frame_slot(slot), op_status(SosStatus.Revoked))
         threads().at(slot).state = ThreadState.Runnable
         ready_push(slot)
+    }
+}
+
+/// End thread `t`'s wakeable park early with `status`, `TimedOut` at its
+/// deadline or `Woken` at a wake (spec §7), and ready it.
+///
+/// The thread is taken off whatever it is parked on, as the op's own wake
+/// would, and nothing the op waited for is consumed. Four parks can be
+/// wakeable, and each leaves its own trace:
+///
+///   - a lock wait names its holder (`lock_holder`). It is unparked as a wake
+///     unparks it, and the holder is brought back to what its remaining
+///     waiters owe it, which undoes this waiter's raise. The waiters flag in
+///     the pair stays set, so the holder's give traps once for nobody. The
+///     holder can be the running thread, the waker or the thread the timer
+///     interrupted, and a lowered one below a ready thread gives the
+///     processor up at the trap's return.
+///   - a `Wait` is on a Waiter's blocked list. It leaves the list, and no
+///     record is written: the buffer is as the thread left it.
+///   - a `Join` is on its target's joiner list. It leaves the list, and the
+///     target is untouched.
+///   - a bare park (`PARK_OP`) is on nothing.
+///
+/// The pair is written here, once, as every wake writes a parked thread's.
+///
+/// `unsafe` though it names nothing unsafe: `t` must be parked wakeable.
+public(package) func end_park(t: ThreadIndex, status: SosStatus) unsafe {
+    let holder = borrow var thread = threads().at(t) {
+        let holder = thread.lock_holder
+        thread.lock_at = 0
+        thread.lock_holder = 0
+        thread.wait_buf = 0
+        holder
+    }
+    if holder == 0 && not unblock_thread(t) {
+        let _ = unjoin_thread(t)
+    }
+    write_result(frame_slot(t), op_status(status))
+    threads().at(t).state = ThreadState.Runnable
+    ready_push(t)
+    if holder != 0 {
+        lock_recompute(ThreadIndex(holder - 1))
+        // The recompute can lower the running thread itself, the holder the
+        // waiter raised, below the waiter `ready_push` just compared it with:
+        // the switch is asked for again against the level it has now.
+        if a_thread_is_running() &&
+           ready_above(threads().at(CURRENT_THREAD).level) {
+            NEED_RESCHED = true
+        }
     }
 }
 

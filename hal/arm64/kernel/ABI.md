@@ -298,11 +298,12 @@ entered once has no storage a second thread could have.
   does nothing for the timer. Here every tick goes round the ordinary
   claim/complete cycle, which is also why this profile exercises that cycle
   without the selftest line and Profile A does not.
-- **One compare register, two customers.** The scheduler tick and the Timer
-  objects share `cntp_cval_el0`, and the sharing is the kernel's arithmetic,
-  not this HAL's: the seam is `timer_now_ns()` + `timer_set_deadline_ns(at)` —
-  a counter read and an absolute deadline — and `kernel/core/` programs the
-  earliest deadline it owes anybody. What this machine does with such a
+- **One compare register, three customers.** The scheduler tick, the Timer
+  objects and the deadlines of parked threads share `cntp_cval_el0`, and the
+  sharing is the kernel's arithmetic, not this HAL's: the seam is
+  `timer_now_ns()` + `timer_set_deadline_ns(at)` — a counter read and an
+  absolute deadline — and `kernel/core/` programs the earliest deadline it
+  owes anybody. What this machine does with such a
   deadline: converts nanoseconds to counter units at `cntfrq_el0`, rounding up
   so a deadline never fires early; writes `cntp_cval_el0` before enabling, so a
   stale compare value cannot assert in the gap; then enables `cntp_ctl_el0` and

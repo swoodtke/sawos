@@ -20,7 +20,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, Priority, EventOp,
                MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
                RELEASE_OP, MINT_OP, INFO_OP, PANIC_OP, THREAD_ID_OP,
-               LOCK_WAIT_OP, LOCK_WAKE_OP, NO_HANDLE, HandleInfo,
+               LOCK_WAIT_OP, LOCK_WAKE_OP, WAIT_WORD_OP, THREAD_WAKE_OP,
+               PARK_OP, NO_HANDLE, HandleInfo,
                HandleKind}
 import sosrt.{section_enter, section_leave, section_registered,
              section_word}
@@ -362,6 +363,13 @@ public func sos_thread_start_band(handle: UInt, band: UInt) -> UInt {
 }
 
 /// Wait for a thread and take its exit value. Requires `ThreadRight.Join`.
+///
+/// A join that would park reads the caller's wait word (`sos_wait_word`): on a
+/// wakeable word it answers `SosStatus.Woken` for a wake, latched or made
+/// while it is parked, and `SosStatus.TimedOut` at the word's deadline, the
+/// target untouched either way, and a finite deadline from a thread
+/// registered with no Clock terminates the caller (`AccessDenied`). A target
+/// that has exited answers its code whatever the word says.
 @export("sos_thread_join")
 public func sos_thread_join(handle: UInt,
                             value_out: UnsafePointer<UInt>) unsafe -> UInt {
@@ -409,7 +417,12 @@ public func sos_thread_id() unsafe -> UInt {
 /// while the caller parks, and the answer is `SosStatus.Ok` once it gives the
 /// lock back, after which the caller swaps again. A lock already free answers
 /// `Ok` at once. A holder that has exited answers `SosStatus.Revoked`, and so
-/// does a wait parked on one when it exits.
+/// does a wait parked on one when it exits. A wait that would park reads the
+/// caller's wait word (`sos_wait_word`): on a wakeable word it answers
+/// `SosStatus.Woken` for a wake, latched or made while it is parked, and
+/// `SosStatus.TimedOut` at the word's deadline, and the holder is brought
+/// back to its own level; a finite deadline from a thread registered with no
+/// Clock terminates the caller (`AccessDenied`).
 ///
 /// Terminating the caller, decided in this order: a `lock` that is not
 /// word-aligned, a pair the kernel cannot write, an owner word that is the
@@ -434,6 +447,54 @@ public func sos_lock_wait(lock: UInt) -> UInt {
 @export("sos_lock_wake")
 public func sos_lock_wake(lock: UInt) -> UInt {
     sos_syscall1(NO_HANDLE, LOCK_WAKE_OP, lock)
+}
+
+/// Register the calling thread's wait word (spec §7): the eight-aligned
+/// doubleword at `word` in its own memory, which the kernel reads at each op's
+/// first park. A word of 0 parks plain, as if none were registered;
+/// `UInt64.max` parks wakeable with no deadline, ended only by a wake; and any
+/// other value parks wakeable until that instant on the Monotonic clock, which
+/// ends the park `SosStatus.TimedOut`. A wakeable park another thread wakes
+/// (`sos_thread_wake`) ends `SosStatus.Woken`. Neither end consumes what the
+/// op waited for.
+///
+/// `clock` is a Monotonic Clock handle carrying `ClockRight.Read`, or
+/// `NO_HANDLE`. A thread registered with none may write only 0 and
+/// `UInt64.max`, and a finite deadline from it terminates it at the park
+/// (`AccessDenied`). The right is checked here, once. A `word` of 0
+/// unregisters, and a later registration replaces the earlier one.
+///
+/// Terminating the caller, in this order: a `clock` word that names nothing or
+/// names no Clock (`BadHandle`), a Clock without `Read` (`AccessDenied`), a
+/// `word` that is not eight-aligned (`BadAlign`) and a doubleword outside the
+/// caller's readable memory (`BadBuffer`).
+@export("sos_wait_word")
+public func sos_wait_word(word: UInt, clock: UInt) unsafe -> UInt {
+    var unused: UInt = 0
+    sos_syscall3(NO_HANDLE, WAIT_WORD_OP, word, clock, 0,
+                 (&var unused) as UnsafePointer<UInt>)
+}
+
+/// Wake the thread of this process whose ID is `id` (spec §7), with no handle
+/// and no right. A thread parked wakeable has its park ended
+/// `SosStatus.Woken`; a thread parked plain, or not parked, has its latch set,
+/// and its next wakeable park answers `Woken` at once. A thread may wake
+/// itself. It answers `Ok`, or `SosStatus.Revoked` for a thread that has
+/// exited. An ID naming another process's thread, or no thread of this one,
+/// terminates the caller (`BadArg`).
+@export("sos_thread_wake")
+public func sos_thread_wake(id: UInt) -> UInt {
+    sos_syscall1(NO_HANDLE, THREAD_WAKE_OP, id)
+}
+
+/// Park the calling thread on nothing (spec §7) until its wait word's deadline,
+/// answered `SosStatus.TimedOut`, or a wake, answered `SosStatus.Woken`. It
+/// is always wakeable, so a latched wake answers at once, and it never answers
+/// `Ok`. No word, 0 and `UInt64.max` all mean no deadline: only a wake ends
+/// such a park. A park while the caller's section is held terminates it.
+@export("sos_park")
+public func sos_park() -> UInt {
+    sos_syscall1(NO_HANDLE, PARK_OP, 0)
 }
 
 /// Make an Event owned by the process the handle names, with its handle in the
@@ -778,6 +839,13 @@ public func sos_waiter_remove(handle: UInt, key: UInt) -> UInt {
 /// The record's layout is public: word 0 the attacher's key, word 1 a
 /// `WaitTag`, word 2 the payload. A C caller reads the words; a Saw caller gets
 /// them decoded into a `WaitResult` by `Waiter.wait`.
+///
+/// A wait that would park reads the caller's wait word (`sos_wait_word`): on a
+/// wakeable word it answers `SosStatus.Woken` for a wake, latched or made
+/// while it is parked, and `SosStatus.TimedOut` at the word's deadline, with
+/// no record written and nothing consumed, and a finite deadline from a thread
+/// registered with no Clock terminates the caller (`AccessDenied`). A ready
+/// attachment is delivered whatever the word says.
 @export("sos_waiter_wait")
 public func sos_waiter_wait(handle: UInt, buf: UnsafePointer<UInt>,
                             cap: UInt) unsafe -> UInt {

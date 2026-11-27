@@ -1,0 +1,171 @@
+// A park's record lasts only as long as the park (spec §7). The wait word, the
+// Event, the Waiters and the pipe are at the C altitude, and the thread is
+// typed. S runs at the main thread's level, and the image arms no tick, so
+// every switch is one a thread makes.
+//
+// The main thread waits wakeable on its Event (`UInt64.max`, registered with
+// no Clock), and S, which runs while it is parked, signals the Event: the
+// wait is answered by the delivery, `Ok`. The main thread then calls S through
+// a pipe with its word at 0. The call's parks read no word and record
+// nothing, so they are plain whatever the last park recorded. S takes the
+// request and wakes the main thread, parked in the call's reply park: the wake
+// latches, the call is answered by S's reply, `Ok`, and the main thread's next
+// park answers `Woken` from the latch.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_wait_word, sos_thread_wake,
+            sos_thread_id, sos_park, sos_process_event_create,
+            sos_process_waiter_create, sos_process_pipe_create,
+            sos_waiter_add, sos_waiter_wait, sos_event_signal,
+            sos_pipe_inlet_call, sos_pipe_outlet_take,
+            sos_pipe_request_reply}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+static KEY_OUTLET: UInt = 2
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The main thread's wait word. S registers none.
+unsafe static var WORD: UInt64 = 0
+
+unsafe static var PROC: UInt = 0
+unsafe static var MAIN_ID: UInt = 0
+unsafe static var EVENT_MAIN: UInt = 0
+unsafe static var WAITER_MAIN: UInt = 0
+unsafe static var WAITER_S: UInt = 0
+/// The pipe's inlet, then its outlet.
+unsafe static var ENDS: [UInt; 2] = [0; 2]
+
+/// A wait record for each thread, over-provisioned for every profile.
+static RECORD_WORDS: Int = 128
+unsafe static var BUF_MAIN: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var BUF_S: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+/// An empty message's send record (body address, length, then the handle
+/// words), and room for a take record and for the call's reply record.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REPLY_ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var TAKEN: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var REPLY: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+/// S's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func record_bytes() -> UInt {
+    (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func send_bytes() -> UInt {
+    (SEND_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+func s_entry(arg: UInt) sync -> UInt {
+    s_run()
+}
+
+/// S: answer the main thread's wait, then serve its call, waking it first.
+func s_run() unsafe sync -> UInt {
+    let _ = sos_event_signal(EVENT_MAIN, 1)
+    let _ = sos_waiter_wait(WAITER_S, (&var BUF_S) as UnsafePointer<UInt>,
+                            record_bytes())
+    if sos_pipe_outlet_take(ENDS[1], (&var TAKEN) as UnsafePointer<UInt>,
+                            record_bytes()) != STATUS_OK {
+        print("SOS parkrecord: S's take was refused")
+        return 1
+    }
+    print("SOS parkrecord: S wakes the main thread in its call: {}",
+          named(sos_thread_wake(MAIN_ID)))
+    if sos_pipe_request_reply(
+           TAKEN[0], (&var REPLY_ARGS) as UnsafePointer<UInt>,
+           send_bytes()) != STATUS_OK {
+        print("SOS parkrecord: S's reply was refused")
+    }
+    0
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS parkrecord: no process handle: {}", error)
+        return
+    }
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var PROC) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_event_create(
+           PROC, 0, (&var EVENT_MAIN) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(
+           PROC, (&var WAITER_MAIN) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(WAITER_MAIN, EVENT_MAIN, KEY_EVENT, 0) != STATUS_OK ||
+       sos_process_pipe_create(
+           PROC, (&var ENDS) as UnsafePointer<UInt>,
+           2 * (sizeof<UInt>() as UInt)) != STATUS_OK ||
+       sos_process_waiter_create(
+           PROC, (&var WAITER_S) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(WAITER_S, ENDS[1], KEY_OUTLET, 0) != STATUS_OK {
+        print("SOS parkrecord: setup refused")
+        return
+    }
+    MAIN_ID = sos_thread_id()
+    let _ = sos_wait_word(((&var WORD) as UnsafePointer<UInt64>) as UInt, NONE)
+    let top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+              (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let s = try proc.thread_create(run: s_entry, arg: 0, stack_top: top) catch {
+        print("SOS parkrecord: no S: {}", error)
+        return
+    }
+    try s.start() catch {
+        print("SOS parkrecord: S did not start: {}", error)
+        return
+    }
+
+    // S runs while the main thread is parked here, and signals.
+    WORD = NEVER
+    let waited = sos_waiter_wait(WAITER_MAIN,
+                                 (&var BUF_MAIN) as UnsafePointer<UInt>,
+                                 record_bytes())
+    WORD = 0
+    print("SOS parkrecord: the main thread's wakeable wait: {}", named(waited))
+
+    var value: UInt = 0
+    let called = sos_pipe_inlet_call(
+        ENDS[0], (&var ARGS) as UnsafePointer<UInt>, send_bytes(),
+        (&var REPLY) as UnsafePointer<UInt>,
+        (&var value) as UnsafePointer<UInt>)
+    print("SOS parkrecord: the main thread's call: {}", named(called))
+
+    WORD = NEVER
+    let kept = sos_park()
+    WORD = 0
+    print("SOS parkrecord: the main thread's park after the call: {}",
+          named(kept))
+    let _ = try s.join() catch { 0 }
+    print("SOS parkrecord: done")
+    let _ = proc.exit(EXIT_OK)
+}

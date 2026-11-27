@@ -4799,8 +4799,8 @@ reads one word for every such end, and what a panic does is the kernel's.
 fixed-width word (kind in the high bits — `Running` beside the three below —
 code in the low). Thread `Start`/`Join`/`Exit`/`Yield`; `Start` carries the
 thread's band (§7). Every thread has an ID, and `LOCK_WAIT_OP` and
-`LOCK_WAKE_OP` are the in-process lock (§7). Not built yet: the wait word's
-ops, `WAIT_WORD_OP`, `THREAD_WAKE_OP` and `PARK_OP` (§7, §11).
+`LOCK_WAKE_OP` are the in-process lock (§7), and `WAIT_WORD_OP`,
+`THREAD_WAKE_OP` and `PARK_OP` the wait word's ops (§7).
 A joiner parks on the target's list and is answered exactly once through the
 funnel §2.2 describes. A joiner whose wait word is wakeable (§7) can be
 answered `TimedOut` or `Woken` instead: it is taken off the target's list and
@@ -5572,10 +5572,11 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **Deadlines and wakes on parks** (§7): the wait word, `WAIT_WORD_OP`,
-  `THREAD_WAKE_OP` and `PARK_OP`, the `TimedOut` and `Woken` statuses (§5.7),
-  each park's early end (§2.1, §2.2, §8), the wakeable `Call`'s claim, and
-  the compiled `Handle` default of 16 (§2.9). Specified, not built yet.
+- **Deadlines and wakes on the pipe parks** (§2.1, §7): `Call`'s room and
+  reply parks, `Resolve`, and `ReplyWait`'s wait leg read no wait word yet,
+  so each parks plain whatever the word holds, and a wakeable `Call` mints no
+  claim. The other parks (`Wait`, `Join`, `LOCK_WAIT_OP`, `PARK_OP`) are
+  built.
 - **The task executor** (§10.1): `sos.exec`'s seams, the drive in the typed
   wrappers, `send`'s fallback, the one-word lock (§7) and the close at a
   thread's end (§8). Specified, not built yet; until it is, nothing in `sos`

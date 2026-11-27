@@ -254,14 +254,15 @@ and they are compiled from one definition so they cannot skew.
   a split 64-bit counter needs on a 32-bit machine: a carry-safe read (the high
   half either side of the low one) and a write order that never leaves the
   comparator naming a deadline in the past (low half to all-ones first).
-- **One comparator, two customers.** The scheduler tick and the Timer objects
-  share `mtimecmp`, and the sharing is the kernel's arithmetic, not this HAL's:
-  the seam is `timer_now_ns()` + `timer_set_deadline_ns(at)` — a counter read
-  and an absolute deadline — and `kernel/core/` programs the earliest deadline
-  it owes anybody. What this machine does with such a deadline: converts
-  nanoseconds to counter units at the board's 10 MHz timebase (100 ns a unit,
-  which divides exactly), rounding up so a deadline never fires early, and
-  writes the comparator through the split-write order above. The kernel's
+- **One comparator, three customers.** The scheduler tick, the Timer objects
+  and the deadlines of parked threads share `mtimecmp`, and the sharing is the
+  kernel's arithmetic, not this HAL's: the seam is `timer_now_ns()` +
+  `timer_set_deadline_ns(at)` — a counter read and an absolute deadline — and
+  `kernel/core/` programs the earliest deadline it owes anybody. What this
+  machine does with such a deadline: converts nanoseconds to counter units at
+  the board's 10 MHz timebase (100 ns a unit, which divides exactly), rounding
+  up so a deadline never fires early, and writes the comparator through the
+  split-write order above. The kernel's
   "never" deadline (`UInt64.max`) saturates to a counter value this machine
   never reaches, which is also what keeps the idle poll quiet when nothing is
   due.

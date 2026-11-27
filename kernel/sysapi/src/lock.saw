@@ -76,8 +76,12 @@ extension Lock {
     /// calling thread's level while it does.
     ///
     /// `Err(SosStatus.Revoked)` when the holder exited without giving it
-    /// back: nothing ever will. Taking a lock the calling thread holds, or
-    /// waiting inside a held section, ends the process.
+    /// back: nothing ever will. A thread whose wait word is wakeable
+    /// (`sos_wait_word`) can be answered `Err(SosStatus.Woken)` for a wake, or
+    /// `Err(SosStatus.TimedOut)` at the word's deadline, without the lock; a
+    /// word at 0 waits plain. Taking a lock the calling thread holds, waiting
+    /// inside a held section, or waiting on a finite deadline after
+    /// registering with no Clock (`AccessDenied`) ends the process.
     public func take(&self) -> Result<Void, SosStatus> {
         checked(sos_lock_take(self.pair()))
     }
@@ -100,8 +104,10 @@ extension Lock {
 /// Take the lock whose two words are at `lock` (spec §7): swap the owner word
 /// from 0 to the caller's ID, and while another thread holds it, wait in the
 /// kernel (`sos_lock_wait`), which raises the holder. Answers `SosStatus.Ok`
-/// once the caller holds it, or `SosStatus.Revoked` when its holder exited
-/// holding it. Taking a lock the caller holds ends the process.
+/// once the caller holds it, `SosStatus.Revoked` when its holder exited
+/// holding it, and, on a wakeable wait word, `SosStatus.Woken` or
+/// `SosStatus.TimedOut` without it, as `sos_lock_wait` answers them. Taking a
+/// lock the caller holds ends the process.
 @export("sos_lock_take")
 public func sos_lock_take(lock: UInt) unsafe -> UInt {
     let words = lock as UnsafePointer<Atomic<Int>>

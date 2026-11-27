@@ -249,6 +249,28 @@ public(package) struct ThreadSlot {
     /// parked on no lock): the holder this thread raises for as long as it
     /// is parked there.
     public(package) lock_holder: Int,
+    /// The user address of the thread's wait word (spec §7), the doubleword
+    /// `WAIT_WORD_OP` registered, or 0 when none is: a thread with none parks
+    /// plain. The kernel reads the word once per op, at the op's first park.
+    public(package) wait_word: UInt,
+    /// Whether a Monotonic Clock came with that registration. Only then may
+    /// the word hold a finite deadline, which is a reading of the clock; the
+    /// right was checked at the registration, so a park asks nothing more.
+    public(package) wait_clock: Bool,
+    /// A wake made while the thread was not parked wakeable (spec §7's latch):
+    /// its next wakeable park answers `Woken` at once and clears it. A plain
+    /// park neither reads nor clears it.
+    public(package) wake_latched: Bool,
+    /// Whether the thread's current park can end early, at its deadline or at
+    /// a wake. It means something only while the thread is `Blocked`:
+    /// `ready_push`, which every wake goes through, clears it, so a park that
+    /// does not record one is plain.
+    public(package) park_wakeable: Bool,
+    /// The current wakeable park's deadline on the Monotonic clock, or
+    /// `UInt64.max` for none. It means something only while `park_wakeable`
+    /// is set. It is recorded at the park, so a write to the word while the
+    /// thread is parked changes nothing for that op.
+    public(package) park_deadline: UInt64,
     /// Handle entries naming this thread, plus the staged messages that carry
     /// it.
     public(package) refs: UInt16,
@@ -307,7 +329,9 @@ unsafe static var THREADS: ThreadTable = ThreadTable(slab: Slab<ThreadSlot, MAX_
                         process: 0, exit_code: 0, joiners: 0, link: 0,
                         wait_buf: 0, call_pipe: 0, call_claim: 0, call_src: 0,
                         call_len: 0, latency_irq: 0, latency_from: 0,
-                        lock_at: 0, lock_holder: 0,
+                        lock_at: 0, lock_holder: 0, wait_word: 0,
+                        wait_clock: false, wake_latched: false,
+                        park_wakeable: false, park_deadline: UInt64.max,
                         refs: 0, generation: 0); MAX_THREADS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
@@ -452,6 +476,10 @@ func level_bit(level: Int) -> UInt8 {
 /// Ready `slot` at the tail of its level, and ask for a switch when that level
 /// is above the running thread's (spec §7's preemption on wake).
 ///
+/// A thread on a ready list is parked nowhere, so its park stops being
+/// wakeable here, whichever wake ended it: a deadline recorded for a park
+/// that a delivery ended is never expired later.
+///
 /// Every wake comes through here, so this is the one place the compare is
 /// made; the switch is `pick_next`'s, at the user-return boundary of the trap
 /// that made the wake. A wake at or below the running level asks for nothing,
@@ -469,6 +497,7 @@ public(package) func ready_push(slot: ThreadIndex) unsafe {
     let level = borrow var thread = threads().at(slot) {
         let level = thread.level as Int
         thread.link = 0
+        thread.park_wakeable = false
         level
     }
     if READY_TAIL[level] == 0 {
@@ -761,7 +790,9 @@ public(package) func free_thread_slot(t: ThreadIndex) unsafe {
                             wait_buf: 0, call_pipe: 0, call_claim: 0,
                             call_src: 0, call_len: 0, latency_irq: 0,
                             latency_from: 0, lock_at: 0, lock_holder: 0,
-                            refs: 0,
+                            wait_word: 0, wait_clock: false,
+                            wake_latched: false, park_wakeable: false,
+                            park_deadline: UInt64.max, refs: 0,
                             generation: next as UInt32)
     }
 }
@@ -872,6 +903,137 @@ public(package) func block_on_join(slot: ThreadIndex, target: ThreadIndex) unsaf
     threads().at(slot).link = threads().at(target).joiners
     threads().at(target).joiners = slot + 1
     NEED_RESCHED = true
+}
+
+// -----------------------------------------------------------------------------
+// Deadlines on parks (spec §2.6, §7)
+// -----------------------------------------------------------------------------
+
+extension ThreadSlot {
+    /// Whether this thread is parked wakeable with a deadline before
+    /// `instant`. Asked with `UInt64.max`, whether it has a deadline at all.
+    public(package) func deadline_before(&self, instant: UInt64) -> Bool {
+        match self.state {
+            case Blocked -> self.park_wakeable && self.park_deadline < instant,
+            case _ -> false,
+        }
+    }
+
+    /// Whether this thread is parked wakeable with a deadline at or before
+    /// `now`: one the clock has reached.
+    public(package) func deadline_due(&self, now: UInt64) -> Bool {
+        match self.state {
+            case Blocked -> self.park_wakeable && self.park_deadline <= now,
+            case _ -> false,
+        }
+    }
+}
+
+/// The earliest deadline a parked thread is waiting on, or `soonest` if none is
+/// sooner: the parked threads' half of `reprogram_timer`'s question. A scan of
+/// the thread slab, as the Timers' half scans theirs.
+public(package) func earliest_park_deadline(soonest: UInt64) -> UInt64 {
+    var next = soonest
+    var t: Int = 0
+    while t < threads().capacity() {
+        borrow var thread = threads().at(ThreadIndex(t)) {
+            if thread.deadline_before(next) {
+                next = thread.park_deadline
+            }
+        }
+        t = t + 1
+    }
+    next
+}
+
+/// Take thread `t` off the joiner list it is parked on, and answer whether it
+/// was on one. A walk of every thread's list with a trailing pointer, as
+/// `unjoin_process` makes: a thread is on at most one list.
+public(package) func unjoin_thread(t: ThreadIndex) -> Bool {
+    var target: Int = 0
+    while target < threads().capacity() {
+        var prev: Int = 0
+        var cur = threads().at(ThreadIndex(target)).joiners
+        while cur != 0 {
+            let next = threads().at(ThreadIndex(cur - 1)).link
+            if cur == t + 1 {
+                if prev == 0 {
+                    threads().at(ThreadIndex(target)).joiners = next
+                } else {
+                    threads().at(ThreadIndex(prev - 1)).link = next
+                }
+                threads().at(t).link = 0
+                return true
+            }
+            prev = cur
+            cur = next
+        }
+        target = target + 1
+    }
+    false
+}
+
+// -----------------------------------------------------------------------------
+// Inheritance levels (spec §7)
+// -----------------------------------------------------------------------------
+//
+// The lock itself, its wait and its wake, is `kcore.sched`'s; these are the
+// walks that move a holder's level, here because a lock wait that ends at its
+// deadline is answered from the timer's interrupt, which sits below `sched`.
+
+/// Raise thread `holder`, and each holder along the chain it is parked in, to
+/// at least `level`.
+///
+/// It stops at the first thread already at or above `level`: a holder is
+/// always at least the level of every thread parked behind it, so the rest of
+/// the chain is too.
+public(package) func lock_raise(holder: ThreadIndex, level: UInt8) {
+    var h = holder
+    while threads().at(h).level < level {
+        set_level(h, level)
+        h = borrow var thread = threads().at(h) {
+            if thread.lock_holder == 0 {
+                return
+            }
+            ThreadIndex(thread.lock_holder - 1)
+        }
+    }
+}
+
+/// The level thread `t` is owed: the highest of its base level and the level
+/// of every thread parked on a lock naming it as the holder. A scan of the
+/// thread slab, since the kernel keeps no list of a holder's waiters.
+func lock_owed(t: ThreadIndex) -> UInt8 {
+    var level = threads().at(t).base_level
+    var w: Int = 0
+    while w < threads().capacity() {
+        borrow var waiter = threads().at(ThreadIndex(w)) {
+            if waiter.lock_holder == t + 1 && waiter.level > level {
+                level = waiter.level
+            }
+        }
+        w = w + 1
+    }
+    level
+}
+
+/// Bring thread `t`'s level to what it is owed, and so on along the chain it
+/// is parked in, until a thread's level does not change.
+public(package) func lock_recompute(t: ThreadIndex) {
+    var h = t
+    while {
+        let owed = lock_owed(h)
+        if owed == threads().at(h).level {
+            return
+        }
+        set_level(h, owed)
+        h = borrow var thread = threads().at(h) {
+            if thread.lock_holder == 0 {
+                return
+            }
+            ThreadIndex(thread.lock_holder - 1)
+        }
+    }
 }
 
 /// The calling process: the process of the running thread. Before there are

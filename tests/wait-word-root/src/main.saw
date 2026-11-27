@@ -1,0 +1,124 @@
+// The wait word's refusals (spec §7), from root's side: `wait-word-child`
+// launched once per round with the round's role and root's main thread's ID,
+// started on a System that may get a Clock, and waited out. Each round prints
+// the child's status word:
+//
+//   SOS waitwords: <round> ended status=<word>
+//
+// `Exited` (1) << 16 with the child's code, or `Faulted` (2) << 16 with the
+// reason: `BadHandle` 1, `AccessDenied` 3, `BadArg` 9, `BadAlign` 10 and
+// `BadBuffer` 11. The child's own comment says what each round does.
+
+import sos.{Process, Memory, BootSet, SosStatus, SystemRight, sos_thread_id}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// What root gives the child.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_ROOT_ID: UInt = 41
+
+static KEY_DEATH: UInt = 6
+
+static ROLE_UNALIGNED: UInt = 1
+static ROLE_NO_ROW: UInt = 2
+static ROLE_NOT_A_CLOCK: UInt = 3
+static ROLE_NO_HANDLE: UInt = 4
+static ROLE_NO_READ: UInt = 5
+static ROLE_CLOCK_FIRST: UInt = 6
+static ROLE_UNREGISTER: UInt = 7
+static ROLE_FOREIGN_WAKE: UInt = 8
+static ROLE_NO_CLOCK: UInt = 9
+static ROLE_CLOCK: UInt = 10
+static ROLE_LATCHED: UInt = 11
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    try round(&img, &ram, "unaligned", ROLE_UNALIGNED)
+    try round(&img, &ram, "no row", ROLE_NO_ROW)
+    try round(&img, &ram, "not a clock", ROLE_NOT_A_CLOCK)
+    try round(&img, &ram, "no handle", ROLE_NO_HANDLE)
+    try round(&img, &ram, "no read", ROLE_NO_READ)
+    try round(&img, &ram, "clock first", ROLE_CLOCK_FIRST)
+    try round(&img, &ram, "unregister", ROLE_UNREGISTER)
+    try round(&img, &ram, "foreign wake", ROLE_FOREIGN_WAKE)
+    try round(&img, &ram, "no clock", ROLE_NO_CLOCK)
+    try round(&img, &ram, "clock", ROLE_CLOCK)
+    try round(&img, &ram, "latched", ROLE_LATCHED)
+    print("SOS waitwords: done")
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS waitwords: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS waitwords: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// One launch of the child, told `role` and root's main thread's ID, started
+/// and waited out.
+func round(img: &Memory, ram: &Memory, name: String,
+           role: UInt) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try tell(&child, TAG_ROLE, role)
+    try tell(&child, TAG_ROOT_ID, sos_thread_id())
+    try start(&child)
+    try ended(move child, name)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(child: &Process, tag: UInt, value: UInt) -> Result<Void, SosStatus> {
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` a System under `TAG_BOOT` and start it on it.
+func start(child: &Process) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Wait for `child`'s death and print its status word.
+func ended(child: Process, name: String) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS waitwords: {} ended status={}", name, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

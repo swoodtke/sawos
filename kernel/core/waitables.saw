@@ -821,6 +821,41 @@ public(package) func unblock_process(p: Int) unsafe {
     }
 }
 
+/// Take thread `t` off the Waiter's blocked list it is parked on, and answer
+/// whether it was on one: a `Wait` ending early (spec §2.2), which leaves the
+/// Waiter's other parked threads where they were. A walk of every live
+/// Waiter's list with a trailing pointer, as `unblock_process` makes.
+public(package) func unblock_thread(t: ThreadIndex) unsafe -> Bool {
+    var w: Int = 0
+    while w < WAITERS.capacity() {
+        match WAITERS[w].state {
+            case Live -> {
+                var prev: Int = 0
+                var cur = WAITERS[w].blocked
+                while cur != 0 {
+                    let next = threads().at(ThreadIndex(cur - 1)).link
+                    if cur == t + 1 {
+                        if prev == 0 {
+                            WAITERS[w].blocked = next
+                        } else {
+                            threads().at(ThreadIndex(prev - 1)).link = next
+                        }
+                        threads().at(t).link = 0
+                        return true
+                    }
+                    prev = cur
+                    cur = next
+                }
+            },
+            // Nothing parks on an invalid Waiter.
+            case Invalid -> {},
+            case Free -> {},
+        }
+        w = w + 1
+    }
+    false
+}
+
 /// Park the running thread on `w`'s blocked list, remembering where its record
 /// goes. `dst` has already been through `copy_out_check`.
 public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {

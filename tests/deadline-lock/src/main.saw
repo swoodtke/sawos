@@ -1,0 +1,353 @@
+// A `LOCK_WAIT_OP`'s early end and its holder's level (spec §7). The wait
+// word, the Clock's word, the Events, the Waiters and the lock's pairs are at
+// the C altitude, and the threads are typed. The manifest puts `Low` at level
+// 1, `Normal` at 2 and `High` at 3; the main thread runs at 2, and the image
+// arms no tick, so every switch is one a thread makes.
+//
+// L (`Low`) takes the lock and parks plain on its Event. H (`High`) waits for
+// the lock and raises L to 3. Each observation signals L's Event and prints
+// a line: a raised L runs at the signal, ahead of the line; L at its own level
+// runs only once the main thread parks, after it. L signals the main thread
+// back each time. H's rounds each begin at the main thread's signal:
+//
+//   raised      H waits wakeable with no deadline (`UInt64.max`, registered
+//               with no Clock), which raises L: L runs, then the line
+//   wake        the main thread wakes H: H's wait answers `Woken`, ahead of
+//               the main thread's own line, since H runs above it
+//   lowered     the early end lowered L to its own level: the line, then L
+//   timed out   H, registered with the Clock, waits until `DELAY_NS` past the
+//               clock's reading while the main thread waits for it:
+//               `TimedOut`, at or past the deadline
+//   lowered     L is at its own level again: the line, then L
+//   L wakes H   H waits wakeable again, raising L, and L, running raised,
+//               wakes it and then prints: the wake lowered L below H, so H's
+//               `Woken` comes first
+//   L spins     H waits on a deadline again, raising L, and L, running
+//               raised, spins until H has printed: the deadline's expiry
+//               lowers L below H, so H runs and L's spin ends
+//   latched     H wakes itself and waits for the held lock: `Woken` at once
+//   free lock   H waits for a second lock, which is free, with a passed word
+//               and then with a latched wake: `Ok` both times, readiness
+//               first, and the latch is kept for H's next park
+//
+// L then gives the lock back: the waiters flag H's waits left set makes one
+// wake that answers nobody, `Ok`. No line says how long a wait took, only
+// that its deadline passed.
+
+import sos.{System, ClockType, SosStatus, Thread, Priority, ALL_RIGHTS,
+            sos_system_clock_get, sos_system_process_self, sos_clock_now,
+            sos_wait_word, sos_thread_wake, sos_thread_id, sos_park,
+            sos_process_event_create, sos_process_waiter_create,
+            sos_waiter_add, sos_waiter_wait, sos_event_signal, sos_lock_take,
+            sos_lock_give, sos_lock_wait}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+
+/// What the main thread signals L with: run once, give the lock back and
+/// exit, wake H, or spin until H has printed. H takes `GO` alone.
+static GO: UInt = 1
+static STOP: UInt = 2
+static WAKE_H: UInt = 4
+static SPIN: UInt = 8
+
+/// How far past the clock's reading each of H's deadlines is.
+static DELAY_NS: UInt64 = 20_000_000
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// H's wait word. Neither L nor the main thread registers one.
+unsafe static var WORD_H: UInt64 = 0
+
+/// The lock's pair: the holder's ID, then the waiters flag. The second is a
+/// lock nobody takes.
+unsafe static var PAIR: [UInt; 2] = [0; 2]
+unsafe static var FREE_PAIR: [UInt; 2] = [0; 2]
+
+/// Set by H once its deadline's line is printed; `L spins` reads it.
+static H_DONE: Atomic<Int> = Atomic(0)
+
+/// The Clock's word, H's ID, and each thread's Event and Waiter.
+unsafe static var CLOCK: UInt = 0
+unsafe static var H_ID: UInt = 0
+unsafe static var EVENT_L: UInt = 0
+unsafe static var WAITER_L: UInt = 0
+unsafe static var EVENT_H: UInt = 0
+unsafe static var WAITER_H: UInt = 0
+unsafe static var EVENT_MAIN: UInt = 0
+unsafe static var WAITER_MAIN: UInt = 0
+
+/// A wait record for each thread, over-provisioned for every profile.
+static RECORD_WORDS: Int = 128
+unsafe static var BUF_L: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var BUF_H: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var BUF_MAIN: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+/// Where a wait record carries an Event's bits.
+static PAYLOAD_WORD: Int = 2
+
+/// The threads' stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_L: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_H: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_bytes() -> UInt {
+    (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func record_bytes() -> UInt {
+    (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func pair() unsafe -> UInt {
+    ((&var PAIR) as UnsafePointer<UInt>) as UInt
+}
+
+func free_pair() unsafe -> UInt {
+    ((&var FREE_PAIR) as UnsafePointer<UInt>) as UInt
+}
+
+func word_h() unsafe -> UInt {
+    ((&var WORD_H) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    if status == code(SosStatus.Revoked) {
+        return "Revoked"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading.
+func now() unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(CLOCK, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+/// An Event and a Waiter holding it, or false.
+func made(proc: UInt, event: UnsafePointer<UInt>,
+          waiter: UnsafePointer<UInt>) unsafe -> Bool {
+    sos_process_event_create(proc, 0, event) == STATUS_OK &&
+        sos_process_waiter_create(proc, waiter) == STATUS_OK &&
+        sos_waiter_add(waiter[0], event[0], KEY_EVENT, 0) == STATUS_OK
+}
+
+func l_entry(arg: UInt) sync -> UInt {
+    l_run()
+}
+
+/// L: take the lock, tell the main thread, then act on each signal until
+/// `STOP`, and give the lock back.
+func l_run() unsafe sync -> UInt {
+    if sos_lock_take(pair()) != STATUS_OK {
+        print("SOS deadlinelock: L's take was refused")
+    }
+    let _ = sos_event_signal(EVENT_MAIN, GO)
+    while {
+        let _ = sos_waiter_wait(WAITER_L, (&var BUF_L) as UnsafePointer<UInt>,
+                                record_bytes())
+        let bits = BUF_L[PAYLOAD_WORD]
+        if (bits & STOP) != 0 {
+            break
+        }
+        if (bits & WAKE_H) != 0 {
+            let woke = sos_thread_wake(H_ID)
+            print("SOS deadlinelock: L woke H: {}", named(woke))
+        } else if (bits & SPIN) != 0 {
+            while H_DONE.load() == 0 {}
+            print("SOS deadlinelock: L saw H's line")
+        } else {
+            print("SOS deadlinelock: L runs")
+        }
+        let _ = sos_event_signal(EVENT_MAIN, GO)
+    }
+    print("SOS deadlinelock: L gives the lock: {}",
+          named(sos_lock_give(pair())))
+    0
+}
+
+func h_entry(arg: UInt) sync -> UInt {
+    h_run()
+}
+
+/// Wait on H's Event for the main thread's next round.
+func h_wait() unsafe {
+    let _ = sos_waiter_wait(WAITER_H, (&var BUF_H) as UnsafePointer<UInt>,
+                            record_bytes())
+}
+
+/// Take the lock with `word` in H's wait word, and answer the status.
+func h_take(word: UInt64) unsafe -> UInt {
+    WORD_H = word
+    let status = sos_lock_take(pair())
+    WORD_H = 0
+    status
+}
+
+/// H's rounds, each after the main thread's signal but the first.
+func h_run() unsafe sync -> UInt {
+    H_ID = sos_thread_id()
+    let _ = sos_wait_word(word_h(), NONE)
+    print("SOS deadlinelock: H's first wait: {}", named(h_take(NEVER)))
+
+    h_wait()
+    let _ = sos_wait_word(word_h(), CLOCK)
+    let deadline = now() + DELAY_NS
+    let second = h_take(deadline)
+    print("SOS deadlinelock: H's second wait: {}, at or past its deadline: {}",
+          named(second), now() >= deadline)
+    let _ = sos_event_signal(EVENT_MAIN, GO)
+
+    h_wait()
+    print("SOS deadlinelock: H's third wait: {}", named(h_take(NEVER)))
+
+    h_wait()
+    let fourth_deadline = now() + DELAY_NS
+    let fourth = h_take(fourth_deadline)
+    print("SOS deadlinelock: H's fourth wait: {}, at or past its deadline: {}",
+          named(fourth), now() >= fourth_deadline)
+    H_DONE.store(1)
+
+    h_wait()
+    let _ = sos_thread_wake(H_ID)
+    print("SOS deadlinelock: H's latched wait: {}", named(h_take(NEVER)))
+
+    h_wait()
+    WORD_H = 1
+    let passed = sos_lock_wait(free_pair())
+    WORD_H = 0
+    print("SOS deadlinelock: H's wait for a free lock, passed word: {}",
+          named(passed))
+    let _ = sos_thread_wake(H_ID)
+    WORD_H = NEVER
+    let latched = sos_lock_wait(free_pair())
+    WORD_H = 0
+    print("SOS deadlinelock: H's wait for a free lock, latched wake: {}",
+          named(latched))
+    WORD_H = NEVER
+    let kept = sos_park()
+    WORD_H = 0
+    print("SOS deadlinelock: H's park after them: {}", named(kept))
+    0
+}
+
+/// Wait on the main thread's Event.
+func main_wait() unsafe {
+    let _ = sos_waiter_wait(WAITER_MAIN, (&var BUF_MAIN) as UnsafePointer<UInt>,
+                            record_bytes())
+}
+
+/// Signal L once and print `round`'s line, then wait for L's signal back.
+func observe(round: String) unsafe {
+    let _ = sos_event_signal(EVENT_L, GO)
+    print("SOS deadlinelock: {}: the main thread after the signal", round)
+    main_wait()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinelock: no process handle: {}", error)
+        return
+    }
+    var raw_proc: UInt = NONE
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var raw_proc) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var CLOCK) as UnsafePointer<UInt>) != STATUS_OK ||
+       not made(raw_proc, (&var EVENT_L) as UnsafePointer<UInt>,
+                (&var WAITER_L) as UnsafePointer<UInt>) ||
+       not made(raw_proc, (&var EVENT_H) as UnsafePointer<UInt>,
+                (&var WAITER_H) as UnsafePointer<UInt>) ||
+       not made(raw_proc, (&var EVENT_MAIN) as UnsafePointer<UInt>,
+                (&var WAITER_MAIN) as UnsafePointer<UInt>) {
+        print("SOS deadlinelock: setup refused")
+        return
+    }
+    let top_l = ((&var STACK_L) as UnsafePointer<UInt>) as UInt + stack_bytes()
+    let top_h = ((&var STACK_H) as UnsafePointer<UInt>) as UInt + stack_bytes()
+    let l = try proc.thread_create(run: l_entry, arg: 0,
+                                   stack_top: top_l) catch {
+        print("SOS deadlinelock: no L: {}", error)
+        return
+    }
+    let h = try proc.thread_create(run: h_entry, arg: 0,
+                                   stack_top: top_h) catch {
+        print("SOS deadlinelock: no H: {}", error)
+        return
+    }
+    // L runs while the main thread waits, takes the lock and signals back.
+    try l.start(band: Priority.Low) catch {
+        print("SOS deadlinelock: L did not start: {}", error)
+        return
+    }
+    main_wait()
+    // H runs at its start and parks on the lock, raising L, which then runs
+    // above the main thread and parks on its Event.
+    try h.start(band: Priority.High) catch {
+        print("SOS deadlinelock: H did not start: {}", error)
+        return
+    }
+    observe("raised")
+
+    print("SOS deadlinelock: wake H: {}", named(sos_thread_wake(H_ID)))
+    observe("lowered after the wake")
+
+    // H waits on its deadline, raising L, which runs and parks again; H's
+    // signal comes once its deadline has ended the wait.
+    let _ = sos_event_signal(EVENT_H, GO)
+    main_wait()
+    observe("lowered after the timeout")
+
+    // H waits wakeable, raising L; L, raised above the main thread, runs at
+    // the signal and wakes H.
+    let _ = sos_event_signal(EVENT_H, GO)
+    let _ = sos_event_signal(EVENT_L, WAKE_H)
+    main_wait()
+
+    // H waits on a deadline, raising L; L runs at the signal and spins until
+    // H, readied by the deadline, has printed.
+    let _ = sos_event_signal(EVENT_H, GO)
+    let _ = sos_event_signal(EVENT_L, SPIN)
+    main_wait()
+
+    let _ = sos_event_signal(EVENT_H, GO)
+    let _ = sos_event_signal(EVENT_H, GO)
+    match h.join() {
+        case Ok(_) -> {},
+        case Err(status) -> {
+            print("SOS deadlinelock: H's join: {}", named(code(status)))
+        },
+    }
+
+    let _ = sos_event_signal(EVENT_L, STOP)
+    match l.join() {
+        case Ok(_) -> {},
+        case Err(status) -> {
+            print("SOS deadlinelock: L's join: {}", named(code(status)))
+        },
+    }
+    print("SOS deadlinelock: done")
+    let _ = proc.exit(EXIT_OK)
+}

@@ -1,0 +1,141 @@
+// A `Waiter.Wait`'s deadline (spec §2.2, §7), at the C altitude for the wait
+// word and the Clock's word, through the typed Waiter for the wait itself. A
+// Waiter holds one Event, which nobody signals but this thread, and the image
+// holds this one thread and arms no tick, so the park's own deadline is the
+// only thing that can wake the machine. Each line is one wait:
+//
+//   deadline   a wait until `DELAY_NS` past the clock's reading answers
+//              `TimedOut`, and the clock read after it is at or past that
+//              instant
+//   consumed   the Event, signalled after that and waited for plain (word
+//              0), is delivered: the early end consumed nothing and left
+//              nothing of this thread on the Waiter
+//   past       a word of 1, an instant already passed, answers `TimedOut`
+//              at once
+//   ready      the Event signalled first, a wait with the passed word answers
+//              `Ok` with the record: readiness comes before the deadline
+//
+// No line says how long a wait took, only that its deadline passed.
+
+import sos.{System, ClockType, SosStatus, Waiter,
+            sos_system_clock_get, sos_clock_now, sos_wait_word}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+
+/// How far past the clock's reading the first wait's deadline is.
+static DELAY_NS: UInt64 = 20_000_000
+
+/// The wait word.
+unsafe static var WORD: UInt64 = 0
+
+func word() unsafe -> UInt {
+    ((&var WORD) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading through `clock`.
+func now(clock: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(clock, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+/// Wait on `waiter` and print what the wait answered under `round`.
+func wait_and_show(waiter: &Waiter, round: String) {
+    match waiter.wait() {
+        case Ok(wake) -> {
+            let (key, what) = (move wake).open()
+            match what {
+                case Event(word) -> {
+                    print("SOS deadlinewait: {}: Ok key={} bits={}", round,
+                          key, word)
+                },
+                case _ -> {
+                    print("SOS deadlinewait: {}: Ok, not an Event", round)
+                },
+            }
+        },
+        case Err(status) -> {
+            print("SOS deadlinewait: {}: {}", round, named(code(status)))
+        },
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinewait: no process handle: {}", error)
+        return
+    }
+    var clock: UInt = NONE
+    if sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var clock) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS deadlinewait: no clock")
+        return
+    }
+    let event = try proc.event_create() catch {
+        print("SOS deadlinewait: no event: {}", error)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS deadlinewait: no waiter: {}", error)
+        return
+    }
+    try waiter.add(event: &event, key: KEY_EVENT) catch {
+        print("SOS deadlinewait: no attach: {}", error)
+        return
+    }
+    print("SOS deadlinewait: register: {}",
+          named(sos_wait_word(word(), clock)))
+
+    let deadline = now(clock) + DELAY_NS
+    WORD = deadline
+    match waiter.wait() {
+        case Ok(_) -> print("SOS deadlinewait: deadline: Ok"),
+        case Err(status) -> {
+            print("SOS deadlinewait: deadline: {}, at or past it: {}",
+                  named(code(status)), now(clock) >= deadline)
+        },
+    }
+
+    try event.signal(bits: 7) catch {
+        print("SOS deadlinewait: no signal: {}", error)
+        return
+    }
+    WORD = 0
+    wait_and_show(&waiter, "consumed")
+
+    WORD = 1
+    wait_and_show(&waiter, "past")
+
+    try event.signal(bits: 5) catch {
+        print("SOS deadlinewait: no signal: {}", error)
+        return
+    }
+    wait_and_show(&waiter, "ready")
+
+    print("SOS deadlinewait: done")
+    let _ = proc.exit(EXIT_OK)
+}
