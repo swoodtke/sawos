@@ -15335,6 +15335,10 @@ TEST_CASES = [
         #     holds the lock with half a line and the main thread's `print`
         #     waits, yielding through the handle in the block the start-up
         #     wrote. Each holder's line is whole, and first;
+        #   spin  a made thread spins on a `SpinLock` the main thread holds
+        #     across a yield; after the spins `SpinLock` yields through
+        #     `sosrt`'s thread-yield seam and the main thread gives the lock
+        #     back. With no tick, std's weak default would spin for good;
         #   claim  the main thread panics while a made thread holds the lock
         #     with half a line: the panic sink's claim waits for the line,
         #     which is whole before the kernel's fault line;
@@ -15380,6 +15384,9 @@ TEST_CASES = [
             "SOS threadrun: the main thread's line waited for it\n"
             "SOS: process exit: code={zero} process={one}",
             "SOS threadrun: lock ended status=65536\n",
+            "SOS threadrun: a spinning waiter took the lock at step 2\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: spin ended status=65536\n",
             *_after("SOS threadrun: a thread holds the lock, and its line is "
                     "whole\n",
                     _panic_fault("{one}", "panic at lib.saw:",

@@ -5,6 +5,8 @@
 //   JOIN     two threads at two entries, joined with their results
 //   LOCK     the main thread holds the output lock while a thread prints,
 //            then a thread holds it while the main thread prints
+//   SPIN     a thread spins on a `SpinLock` the main thread holds across a
+//            yield, and is let by the runtime's thread-yield seam
 //   CLAIM    the main thread panics while a thread holds the output lock
 //   PANIC    a thread panics
 //   REFUSED  a create its rows refuse, and the rows before and after
@@ -40,6 +42,7 @@ static ROLE_OWN_PID: UInt = 7
 static ROLE_ROOT_PID: UInt = 8
 static ROLE_NO_CONTROL: UInt = 9
 static ROLE_GIVEN_BACK: UInt = 10
+static ROLE_SPIN: UInt = 11
 
 func main() -> Result<Int, SosStatus> {
     var set = sosmain.take_boot_set()
@@ -51,6 +54,10 @@ func main() -> Result<Int, SosStatus> {
     if role == ROLE_LOCK {
         try threadrun.main_holds()
         try threadrun.thread_holds()
+        return 0
+    }
+    if role == ROLE_SPIN {
+        try threadrun.spin_holds()
         return 0
     }
     if role == ROLE_CLAIM {

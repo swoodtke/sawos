@@ -13,6 +13,7 @@
 
 import sos.{SosStatus, QuotaKind, ThreadRight, Waiter, ALL_RIGHTS}
 import sosmain
+import std.spinlock.{SpinLock}
 
 extern "C" {
     func __saw_rt_output_lock()
@@ -99,6 +100,52 @@ public func main_holds() -> Result<Void, SosStatus> {
 func waiting_line(arg: UInt) sync -> UInt {
     print("SOS threadrun: a thread's line waited for it")
     0
+}
+
+/// What `GATE` guards: how far the holder and the waiter have got.
+static STEP_HELD: UInt = 1
+static STEP_RELEASED: UInt = 2
+static STEP_WAITER_DONE: UInt = 3
+
+/// The lock `spin_holds` contends, with the step it guards.
+static GATE: SpinLock<UInt>
+
+/// A made thread spins on a `SpinLock` the main thread holds across a yield:
+///
+///   SOS threadrun: a spinning waiter took the lock at step 2
+///
+/// The main thread takes the lock, yields through a handle onto itself, and
+/// leaves it. The thread runs at that yield, finds the lock held, and spins
+/// until `SpinLock` offers the processor through `__saw_rt_thread_yield`,
+/// which `sosrt` answers with the thread's own handle, so the main thread
+/// runs again and gives the lock back. This image arms no tick: were the seam
+/// std's weak default, the thread would spin for good and the case would hang
+/// to the harness's timeout. The step the thread reads under the lock is the
+/// main thread's second, which it writes only after the yield returned.
+public func spin_holds() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let waiter = try sosmain.context().process().thread_create(
+        run: spinning, arg: 0, stack_top: top_a())
+    try waiter.start()
+    borrow var step = GATE.lock() {
+        step = STEP_HELD
+        try me.yield_now() catch {
+            panic("SOS threadrun: the holder's yield was refused: {}", error)
+        }
+        step = STEP_RELEASED
+    }
+    let seen = try waiter.join()
+    print("SOS threadrun: a spinning waiter took the lock at step {}", seen)
+    return
+}
+
+func spinning(arg: UInt) sync -> UInt {
+    var seen: UInt = 0
+    borrow var step = GATE.lock() {
+        seen = step
+        step = STEP_WAITER_DONE
+    }
+    seen
 }
 
 /// A made thread holds the output lock while the main thread prints:
