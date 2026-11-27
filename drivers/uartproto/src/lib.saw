@@ -10,6 +10,7 @@
 //!           bytes to write
 //! Sync   3  -                     -
 //! Mark   4  -                     -
+//! Pending 5 -                     the count of input bytes buffered
 //! ```
 //!
 //! A reply that is not `Ok` carries the status byte alone.
@@ -37,7 +38,8 @@
 //! on an op that takes none), then `Unsupported` (an op this driver's device
 //! cannot do), then `Busy` (a `Read` the driver would hold, when it holds as
 //! many as it will). Every driver serves `Write`, `Sync` and `Mark`; a driver
-//! whose device has no input answers every `Read` `Unsupported`, at once.
+//! whose device has no input answers every `Read` and `Pending`
+//! `Unsupported`, at once.
 //!
 //! # The ops
 //!
@@ -61,6 +63,13 @@
 //!               measured over a window the case controls. It carries no
 //!               authority and reads no device.
 //!
+//!   - `Pending` - a call answered `Ok` and the count of input bytes the
+//!               driver has buffered, which no `Read` has taken: at most the
+//!               driver's buffer, so one byte holds it. It reads no device and
+//!               takes nothing. A client that reads alone waits on it for a
+//!               byte to be buffered before it asks for one, instead of on a
+//!               clock; each call is one round trip, answered at once.
+
 //! A refusal is a reply, so a malformed request that was posted and its claim
 //! dropped is refused to nobody: the client that wants to know calls.
 //!
@@ -82,6 +91,7 @@ public enum UartOp: UInt8 {
     case Write = 2,
     case Sync = 3,
     case Mark = 4,
+    case Pending = 5,
 }
 
 extension UartOp {
@@ -92,6 +102,7 @@ extension UartOp {
             case Write -> "write",
             case Sync -> "sync",
             case Mark -> "mark",
+            case Pending -> "pending",
         }
     }
 
@@ -209,6 +220,76 @@ extension UartBody {
         self.bytes[0] = UartStatus.Ok as UInt8
         self.bytes[1] = b
         2
+    }
+}
+
+/// How many input bytes a driver buffers.
+public static INPUT_BYTES: Int = 16
+
+/// Bytes a driver's device has handed over that no client has asked for yet.
+///
+/// A driver buffers because a device does not wait. Draining the receiver in
+/// one go turns a burst into one wake, but the bytes then have to live
+/// somewhere until a `Read` asks for them, and this ring is that place. A full
+/// ring drops and says so in `dropped` rather than silently: an overrun is a
+/// fact about the workload, and hiding it would make a lost byte look like a
+/// bug in the pipe.
+///
+/// The ring is here, beside the wire, so the host tests hold what a driver
+/// does with a byte its reply could not deliver (`unpush`) without a device.
+public struct InBuf {
+    public bytes: [UInt8; INPUT_BYTES],
+    public head: Int,
+    public count: Int,
+    public dropped: Int,
+    /// Bytes a reply that found nobody home put back at the front.
+    public returned: Int,
+}
+
+extension InBuf {
+    public static func empty() -> InBuf {
+        InBuf(bytes: [0; INPUT_BYTES], head: 0, count: 0, dropped: 0,
+              returned: 0)
+    }
+
+    public func has(&self) -> Bool { self.count > 0 }
+
+    public func push(&var self, b: UInt8) {
+        if self.count >= INPUT_BYTES {
+            self.dropped = self.dropped + 1
+            return
+        }
+        var at = self.head + self.count
+        if at >= INPUT_BYTES { at = at - INPUT_BYTES }
+        self.bytes[at] = b
+        self.count = self.count + 1
+    }
+
+    /// Put a byte back at the front: what a reply that found nobody home does,
+    /// so the next reader gets the byte rather than the machine losing it.
+    public func unpush(&var self, b: UInt8) {
+        if self.count >= INPUT_BYTES {
+            self.dropped = self.dropped + 1
+            return
+        }
+        var at = self.head - 1
+        if at < 0 { at = INPUT_BYTES - 1 }
+        self.bytes[at] = b
+        self.head = at
+        self.count = self.count + 1
+        self.returned = self.returned + 1
+    }
+
+    /// The oldest byte, or zero when there is none. The caller asks `has()`
+    /// first; a server must not be endable by its own bookkeeping.
+    public func pop(&var self) -> UInt8 {
+        if self.count == 0 { return 0 }
+        let b = self.bytes[self.head]
+        var next = self.head + 1
+        if next >= INPUT_BYTES { next = 0 }
+        self.head = next
+        self.count = self.count - 1
+        b
     }
 }
 
@@ -360,6 +441,13 @@ public func read_reply(reply: &Frame) -> Result<UInt8, UartError> {
     return reply.byte(1)
 }
 
+/// A `Pending`'s reply: `Ok` and the count as one byte, or a refusal alone.
+/// A driver buffers at most `INPUT_BYTES`, which one byte holds.
+public func pending_reply(reply: &Frame) -> Result<Int, UartError> {
+    let count = try read_reply(&reply)
+    count as Int
+}
+
 /// The reply to a `Write`, `Sync` or `Mark`: the status alone, `Ok` or a
 /// refusal.
 public func empty_reply(reply: &Frame) -> Result<Void, UartError> {
@@ -438,6 +526,15 @@ extension Uart<T: UartTransport> {
         let n = self.body.bare(UartOp.Sync)
         let reply = try self.transport.call(&self.body.bytes, n)
         empty_reply(&reply)
+    }
+
+    /// How many input bytes the driver holds that no read has taken. A
+    /// driver is the only one that fills the count, and only a read empties
+    /// it, so a client that is the only reader sees it only grow.
+    public func pending(&var self) -> Result<Int, UartError> {
+        let n = self.body.bare(UartOp.Pending)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        pending_reply(&reply)
     }
 
     /// Asks the driver to take its trap reading.

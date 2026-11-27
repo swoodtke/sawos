@@ -1,0 +1,118 @@
+// A driver's input ring: order, wrap-around, and the byte a reply that found
+// nobody home puts back. The gate's `uart_dropped_read` boots the drivers
+// through the same path; what it cannot show is the ring's edges, which are
+// held here, where every byte's arrival is the test's.
+
+import uartproto.{INPUT_BYTES, InBuf}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// A ring holding `Z`, `q`, `7`, `#` in that order.
+func typed() -> InBuf {
+    var b = InBuf.empty()
+    b.push(0x5A)
+    b.push(0x71)
+    b.push(0x37)
+    b.push(0x23)
+    b
+}
+
+/// The ring's bytes, oldest first, as one number a byte at a time: `Z`, `q`,
+/// `7`, `#` read as 0x5A713723.
+func drain(b: &var InBuf) -> UInt32 {
+    var all: UInt32 = 0
+    while b.has() {
+        all = (all << 8) | (b.pop() as UInt32)
+    }
+    all
+}
+
+func main() {
+    // Oldest first.
+    var fifo = typed()
+    check(fifo.count == 4, "four bytes are held")
+    check(fifo.pop() == 0x5A, "the first byte typed is the first out")
+    check(fifo.pop() == 0x71, "then the second")
+    check(drain(&var fifo) == 0x3723, "then the rest")
+    check(not fifo.has(), "and the ring is empty")
+    check(fifo.pop() == 0, "an empty ring pops zero")
+    check(fifo.count == 0, "and stays empty")
+
+    // The dropped read: the byte a reply carried goes back to the front, so
+    // the next reader gets it, before every byte behind it.
+    var back = typed()
+    let b = back.pop()
+    check(back.count == 3, "a popped byte leaves three")
+    back.unpush(b)
+    check(back.count == 4, "a put-back byte makes four again")
+    check(back.returned == 1, "the put-back is counted once")
+    check(back.dropped == 0, "and nothing is dropped")
+    check(drain(&var back) == 0x5A713723,
+          "the byte is first out, once, and the rest follow in order")
+
+    // Two replies lost in a row put two bytes back, newest at the front.
+    var twice = typed()
+    let first = twice.pop()
+    let second = twice.pop()
+    twice.unpush(second)
+    twice.unpush(first)
+    check(twice.returned == 2, "two put-backs are counted twice")
+    check(drain(&var twice) == 0x5A713723, "and each byte is where it was")
+
+    // A byte put back at the start of the array goes to its end, and comes out
+    // before the byte that was at the start.
+    var start = InBuf.empty()
+    start.push(0x41)
+    start.unpush(0x42)
+    check(start.head == INPUT_BYTES - 1, "the front wraps to the array's end")
+    check(start.pop() == 0x42, "the put-back byte is first out")
+    check(start.pop() == 0x41, "then the byte that was at the start")
+    check(not start.has(), "and nothing else")
+
+    // A ring whose bytes wrap past the array's end pops oldest first.
+    var wrapped = InBuf.empty()
+    var i = 0
+    while i < INPUT_BYTES {
+        wrapped.push(0x41)
+        i = i + 1
+    }
+    check(wrapped.pop() == 0x41, "the head moves off the array's start")
+    wrapped.push(0x42)
+    check(wrapped.dropped == 0, "a push into the freed slot drops nothing")
+    i = 1
+    while i < INPUT_BYTES {
+        check(wrapped.pop() == 0x41, "the older bytes come first")
+        i = i + 1
+    }
+    check(wrapped.pop() == 0x42, "the wrapped byte comes last")
+
+    // A put-back into a full ring loses nothing already held.
+    var full = InBuf.empty()
+    i = 0
+    while i < INPUT_BYTES {
+        full.push(0x30)
+        i = i + 1
+    }
+    full.unpush(0x99)
+    check(full.dropped == 1, "a put-back into a full ring is counted dropped")
+    check(full.returned == 0, "and not counted as put back")
+    check(full.count == INPUT_BYTES, "and the ring still holds what it did")
+    check(full.pop() == 0x30, "and its first byte is the one held first")
+
+    // A push into a full ring is dropped too, and the oldest stays.
+    var over = InBuf.empty()
+    i = 0
+    while i < INPUT_BYTES {
+        over.push(0x31)
+        i = i + 1
+    }
+    over.push(0x32)
+    check(over.dropped == 1, "a push into a full ring is counted dropped")
+    check(over.pop() == 0x31, "and the oldest byte stays first")
+}

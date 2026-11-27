@@ -91,6 +91,23 @@ func main() {
     check(reads(reply(2, 2, 0), UartError.Malformed), "a refusal with a byte")
     check(reads(reply(2, 9, 0x5A), UartError.Malformed), "a byte after a status that is none")
 
+    // Pending: the op alone, called; the count in the reply's one byte.
+    var p = client(reply(2, 0, 3))
+    check(try! p.pending() == 3, "a pending answers its count")
+    check(p.transport.sent_len == 1 && p.transport.sent[0] == 5 && p.transport.calls == 1,
+          "a pending is the op alone, called")
+    var p0 = client(reply(2, 0, 0))
+    check(try! p0.pending() == 0, "a pending answers none buffered")
+    check(is_err(client(reply(1, 1, 0)).pending(), UartError.BadOp), "a pending refused BadOp")
+    check(is_err(client(reply(1, 2, 0)).pending(), UartError.Unsupported),
+          "a pending refused Unsupported")
+    check(is_err(client(reply(1, 0, 0)).pending(), UartError.Malformed),
+          "a pending answered Ok alone")
+    check(is_err(client(reply(3, 0, 0)).pending(), UartError.Malformed),
+          "a pending answered Ok and two")
+    check(is_err(client(reply(0, 0, 0)).pending(), UartError.Malformed),
+          "a pending answered nothing")
+
     // Sync, Mark and a Write sent as a call: Ok alone, or a refusal.
     var s = client(reply(1, 0, 0))
     try! s.sync()

@@ -2223,7 +2223,7 @@ _UART_CLIENT_LINES = [
 _UART_CLIENT_AFTER_READ = [
     "SOS uartclient: a request of no bytes: BadOp",
     "SOS uartclient: op 0: BadOp",
-    "SOS uartclient: op 5: BadOp",
+    "SOS uartclient: op 6: BadOp",
     "SOS uartclient: op 255: BadOp",
     "SOS uartclient: a read carrying a byte: BadOp",
     "SOS uartclient: a sync carrying a byte: BadOp",
@@ -12133,12 +12133,17 @@ TEST_CASES = [
         # A UART driver answers a `Read` from bytes it holds, and the reader
         # has dropped its claim (`tests/images/uart_dropped_read*.toml`): the
         # byte goes back to the front of the buffer, so the next reader gets
-        # it. The harness hands the four bytes over before the guest boots,
-        # so they are waiting when the driver first looks (`ECHO_INPUT`), every
-        # read is answered from the buffer, and the client orders the rest by
-        # a `Sync`, not by a clock. A driver that lost the byte would leave the
-        # client's last read waiting for a fifth; one that never served a read
-        # from its buffer, or never had one dropped, would count differently.
+        # it. A UART holds one byte until its driver enables a FIFO, and the
+        # emulator hands the device the next typed byte some time after the
+        # driver has read the one before, so when a byte reaches the driver's
+        # buffer is the host's. The client therefore reads one byte and then
+        # asks the driver, by `Pending`, until it holds another: it is the
+        # only reader, so that byte is still buffered when it tells the
+        # dropped `Read`. The driver answers that read from its buffer and the
+        # reply goes nowhere, so none is held, none abandoned, and one byte is
+        # put back. How many times the client asked is the host's speed, so
+        # `served` and the counts after the mark are printed and not
+        # asserted. A `Sync` orders the rest, not a clock.
         "name": "uart_dropped_read",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "uart_dropped_read.toml",
@@ -12149,15 +12154,8 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        f"SOS uartdrop: after a dropped read, {ECHO_INPUT}",
                        "root: client ended status=65536",
-                       # Every read answered from the buffer: the mark, the
-                       # four reads and the two syncs answered, the dropped
-                       # read's reply and the six writes discarded, and no
-                       # read held, so none abandoned. The dropped read's byte
-                       # is the one put back.
-                       "SOS uartsvc drv: served=14 abandoned=0 dropped=0",
+                       "abandoned=0 dropped=0",
                        "SOS uartsvc drv: bytes put back=1",
-                       "SOS uartsvc drv: after the mark answered=7 "
-                       "discarded=7 traps=22",
                        "root: console ended status=65536"],
         "expect_clean_exit": True,
     },
@@ -17681,8 +17679,10 @@ def _run_qemu(qemu, arch, elf, feed=None, at_once=False):
     The bytes go one at a time behind `SERIAL_TYPE_DELAY_S`, for the reason
     stated there: withholding them is what makes the driver park and the
     kernel idle, and a burst handed over at once would test neither. With
-    `at_once` they are handed over before the guest boots, for a case that
-    needs every byte waiting in the driver's buffer.
+    `at_once` they are written without the delay, so the guest finds each
+    byte as soon as the emulator has passed it on (a UART holds one byte at a
+    time). A case may not assert how many the driver has buffered at any
+    moment: that is the emulator's speed.
 
     The pipe is made here rather than by `Popen(stdin=PIPE)`, because
     `communicate()` closes the stdin it owns as soon as it is called, which

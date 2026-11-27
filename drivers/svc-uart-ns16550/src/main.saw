@@ -16,7 +16,8 @@
 //   Message      a request. `Read` is answered from the input buffer, or held,
 //                or answered `Busy` while `MAX_HELD` are held; `Write` goes
 //                out the transmitter and is answered `Ok`; `Sync` and `Mark`
-//                are answered `Ok`; a request `uartproto` refuses is answered
+//                are answered `Ok`; `Pending` is answered with the count of
+//                buffered bytes; a request `uartproto` refuses is answered
 //                `BadOp`.
 //   Interrupt    the device has bytes. Drain, ack, then answer as many held
 //                reads as there are bytes for.
@@ -45,7 +46,7 @@
 import sos.{BootSet, IoMemory, Interrupt, Waiter, WaitResult, WaitPayload,
             PipeOutlet, PipeRequest, PipeMsg, AttachMode, ReplyWaitError,
             SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartStatus, UartBody, Frame, BODY_BYTES}
+import uartproto.{UartOp, UartStatus, UartBody, Frame, BODY_BYTES, InBuf}
 import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
@@ -121,72 +122,6 @@ extension Uart {
 // =============================================================================
 // The service's own state
 // =============================================================================
-
-/// Bytes the device has handed over that no client has asked for yet.
-///
-/// A driver buffers because a device does not wait. Draining the receiver in
-/// one go turns a burst into one wake, but the bytes then have to live somewhere
-/// until a `Read` asks for them, and this ring is that place. A full ring drops
-/// and says so in the report rather than silently: an overrun is a fact about
-/// the workload, and hiding it would make a lost byte look like a bug in the
-/// pipe.
-static INPUT_BYTES: Int = 16
-
-struct InBuf {
-    bytes: [UInt8; INPUT_BYTES],
-    head: Int,
-    count: Int,
-    dropped: Int,
-    /// Bytes a reply that found nobody home put back at the front.
-    returned: Int,
-}
-
-extension InBuf {
-    static func empty() -> InBuf {
-        InBuf(bytes: [0; INPUT_BYTES], head: 0, count: 0, dropped: 0,
-              returned: 0)
-    }
-
-    func has(&self) -> Bool { self.count > 0 }
-
-    func push(&var self, b: UInt8) {
-        if self.count >= INPUT_BYTES {
-            self.dropped = self.dropped + 1
-            return
-        }
-        var at = self.head + self.count
-        if at >= INPUT_BYTES { at = at - INPUT_BYTES }
-        self.bytes[at] = b
-        self.count = self.count + 1
-    }
-
-    /// Put a byte back at the front: what a reply that found nobody home does,
-    /// so the next reader gets the byte rather than the machine losing it.
-    func unpush(&var self, b: UInt8) {
-        if self.count >= INPUT_BYTES {
-            self.dropped = self.dropped + 1
-            return
-        }
-        var at = self.head - 1
-        if at < 0 { at = INPUT_BYTES - 1 }
-        self.bytes[at] = b
-        self.head = at
-        self.count = self.count + 1
-        self.returned = self.returned + 1
-    }
-
-    /// The oldest byte, or zero when there is none — the caller asks `has()`
-    /// first, and a server must not be endable by its own bookkeeping.
-    func pop(&var self) -> UInt8 {
-        if self.count == 0 { return 0 }
-        let b = self.bytes[self.head]
-        var next = self.head + 1
-        if next >= INPUT_BYTES { next = 0 }
-        self.head = next
-        self.count = self.count - 1
-        b
-    }
-}
 
 /// How many reads this driver will hold at once. Four: one per client this
 /// tree's topology can produce, plus slack.
@@ -587,6 +522,11 @@ func serve(waiter: &Waiter, uart: &Uart,
                         case Write -> {
                             write_out(&uart, &frame)
                             let n = body.ok()
+                            wake = try answer(move obligation, &body, n,
+                                              &waiter, &var window)
+                        },
+                        case Pending -> {
+                            let n = body.ok_byte(input.count as UInt8)
                             wake = try answer(move obligation, &body, n,
                                               &waiter, &var window)
                         },
