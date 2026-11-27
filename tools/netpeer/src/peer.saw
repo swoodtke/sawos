@@ -1,16 +1,18 @@
 //! What the peer answers: one guest frame in, the frames to send back and the
 //! lines to log out.
 //!
-//! The peer is 10.0.2.2 with MAC 52:55:0a:00:02:02 on 10.0.2.0/24. It only
-//! answers: every frame it sends is caused by a frame it was given, so the
-//! guest's run does not depend on any clock. A script says how much it
-//! answers.
+//! The peer is 10.0.2.2 with MAC 52:55:0a:00:02:02 on 10.0.2.0/24. Every
+//! frame it sends is caused by a frame it was given, or by the harness's word
+//! that the guest is ready (`greet`), so the guest's run does not depend on
+//! any clock. A script says how much it answers.
 //!
 //!     ping     ARP requests for the peer and ICMP echo requests to it
 //!     burst    `ping`, and `N` UDP datagrams to a sender of `burst N` to
 //!              port 7
 //!     log      `ping`, and a line for every frame's length
 //!     silent   nothing, but a line for every frame's length
+//!     greet    `ping`, and one broadcast frame sent once the harness says
+//!              the guest is ready, before the guest has said anything
 //!
 //! Anything else a script handles is logged as `peer: unexpected: ...`,
 //! naming what was wrong. Frames are written and checked with this file's
@@ -34,6 +36,10 @@ static MIN_FRAME: Int = 60
 static ETHER_ARP: UInt = 0x0806
 static ETHER_IPV4: UInt = 0x0800
 
+/// The greeting's EtherType: IEEE's local experimental one, which no stack
+/// answers.
+static ETHER_GREETING: UInt = 0x88B5
+
 static PROTO_ICMP: UInt = 1
 static PROTO_UDP: UInt = 17
 static ECHO_PORT: UInt = 7
@@ -45,7 +51,8 @@ public enum Script {
     case Ping,
     case Burst,
     case Log,
-    case Silent
+    case Silent,
+    case Greet
 }
 
 extension Script {
@@ -55,7 +62,16 @@ extension Script {
         if name.equals("burst") { return Script.Burst }
         if name.equals("log") { return Script.Log }
         if name.equals("silent") { return Script.Silent }
+        if name.equals("greet") { return Script.Greet }
         None
+    }
+
+    /// Whether the script speaks before it has been spoken to.
+    public func greets(&self) -> Bool {
+        match self {
+            case Greet -> true,
+            case _ -> false,
+        }
     }
 
     func answers(&self) -> Bool {
@@ -120,6 +136,25 @@ extension Peer {
     /// The frames received so far.
     public func count(&self) -> Int {
         self.frames
+    }
+
+    /// What the peer says before any guest frame, when the harness says the
+    /// guest is ready: the greeting of a script that greets, the broadcast
+    /// frame `greet` sends, and nothing for the others. It is not a guest
+    /// frame, so it is not counted.
+    public func greeting(&self) -> Handled {
+        var out = Handled()
+        if not self.script.greets() {
+            return move out
+        }
+        var frame = Data()
+        ether(&var frame, BROADCAST, ETHER_GREETING)
+        put_from_text(&var frame, "hello from the peer")
+        pad(&var frame)
+        let n = frame.len()
+        out.reply(frame)
+        out.line("greeted with {n} bytes")
+        move out
     }
 
     /// Takes one frame from the guest.

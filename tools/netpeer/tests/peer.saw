@@ -602,13 +602,51 @@ func script_tests() {
     check(peer.count() == 2, "two frames")
 
     check(known("ping"), "ping")
+    check(known("greet"), "greet")
     check(known("burst"), "burst")
     check(known("log"), "log")
     check(known("silent"), "silent")
     check(not known("loud"), "no other")
 }
 
+/// What `greet` says first: one broadcast frame, of the local experimental
+/// EtherType, from the peer, with its text and padding to the minimum frame.
+func greeting_tests() {
+    var peer = Peer(script: Script.Greet)
+    let hello = peer.greeting()
+    lines_are(&hello, &one("peer: greeted with 60 bytes"), "greeting")
+    check(hello.replies.len() == 1, "one greeting")
+    let f = hello.replies.get(0) ?? Data()
+    check(f.len() == 60, "the greeting is a minimum frame")
+    check(at(&f, 0, 6) == BROADCAST, "to everyone")
+    check(at(&f, 6, 6) == PEER_MAC, "from the peer")
+    check(at(&f, 12, 2) == 0x88B5, "the experimental EtherType")
+    var text = Data()
+    put_text(&var text, "hello from the peer")
+    var i = 0
+    while i < text.len() {
+        check(at(&f, 14 + i, 1) == at(&text, i, 1), "the greeting's text")
+        i = i + 1
+    }
+    check(at(&f, 14 + text.len(), 1) == 0, "padded with zeros")
+
+    // It is not a guest frame, and it is said once: the count stays at zero,
+    // and no other script says anything first.
+    check(peer.count() == 0, "the greeting is not counted")
+    check(Peer(script: Script.Ping).greeting().replies.len() == 0, "ping is silent")
+    check(Peer(script: Script.Burst).greeting().replies.len() == 0, "burst is silent")
+    check(Peer(script: Script.Log).greeting().lines.len() == 0, "log is silent")
+    check(Peer(script: Script.Silent).greeting().lines.len() == 0, "silent is silent")
+
+    // After it, `greet` answers as `ping` does.
+    let ask = ArpSpec.request(PEER_IP).frame()
+    let h = run(Script.Greet, &ask)
+    lines_are(&h, &one(arp_line()), "greet answers ARP")
+    check(h.replies.len() == 1, "greet answers ARP with one frame")
+}
+
 func main() {
+    greeting_tests()
     arp_tests()
     echo_tests()
     ip_tests()

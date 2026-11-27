@@ -1090,6 +1090,35 @@ NET_PING_PEER = [
     "peer: closed after 5 frames",
 ]
 
+# The network driver's two start lines and the client's attach line, as the
+# cases that boot `tests/net-client` read them (a case whose device offers
+# other features, or whose link starts down, writes its own); and what the
+# driver says when its client's end goes.
+NET_DRIVER_UP = [
+    "SOS netdrv: virtio-mmio version 2, network device, features version_1 "
+    "mac status\n",
+    "SOS netdrv: mac 52:54:00:12:34:56, link up, mtu 1500, queues 64 and 64",
+]
+NET_CLIENT_ATTACHED = ("SOS netclient: attached, mac 52:54:00:12:34:56, "
+                       "mtu 1500, slots 8 and 8")
+NET_DRIVER_GONE = "SOS netdrv: client gone: device reset, ring unmapped"
+
+# The client's lines for a scenario that ends with one ping, and the driver's
+# for the client's end after it: the frames are the announcement, the ARP
+# request and the echo request, and the replies the ARP reply and the echo
+# reply.
+NET_ONE_PING = [
+    "SOS netclient: 10.0.2.15 pinging 10.0.2.2",
+    "SOS netclient: reply 1 from 10.0.2.2, 56 bytes",
+]
+NET_ONE_PING_PEER = [
+    "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+    "peer: arp request for 10.0.2.2 from 10.0.2.15 at 52:54:00:12:34:56, "
+    "answered",
+    "peer: echo request 1 from 10.0.2.15, 56 bytes, answered",
+    "peer: closed after 3 frames",
+]
+
 # How long the harness waits before each byte it types.
 #
 # The delay is the test. Handed the whole string up front, the emulator buffers
@@ -16307,6 +16336,516 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The link is down when the driver starts (`set_link` before the guest
+        # runs), so the driver reports `link down` and the client's first event
+        # is `LinkDown`. The client says it is waiting, the harness raises the
+        # link when that line is on the console, and the driver's
+        # configuration-change interrupt becomes `LinkUp`; a ping is then
+        # answered. The link is raised on the client's word and not after any
+        # time.
+        "name": "net_link_down_first",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_link_down_first.toml",
+                       "riscv32-flat": "net_link_down_first_flat.toml",
+                       "arm64": "net_link_down_first_arm64.toml"},
+        "net": {"script": "ping",
+                "before_cont": [["set_link", {"name": "net0", "up": False}]],
+                "on_console": [{"text": "SOS netclient: waiting for link",
+                                "qmp": ["set_link", {"name": "net0",
+                                                     "up": True}]}]},
+        "expect_out": ["{banner}",
+                       NET_DRIVER_UP[0],
+                       "SOS netdrv: mac 52:54:00:12:34:56, link down, "
+                       "mtu 1500, queues 64 and 64",
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link down",
+                       "SOS netclient: waiting for link",
+                       "SOS netclient: link up",
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=2 rx_dropped=0 tx=3 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=2 tx=3 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_ONE_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # A frame the driver will not send: one of 2000 bytes, which a slot
+        # holds and the MTU (1500, and its Ethernet header) does not, and one of
+        # 10, under an Ethernet header. Neither is a ring fault. Each is counted
+        # in `tx_errors` and its slot completes as sent, and a ping after them
+        # is answered. The peer logs the length of every frame it receives
+        # (`log`): the two are not among them, and it closed after the three the
+        # stack sent.
+        "name": "net_tx_length",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_tx_length.toml",
+                       "riscv32-flat": "net_tx_length_flat.toml",
+                       "arm64": "net_tx_length_arm64.toml"},
+        "net": {"script": "log"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=2 rx_dropped=0 tx=3 "
+                       "tx_errors=2 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=2 tx=3 tx_errors=2 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": [
+            "peer: frame 60 bytes",
+            "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+            "peer: frame 60 bytes",
+            "peer: arp request for 10.0.2.2 from 10.0.2.15 at "
+            "52:54:00:12:34:56, answered",
+            "peer: frame 98 bytes",
+            "peer: echo request 1 from 10.0.2.15, 56 bytes, answered",
+            "peer: closed after 3 frames",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A ring fault, as the driver has it (the connection ends, `ring_faults`
+        # is 1, exit 2): the client stores the `ToServer` head at 2n + 3 (19 in
+        # a ring of eight) and rings `Tx`. The driver releases its end of the
+        # connection, so the client's next call is answered `PeerClosed`. Its
+        # line follows the driver's exit because a wake does not preempt, and
+        # the image arms no tick. Root's report of the client is left out: where
+        # it lands beside the driver's lines is the scheduler's choice.
+        "name": "net_ring_index_past",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_index_past.toml",
+                       "riscv32-flat": "net_ring_index_past_flat.toml",
+                       "arm64": "net_ring_index_past_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netdrv: connection ended: an index past the slot count: 19, "
+                       "ring_faults=1",
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=1 "
+                       "abandoned=0",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS netclient: stats after the fault: the other end "
+                       "of this connection is gone",
+                       "root: net ended status=65538"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client sends one frame and waits for its slot to come back, then
+        # stores the `ToServer` head back at 0 and rings `Tx`: an index in range
+        # that the ring cannot be at, since the driver has taken a slot.
+        "name": "net_ring_index_order",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_index_order.toml",
+                       "riscv32-flat": "net_ring_index_order_flat.toml",
+                       "arm64": "net_ring_index_order_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: one frame sent",
+                       "SOS netdrv: connection ended: an index out of order: 0, "
+                       "ring_faults=1",
+                       "SOS netdrv: rx=0 tx=1 tx_errors=0 ring_faults=1 "
+                       "abandoned=0",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS netclient: stats after the fault: the other end "
+                       "of this connection is gone",
+                       "root: net ended status=65538"],
+        "expect_peer": ["peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+                       "peer: closed after 1 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client writes 4096 as the length word of the first `ToServer`
+        # slot, which holds 2048, publishes it and rings `Tx`.
+        "name": "net_ring_length_past",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_length_past.toml",
+                       "riscv32-flat": "net_ring_length_past_flat.toml",
+                       "arm64": "net_ring_length_past_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netdrv: connection ended: a length past the slot: 4096, "
+                       "ring_faults=1",
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=1 "
+                       "abandoned=0",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS netclient: stats after the fault: the other end "
+                       "of this connection is gone",
+                       "root: net ended status=65538"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client stores the `ToClient` tail at 2n + 1 (17) and rings
+        # `RxReturn`. Every slot of that ring holds a posted buffer, so the
+        # driver reads the tail at the doorbell to see which are free.
+        "name": "net_ring_tail_past",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_tail_past.toml",
+                       "riscv32-flat": "net_ring_tail_past_flat.toml",
+                       "arm64": "net_ring_tail_past_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netdrv: connection ended: an index past the slot count: 17, "
+                       "ring_faults=1",
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=1 "
+                       "abandoned=0",
+                       "SOS: process exit: code={two} process={one}",
+                       "SOS netclient: stats after the fault: the other end "
+                       "of this connection is gone",
+                       "root: net ended status=65538"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An `Attach` for 256 slots each way, about a mebibyte, which the
+        # driver's pool cannot hold: it is answered with the status `NoMemory`
+        # and the connection stays, so an `Attach` of eight each way is then
+        # answered, and a ping.
+        "name": "net_attach_too_large",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_attach_too_large.toml",
+                       "riscv32-flat": "net_attach_too_large_flat.toml",
+                       "arm64": "net_attach_too_large_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       "SOS netclient: attach of 256 and 256: refused: "
+                       "NoMemory",
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=2 rx_dropped=0 tx=3 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=2 tx=3 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_ONE_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # An `Attach` that carries a handle (a page of the client's heap, which
+        # can be sent) is `BadOp`, since a request carries none; a plain
+        # `Attach` after it is answered.
+        "name": "net_attach_handle",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_attach_handle.toml",
+                       "riscv32-flat": "net_attach_handle_flat.toml",
+                       "arm64": "net_attach_handle_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       "SOS netclient: attach carrying a handle: refused: "
+                       "BadOp",
+                       NET_CLIENT_ATTACHED,
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client calls `Pin` on the ring the driver gave it. The handle
+        # carries `Map` and `Transfer` and not `Physical`, so the client can
+        # neither learn the ring's address nor drop the driver's pin: the kernel
+        # ends it with `AccessDenied`, and the driver, finding its client gone,
+        # resets the device and unpins and unmaps the ring. Root's report of the
+        # client is left out: where it lands beside the driver's lines is the
+        # scheduler's choice.
+        "name": "net_ring_no_pin",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_no_pin.toml",
+                       "riscv32-flat": "net_ring_no_pin_flat.toml",
+                       "arm64": "net_ring_no_pin_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: pinning the ring",
+                       "SOS: process fault: access denied process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client calls `Unpin` on the ring the driver gave it. The handle
+        # carries `Map` and `Transfer` and not `Physical`, so the client can
+        # neither learn the ring's address nor drop the driver's pin: the kernel
+        # ends it with `AccessDenied`, and the driver, finding its client gone,
+        # resets the device and unpins and unmaps the ring. Root's report of the
+        # client is left out: where it lands beside the driver's lines is the
+        # scheduler's choice.
+        "name": "net_ring_no_unpin",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ring_no_unpin.toml",
+                       "riscv32-flat": "net_ring_no_unpin_flat.toml",
+                       "arm64": "net_ring_no_unpin_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: unpinning the ring",
+                       "SOS: process fault: access denied process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Each op of the protocol in a state that refuses it, and the status it
+        # is answered with: an op byte that is none (`BadOp`, which is checked
+        # first), a `Tx`, an `RxReturn`, a `WaitEvent` and a `Stats` before
+        # `Attach` (`NotAttached`), an `Attach` of no slots (`BadArg`); then,
+        # attached, a second `Attach` (`Attached`), a `WaitEvent` while one is
+        # held (`Busy`), and a `Tx` and an `RxReturn` naming a slot a ring of
+        # eight does not have, which the wire admits (`BadArg`). The client ends
+        # holding its `WaitEvent`, so whether the driver counts it abandoned
+        # before it sees the client gone is left out of the driver's last line.
+        "name": "net_protocol_states",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_protocol_states.toml",
+                       "riscv32-flat": "net_protocol_states_flat.toml",
+                       "arm64": "net_protocol_states_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       "SOS netclient: an op that is none: refused: BadOp",
+                       "SOS netclient: tx before attach: refused: "
+                       "NotAttached",
+                       "SOS netclient: rx_return before attach: refused: "
+                       "NotAttached",
+                       "SOS netclient: wait_event before attach: refused: "
+                       "NotAttached",
+                       "SOS netclient: stats before attach: refused: "
+                       "NotAttached",
+                       "SOS netclient: attach of no slots: refused: BadArg",
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: a second attach: refused: Attached",
+                       "SOS netclient: link up",
+                       "SOS netclient: wait_event while one is held: "
+                       "refused: Busy",
+                       "SOS netclient: tx past the ring: refused: BadArg",
+                       "SOS netclient: rx_return past the ring: refused: "
+                       "BadArg",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=0 tx=0 tx_errors=0 ring_faults=0 "
+                       "abandoned=",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The peer answers `burst 20` with twenty datagrams, to a ring of eight
+        # slots. The client takes frames and gives no slot back until all eight
+        # are full (the ARP reply and seven datagrams), then gives one back at a
+        # time and takes the frame it makes room for. The driver posts only the
+        # slots that are free, and QEMU keeps the rest and stops reading the
+        # peer's stream meanwhile: the datagrams arrive intact and in order, and
+        # `rx_dropped` is 0.
+        "name": "net_slow_client",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_slow_client.toml",
+                       "riscv32-flat": "net_slow_client_flat.toml",
+                       "arm64": "net_slow_client_arm64.toml"},
+        "net": {"script": "burst"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: heard frame 1 of 20",
+                       "SOS netclient: heard frame 2 of 20",
+                       "SOS netclient: heard frame 3 of 20",
+                       "SOS netclient: heard frame 4 of 20",
+                       "SOS netclient: heard frame 5 of 20",
+                       "SOS netclient: heard frame 6 of 20",
+                       "SOS netclient: heard frame 7 of 20",
+                       "SOS netclient: holding 8 frames",
+                       "SOS netclient: heard frame 8 of 20",
+                       "SOS netclient: heard frame 9 of 20",
+                       "SOS netclient: heard frame 10 of 20",
+                       "SOS netclient: heard frame 11 of 20",
+                       "SOS netclient: heard frame 12 of 20",
+                       "SOS netclient: heard frame 13 of 20",
+                       "SOS netclient: heard frame 14 of 20",
+                       "SOS netclient: heard frame 15 of 20",
+                       "SOS netclient: heard frame 16 of 20",
+                       "SOS netclient: heard frame 17 of 20",
+                       "SOS netclient: heard frame 18 of 20",
+                       "SOS netclient: heard frame 19 of 20",
+                       "SOS netclient: heard frame 20 of 20",
+                       "SOS netclient: 20 datagrams, in order",
+                       "SOS netclient: driver rx=21 rx_dropped=0 tx=3 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=21 tx=3 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+                        "peer: arp request for 10.0.2.2 from 10.0.2.15 at "
+                        "52:54:00:12:34:56, answered",
+                        "peer: burst of 20 to 10.0.2.15:5000",
+                        "peer: closed after 3 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client sends the announcement and an echo request, which waits for
+        # the peer's ARP answer, waits for both frames' slots to come back, and
+        # ends with its receive buffers posted and the peer's answer on its way.
+        # The driver finds its client gone, resets the device and waits for the
+        # reset to read as complete before it unmaps and releases the ring, so a
+        # buffer the device still holds does not outlive its memory. How many
+        # frames the driver received before that depends on when the answer
+        # lands, so the line of counts is read from `tx=` on. The peer saw both
+        # frames, as their slots coming back says.
+        "name": "net_client_dies",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_client_dies.toml",
+                       "riscv32-flat": "net_client_dies_flat.toml",
+                       "arm64": "net_client_dies_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: two frames sent, leaving with the "
+                       "receive buffers posted",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       " tx=2 tx_errors=0 ring_faults=0 abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+                        "peer: arp request for 10.0.2.2 from 10.0.2.15 at "
+                        "52:54:00:12:34:56, answered",
+                        "peer: closed after 2 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The client posts a `WaitEvent` the driver has no event for and keeps
+        # the claim. It then yields: this image arms no tick, so the yield
+        # returns only once the driver has taken the request, attached it
+        # one-shot and parked in `wait`. Dropping the claim writes the abandoned
+        # delivery into the driver's `wait` there, before anything else is
+        # posted (`tests/uart-cancel` is forced the same way). The ping that
+        # follows asks `WaitEvent` again, which is answered; a driver that kept
+        # the abandoned obligation would answer `Busy`. The driver's last line
+        # counts the abandonment.
+        "name": "net_wait_abandoned",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_wait_abandoned.toml",
+                       "riscv32-flat": "net_wait_abandoned_flat.toml",
+                       "arm64": "net_wait_abandoned_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: wait_event posted",
+                       "SOS netclient: claim dropped",
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=2 rx_dropped=0 tx=3 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=2 tx=3 tx_errors=0 ring_faults=0 "
+                       "abandoned=1",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_ONE_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # The peer speaks first, and the client only listens: it sends nothing,
+        # so nothing completes and no interrupt would make the driver post a
+        # buffer later. The frame can be received only if the driver posted
+        # receive buffers when it attached. The peer is held until the client's
+        # attach line is on the console (its standard input, written by the
+        # harness), since QEMU drops a frame it flushes to a device that is not
+        # up yet; once the driver has posted its buffers the device takes the
+        # frame, and one it has not would keep it queued for ever.
+        "name": "net_greeted",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_greeted.toml",
+                       "riscv32-flat": "net_greeted_flat.toml",
+                       "arm64": "net_greeted_arm64.toml"},
+        "net": {"script": "greet",
+                "on_console": [{"text": "SOS netclient: attached",
+                                "peer": "go\n"}]},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: heard 60 bytes from "
+                       "52:55:0a:00:02:02 to ff:ff:ff:ff:ff:ff: hello from "
+                       "the peer",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=1 tx=0 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: greeted with 60 bytes", "peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
         # What a device grant in the transports' block reaches and leaves
         # behind, on arm64 (`tests/set-reuse`, `tests/child-window-probe`).
         # The first child is given VIRTIO24's page, maps it and reads it, then
@@ -17993,6 +18532,15 @@ def _run_qemu(qemu, arch, elf, feed=None, at_once=False):
 #   props    extra `-device` properties, as `key=value,key=value`
 #   legacy   leave the transports legacy (version 1), which QEMU does by
 #            default; without it they are modern (version 2)
+#   before_cont  QMP commands, each `[execute, arguments]`, sent while QEMU is
+#            still paused, after the stream has connected and before the guest
+#            runs
+#   on_console   what the console causes: a list of `{"text": T, "qmp":
+#            [execute, arguments]}` or `{"text": T, "peer": LINE}`, each done
+#            once, when `T` has appeared in what the guest has printed: the
+#            QMP command sent, or the line written to the peer's standard
+#            input, which a script that waits for it (`greet`) is held by.
+#            What it waits on is what the guest did, not a clock
 # and a case's `expect_peer` is the peer's log, line for line. The device sits
 # on the profile's `net_bus` unless the case's own `net_bus`, a profile's name
 # to a bus, names another (`_net_bus`), so a case can hold a board row other
@@ -18090,8 +18638,8 @@ def _start_peer(netpeer, script):
     """Start `netpeer serve` and return (process, its port): the port is the
     first line it prints."""
     peer = subprocess.Popen([netpeer, "serve", "--script", script],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            bufsize=0)
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, bufsize=0)
     deadline = time.monotonic() + QEMU_TIMEOUT_S
     line = b""
     while not line.endswith(b"\n"):
@@ -18151,14 +18699,20 @@ def _run_net_qemu(qemu, arch, elf, net, netpeer, bus):
                             f"{shown.strip()}")
         if qmp.command("query-status").get("status") != "prelaunch":
             raise ToolError("QEMU is running before the netdev connected")
+        for execute, arguments in net.get("before_cont", []):
+            qmp.command(execute, **arguments)
         qmp.command("cont")
-        try:
-            out, _err = proc.communicate(timeout=QEMU_TIMEOUT_S)
-            status, timed_out = proc.returncode, False
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _err = proc.communicate()
-            status, timed_out = None, True
+        hooks = net.get("on_console", [])
+        if hooks:
+            out, status, timed_out = _watch_console(proc, qmp, peer, hooks)
+        else:
+            try:
+                out, _err = proc.communicate(timeout=QEMU_TIMEOUT_S)
+                status, timed_out = proc.returncode, False
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, _err = proc.communicate()
+                status, timed_out = None, True
     except BaseException as e:
         said = ""
         if proc is not None:
@@ -18184,6 +18738,50 @@ def _run_net_qemu(qemu, arch, elf, net, netpeer, bus):
     lines = peer_out.decode(errors="replace").splitlines()
     return status, out, timed_out, (peer.returncode, lines, peer_err.decode(
         errors="replace"))
+
+
+def _watch_console(proc, qmp, peer, hooks):
+    """Read QEMU's console to its end, doing each hook once, the first time
+    its text is in what has been read: its QMP command sent, or its line
+    written to the peer's standard input. Returns (output, exit status, timed
+    out), as `communicate` does. The reads are bounded by the case's timeout,
+    which only a hung case reaches."""
+    deadline = time.monotonic() + QEMU_TIMEOUT_S
+    pending = list(hooks)
+    seen = b""
+    fd = proc.stdout.fileno()
+    errors = threading.Thread(target=proc.stderr.read, daemon=True)
+    errors.start()
+    timed_out = False
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            timed_out = True
+            break
+        if not select.select([fd], [], [], left)[0]:
+            continue
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        seen += chunk
+        text = seen.decode(errors="replace")
+        for hook in list(pending):
+            if hook["text"] in text:
+                pending.remove(hook)
+                if "qmp" in hook:
+                    execute, arguments = hook["qmp"]
+                    qmp.command(execute, **arguments)
+                else:
+                    peer.stdin.write(hook["peer"].encode())
+                    peer.stdin.flush()
+    if timed_out:
+        proc.kill()
+    proc.wait()
+    errors.join()
+    proc.stdout.close()
+    proc.stderr.close()
+    return seen.decode(errors="replace"), (None if timed_out else
+                                          proc.returncode), timed_out
 
 
 def _check_peer(case, peer):
@@ -18248,10 +18846,11 @@ def _strip_kernel_diagnostics(out):
 
 def _check(case, arch, status, out, timed_out):
     """Return (ok, reason). Validates console output and exit expectations."""
-    if timed_out:
-        return False, f"QEMU hung (> {QEMU_TIMEOUT_S}s) — no clean exit"
     if isinstance(out, bytes):
         out = out.decode(errors="replace")
+    if timed_out:
+        return False, (f"QEMU hung (> {QEMU_TIMEOUT_S}s) — no clean exit "
+                       f"(got {out!r})")
     # The raw output is what a failure reports, always: a reader diagnosing a
     # red row needs the console as the machine wrote it, ticks included.
     hay = out
@@ -18584,6 +19183,8 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
             ok, reason = _check(case, arch, status, out, timed_out)
             if ok:
                 ok, reason = _check_peer(case, peer)
+            else:
+                reason += f"; the peer logged {peer[1]!r}"
         else:
             status, out, timed_out = _run_qemu(qemu, arch, elf,
                                                case.get("stdin"),

@@ -1,0 +1,1004 @@
+//! The network client of the hostile and edge cases: a `netdevproto` client
+//! with `netstack` above it, whose one step is a build input (`netcase`).
+//!
+//! Every scenario attaches to the network driver (or, to test `Attach`
+//! itself, does something else first), does its one hostile or edge step,
+//! prints what it sees and ends by itself. A step that does not come out as
+//! the scenario expects is a line naming it and exit 1, so no scenario waits
+//! on the harness's timeout for a failure it can see. The scenarios:
+//!
+//!   - `attach`             attach, wait out the link's first state.
+//!   - `link_down_first`    the link is down at attach; the harness raises it
+//!                          when the client says it is waiting; a ping.
+//!   - `tx_length`          a frame past the MTU and one under an Ethernet
+//!                          header are sent beside a ping.
+//!   - `ring_index_past`    the `ToServer` head stored past the index range.
+//!   - `ring_index_order`   the `ToServer` head stored back.
+//!   - `ring_length_past`   a slot's length word past the slot.
+//!   - `ring_tail_past`     the `ToClient` tail stored past the index range.
+//!   - `attach_too_large`   an `Attach` the driver's memory cannot hold, and
+//!                          one it can.
+//!   - `attach_handle`      an `Attach` that carries a handle, and a plain one.
+//!   - `ring_no_pin`        `Pin` on the ring the driver gave.
+//!   - `ring_no_unpin`      `Unpin` on the ring the driver gave.
+//!   - `protocol_states`    the statuses of the protocol's states.
+//!   - `slow_client`        a burst of datagrams met with every slot held.
+//!   - `client_dies`        frames sent, and the process ends with its
+//!                          receive buffers posted.
+//!   - `wait_abandoned`     a held `WaitEvent` whose claim is dropped.
+//!   - `greeted`            a frame the peer sends before the client has said
+//!                          anything.
+//!
+//! Nothing here keeps time: every stack call is given `now = 0`, and `poll`
+//! is never called. Each wait is on an event the driver sends for something
+//! that already happened, or on a reply the peer sends to a frame this
+//! program sent.
+
+import sos.{BootSet, Heap, MapAccess, Memory, MemoryRight, PipeHandles, PipeInlet, PipeMsg,
+            PipeReply, SosStatus, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
+import pktring.{Endpoint, Layout, Ring, RingError, Shared, SharedWindow, SlotRange}
+import netdevproto.{AttachInfo, BODY_BYTES, Frame, NetdevBody, NetdevError, NetdevEvent,
+                    NetdevStats, SLOT_BYTES, attach_reply, empty_reply,
+                    event_reply, layout, stats_reply}
+import netstack.{Config, DROP_KINDS, Delivery, Drop, Ipv4Addr, MacAddr, Sink, SinkError,
+                 SocketAddr, Stack}
+import netstack.bytes.{put_bytes}
+import netcase.{name}
+import sosmain
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+/// The client record's tag in the declaration.
+static TAG_NETDEV: UInt = 2
+
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The slots it asks for, each way.
+static SLOTS: UInt16 = 8
+
+/// A slot, as an array length.
+static SLOT: Int = 2048
+
+static_assert(SLOT_BYTES == 2048, "a frame buffer is one slot")
+
+static IDENT: UInt16 = 1
+static ECHO_BYTES: Int = 56
+
+/// A page: what a heap share is made of, on every board.
+static PAGE: UInt = 0x1000
+
+/// The datagrams a burst asks for, and the port the client listens on.
+static BURST: UInt16 = 20
+static LISTEN_PORT: UInt16 = 5000
+
+/// The echo port the peer's `burst` script answers.
+static BURST_PORT: UInt16 = 7
+
+// =============================================================================
+// Words for the transcript
+// =============================================================================
+
+/// A MAC address as six colon-separated pairs of hex digits.
+struct MacText {
+    octets: [UInt8; 6],
+}
+
+func hex_digit(nibble: UInt8) -> Byte {
+    if nibble < 10 { Byte(0x30 + nibble) } else { Byte(0x61 + nibble - 10) }
+}
+
+extension MacText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        var i = 0
+        while i < 6 {
+            if i > 0 { try! into.append(b: Byte(0x3A)) }
+            try! into.append(b: hex_digit(self.octets[i] >> 4))
+            try! into.append(b: hex_digit(self.octets[i] & 0x0F))
+            i = i + 1
+        }
+    }
+}
+
+/// An IPv4 address, dotted.
+struct IpText {
+    addr: Ipv4Addr,
+}
+
+extension IpText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        let v = self.addr.value
+        try! into.append(value: ((v >> 24) & 0xFF) as UInt)
+        try! into.append(b: Byte(0x2E))
+        try! into.append(value: ((v >> 16) & 0xFF) as UInt)
+        try! into.append(b: Byte(0x2E))
+        try! into.append(value: ((v >> 8) & 0xFF) as UInt)
+        try! into.append(b: Byte(0x2E))
+        try! into.append(value: (v & 0xFF) as UInt)
+    }
+}
+
+/// The bytes of `data`, up to the first zero, as text.
+struct Text {
+    bytes: [UInt8; 64],
+    len: Int,
+}
+
+extension Text {
+    static func of(data: &[UInt8]) -> Text {
+        var t = Text(bytes: [0; 64], len: 0)
+        while t.len < data.len() && t.len < 64 && data[t.len] != 0 {
+            t.bytes[t.len] = data[t.len]
+            t.len = t.len + 1
+        }
+        t
+    }
+}
+
+extension Text: Printable {
+    func format(&self, into: &var StringBuilder) {
+        var i = 0
+        while i < self.len {
+            try! into.append(b: Byte(self.bytes[i]))
+            i = i + 1
+        }
+    }
+}
+
+/// What stopped a step.
+enum Failure {
+    /// The pipe refused, the driver's end gone among others.
+    case Pipe(status: SosStatus),
+    /// The driver refused, or answered what no reply can be.
+    case Netdev(error: NetdevError),
+    /// The ring failed a check.
+    case Ring(error: RingError),
+}
+
+extension Failure: Printable {
+    func format(&self, into: &var StringBuilder) {
+        match self {
+            case Pipe(status) -> status.format(&var into),
+            case Netdev(error) -> error.format(&var into),
+            case Ring(error) -> error.format(&var into),
+        }
+    }
+}
+
+/// A step that failed: its line, and exit 1.
+func failed<E: Printable>(what: String, why: &E) -> Int {
+    print("SOS netclient: {}: {}", what, why)
+    EXIT_FAILED
+}
+
+/// A step that failed with nothing more to say: its line, and exit 1.
+func failed_plainly(what: String) -> Int {
+    print("SOS netclient: {}", what)
+    EXIT_FAILED
+}
+
+/// What a request was answered with, whichever way it went: the refusal's
+/// words, or that it was accepted.
+func said<T>(what: String, r: Result<T, NetdevError>) {
+    match r {
+        case Ok(_) -> print("SOS netclient: {}: accepted", what),
+        case Err(e) -> print("SOS netclient: {}: {}", what, e),
+    }
+}
+
+// =============================================================================
+// The connection
+// =============================================================================
+
+/// How many handles `m` carried.
+func carried(m: &PipeMsg) -> UInt {
+    var n: UInt = 0
+    var i = 0
+    while i < PIPE_MSG_HANDLES {
+        if m.handles[i].is_some() { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+/// A reply's bytes and handle count, for the protocol's decoders.
+func frame_of(m: &PipeMsg) -> Result<Frame, Failure> {
+    try Frame(len: m.len, body: m.bytes, handles: carried(&m)) catch {
+        return Failure.Netdev(NetdevError.Malformed(error))
+    }
+}
+
+/// A call on `inlet`: the request, and its reply decoded far enough for the
+/// protocol's own decoders.
+func call(inlet: &PipeInlet, body: &NetdevBody, n: UInt) -> Result<Frame, Failure> {
+    let reply = try inlet.send(body: &body.bytes, len: n) catch {
+        return Failure.Pipe(error)
+    }
+    let frame = try frame_of(&reply)
+    let _ = move reply
+    return frame
+}
+
+/// A tell: posted, and its claim dropped. A post refused for a full ring or
+/// no room for the claim is sent as a call instead, which waits for the
+/// driver.
+func tell(inlet: &PipeInlet, body: &NetdevBody, n: UInt) -> Result<Void, Failure> {
+    let claim = try inlet.post(body: &body.bytes, len: n) catch {
+        if error == SosStatus.WouldBlock || error == SosStatus.QuotaExceeded ||
+           error == SosStatus.NoResource {
+            let reply = try inlet.send(body: &body.bytes, len: n) catch {
+                return Failure.Pipe(error)
+            }
+            let _ = move reply
+            return
+        }
+        return Failure.Pipe(error)
+    }
+    let _ = move claim
+    return
+}
+
+/// The client's end: the driver's connection, the ring (through the
+/// endpoint, and as raw words for the scenarios that write what the endpoint
+/// never would), and what the stack last handed up.
+struct Link {
+    inlet: PipeInlet,
+    end: Endpoint<SharedWindow>,
+    /// The ring's words, stored as a hostile client would.
+    raw: SharedWindow,
+    shape: Layout,
+    /// The ring's Memory handle, as the driver minted it.
+    ring: Memory,
+    /// The device's MAC address, as `Attach` answered it.
+    mac: [UInt8; 6],
+    /// The sequence number of the last echo reply, its sender and its data's
+    /// bytes; 0 before the first.
+    replied: UInt16,
+    reply_from: Ipv4Addr,
+    reply_bytes: Int,
+    /// The datagrams of a burst heard, and whether one was not the next.
+    datagrams: UInt16,
+    wrong: Bool,
+    /// The first failure a transmit met, which the stack cannot carry.
+    failed: Failure?,
+}
+
+extension Link: NoCopy {}
+
+extension Link {
+    /// A call: the request, and its reply decoded.
+    func call(&self, body: &NetdevBody, n: UInt) -> Result<Frame, Failure> {
+        call(&self.inlet, &body, n)
+    }
+
+    /// The driver's next event, waiting for one.
+    func wait_event(&self) -> Result<NetdevEvent, Failure> {
+        var body = NetdevBody.empty()
+        let n = body.wait_event()
+        let frame = try self.call(&body, n)
+        try event_reply(&frame) catch { return Failure.Netdev(error) }
+    }
+
+    /// Hands every frame the driver published since the last look to
+    /// `stack`, and answers how many. The slots stay taken: the caller gives
+    /// them back (`give_back`) when it chooses.
+    func receive_held(&var self, stack: &var Stack) -> Result<UInt, Failure> {
+        let _ = try self.end.poll() catch {
+            if error.is_fatal() { return Failure.Ring(error) }
+            SlotRange(first: 0, count: 0)
+        }
+        var frame: [UInt8; SLOT] = [0; SLOT]
+        var got: UInt = 0
+        while {
+            let n = try self.end.receive(&var frame) catch {
+                if error.is_fatal() { return Failure.Ring(error) }
+                break
+            }
+            stack.receive(&frame[..(n as Int)], 0, &var self)
+            got = got + 1
+        }
+        return got
+    }
+
+    /// Gives back the oldest `count` slots taken and rings `RxReturn`.
+    func give_back(&var self, count: UInt32) -> Result<Void, Failure> {
+        let range = try self.end.release_taken(count) catch { return Failure.Ring(error) }
+        var body = NetdevBody.empty()
+        let n = body.rx_return(range)
+        try tell(&self.inlet, &body, n)
+        return
+    }
+
+    /// Hands every frame the driver published since the last look to
+    /// `stack`, then gives all the slots back.
+    func receive_all(&var self, stack: &var Stack) -> Result<Void, Failure> {
+        let got = try self.receive_held(&var stack)
+        if got == 0 { return }
+        try self.give_back(got as UInt32)
+        return
+    }
+
+    /// Writes the first `len` bytes of an arbitrary frame into the next
+    /// `ToServer` slot, publishes it and rings `Tx`: a frame no stack made.
+    func send_raw(&var self, len: Int) -> Result<Void, Failure> {
+        var buf: [UInt8; SLOT] = [0xA5; SLOT]
+        let _ = try self.end.send(&buf, len as UInt) catch { return Failure.Ring(error) }
+        try self.ring_tx()
+        return
+    }
+
+    /// Rings `Tx` for `range`, whatever the ring says.
+    func ring_tx_range(&var self, range: SlotRange) -> Result<Void, Failure> {
+        var body = NetdevBody.empty()
+        let n = body.tx(range)
+        try tell(&self.inlet, &body, n)
+        return
+    }
+
+    /// Publishes what the endpoint has written and rings `Tx` for it.
+    func ring_tx(&var self) -> Result<Void, Failure> {
+        let range = try self.end.publish() catch { return Failure.Ring(error) }
+        var body = NetdevBody.empty()
+        let n = body.tx(range)
+        try tell(&self.inlet, &body, n)
+        return
+    }
+
+    /// Counts a datagram of the burst and says it, noting one that is not the
+    /// next, `frame K of N`.
+    func hears(&var self, data: &[UInt8]) {
+        self.datagrams = self.datagrams + 1
+        print("SOS netclient: heard {}", Text.of(&data))
+        let k = self.datagrams
+        if data.len() != frame_text_len(k) || not has_frame_text(&data, k) {
+            self.wrong = true
+        }
+    }
+}
+
+/// `frame K of 20`'s length.
+func frame_text_len(k: UInt16) -> Int {
+    let digits_k: Int = if k >= 10 { 2 } else { 1 }
+    let digits_n: Int = if BURST >= 10 { 2 } else { 1 }
+    6 + digits_k + 4 + digits_n
+}
+
+/// Whether `data` begins with the text `frame K of 20`.
+func has_frame_text(data: &[UInt8], k: UInt16) -> Bool {
+    var want = Text(bytes: [0; 64], len: 0)
+    put_text(&var want, "frame ")
+    put_number(&var want, k as UInt)
+    put_text(&var want, " of ")
+    put_number(&var want, BURST as UInt)
+    var i = 0
+    while i < want.len {
+        if i >= data.len() || data[i] != want.bytes[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+func put_text(t: &var Text, s: String) {
+    var i = 0
+    while i < s.len() {
+        t.bytes[t.len] = s.byte_at(i) as UInt8
+        t.len = t.len + 1
+        i = i + 1
+    }
+}
+
+func put_number(t: &var Text, n: UInt) {
+    if n >= 10 {
+        t.bytes[t.len] = (0x30 + n / 10) as UInt8
+        t.len = t.len + 1
+    }
+    t.bytes[t.len] = (0x30 + n % 10) as UInt8
+    t.len = t.len + 1
+}
+
+extension Link: Sink {
+    /// Writes `frame` into the next `ToServer` slot, publishes it and rings
+    /// `Tx`. A full ring is the stack's drop; a failure is kept for the
+    /// caller, and the frame dropped.
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError> {
+        if self.failed.is_some() { return SinkError.Full }
+        if frame.len() > SLOT { return SinkError.Full }
+        var buf: [UInt8; SLOT] = [0; SLOT]
+        put_bytes(&var buf, 0, &frame)
+        let _ = try self.end.send(&buf, frame.len() as UInt) catch {
+            if error.is_fatal() { self.failed = Failure.Ring(error) }
+            return SinkError.Full
+        }
+        try self.ring_tx() catch {
+            self.failed = error
+            return SinkError.Full
+        }
+        return
+    }
+
+    func deliver(&var self, delivery: Delivery, data: &[UInt8]) -> Result<Void, SinkError> {
+        match delivery {
+            case EchoReply(from, _, sequence) -> {
+                self.replied = sequence
+                self.reply_from = from
+                self.reply_bytes = data.len()
+            },
+            case Datagram(_, _) -> self.hears(&data),
+        }
+        return
+    }
+}
+
+// =============================================================================
+// The program
+// =============================================================================
+//
+// Each line is printed by a small function of its own: a `print` renders its
+// arguments into scratch in the frame it is written in, and the steps below
+// would otherwise hold every line's scratch in one frame.
+
+/// The worker's stack. A send holds a whole frame at each of several levels
+/// of the stack and the client, which with the start-up's own frames below
+/// them is more than the main thread's stack holds; the main thread only
+/// starts the worker and joins it.
+static WORK_STACK_WORDS: Int = 8192
+unsafe static var WORK_STACK: [UInt; WORK_STACK_WORDS] = [0; WORK_STACK_WORDS]
+
+func work_stack_top() unsafe -> UInt {
+    let base = ((&var WORK_STACK) as UnsafePointer<UInt>) as UInt
+    base + (WORK_STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Int {
+    let worker = try sosmain.context().process().thread_create(run: work, arg: 0,
+                                                             stack_top: work_stack_top()) catch {
+        return failed("the worker", &error)
+    }
+    try worker.start() catch { return failed("the worker's start", &error) }
+    let code = try worker.join() catch { return failed("the worker's end", &error) }
+    code as Int
+}
+
+/// The scenario, on the worker's stack. Once it has run, the client ends the
+/// process itself, still holding its end of the connection: the driver hears
+/// of its end at the teardown, after the kernel's line for the exit, and not
+/// when the worker's frame lets go of it.
+func work(arg: UInt) sync -> UInt {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_NETDEV) else { return no_record() as UInt }
+    guard let inlet = record.take_inlet() else { return no_record() as UInt }
+    let code = scenario(move inlet) as UInt
+    try sosmain.context().process().exit(code) catch { return failed("exit", &error) as UInt }
+    code
+}
+
+func no_record() -> Int {
+    print("SOS netclient: no inlet under tag {}", TAG_NETDEV)
+    EXIT_FAILED
+}
+
+func no_scenario(what: String) -> Int {
+    print("SOS netclient: no scenario named {}", what)
+    EXIT_FAILED
+}
+
+/// The scenario the image names.
+func scenario(inlet: PipeInlet) -> Int {
+    let which = name()
+    if which.equals("protocol_states") { return protocol_states(move inlet) }
+    if which.equals("attach_too_large") { return attach_too_large(move inlet) }
+    if which.equals("attach_handle") { return attach_handle(move inlet) }
+    var link = try attach(move inlet, SLOTS, SLOTS) catch { return error }
+    if which.equals("attach") { return link_up_only(&var link) }
+    if which.equals("link_down_first") { return link_down_first(&var link) }
+    if which.equals("tx_length") { return tx_length(&var link) }
+    if which.equals("ring_index_past") { return ring_index_past(&var link) }
+    if which.equals("ring_index_order") { return ring_index_order(&var link) }
+    if which.equals("ring_length_past") { return ring_length_past(&var link) }
+    if which.equals("ring_tail_past") { return ring_tail_past(&var link) }
+    if which.equals("ring_no_pin") { return ring_no_pin(&var link) }
+    if which.equals("ring_no_unpin") { return ring_no_unpin(&var link) }
+    if which.equals("slow_client") { return slow_client(&var link) }
+    if which.equals("client_dies") { return client_dies(&var link) }
+    if which.equals("wait_abandoned") { return wait_abandoned(&var link) }
+    if which.equals("greeted") { return greeted(&var link) }
+    no_scenario(which)
+}
+
+func report_attached(info: &AttachInfo) {
+    print("SOS netclient: attached, mac {}, mtu {}, slots {} and {}", MacText(octets: info.mac),
+          info.mtu, info.to_server, info.to_client)
+}
+
+func report_pinging(guest: Ipv4Addr, peer: Ipv4Addr) {
+    print("SOS netclient: {} pinging {}", IpText(addr: guest), IpText(addr: peer))
+}
+
+func report_reply(k: UInt16, link: &Link) {
+    print("SOS netclient: reply {} from {}, {} bytes", k, IpText(addr: link.reply_from),
+          link.reply_bytes)
+}
+
+func report_stats(stats: &NetdevStats) {
+    print("SOS netclient: driver rx={} rx_dropped={} tx={} tx_errors={} ring_faults={}",
+          stats.rx_frames, stats.rx_dropped, stats.tx_frames, stats.tx_errors, stats.ring_faults)
+}
+
+func report_drops(drops: UInt32) {
+    print("SOS netclient: stack drops={}", drops)
+}
+
+/// The window over the ring a mapping at `at` of `len` bytes holds.
+func window_at(at: UInt, len: UInt, shape: &Layout) unsafe -> Result<SharedWindow, RingError> {
+    SharedWindow(at: at as UnsafePointer<UInt32>, len: len, layout: &shape)
+}
+
+/// Stores `word` at `offset` of the ring, as a client that is no `Endpoint`
+/// would.
+func poke(window: &var SharedWindow, offset: UInt, word: UInt32) unsafe {
+    window.store(offset, word)
+}
+
+/// The stack, on the heap: it keeps frames waiting on an address, more than
+/// a stack frame should hold.
+func boxed_stack(mac: MacAddr) unsafe -> Result<Box<Stack>, AllocError> {
+    Box<Stack>.make(Stack(mac: mac))
+}
+
+/// Every drop the stack counted, whatever its reason.
+func drops(stack: &Stack) -> UInt32 {
+    var total: UInt32 = 0
+    var raw = 0
+    while raw < DROP_KINDS {
+        if let reason = Drop.from(raw: raw as UInt8) { total = total + stack.drops(reason) }
+        raw = raw + 1
+    }
+    total
+}
+
+/// What a ring's handle must be, and what its mapping must hold, as input:
+/// the handle carries `Map`, the mapping holds the layout. Answers the
+/// client's end.
+func take_ring(reply: &var PipeMsg, info: &AttachInfo, inlet: PipeInlet) -> Result<Link, Int> {
+    guard let handle = reply.handles[0].take() else {
+        return failed_plainly("attach: no ring in the reply")
+    }
+    let ring = match handle {
+        case Memory(m) -> move m,
+        case _ -> { return failed_plainly("attach: the reply's handle is no Memory") },
+    }
+    let rights = try ring.rights() catch { return failed("the ring's rights", &error) }
+    if (rights & (MemoryRight.Map as UInt32)) == 0 {
+        return failed_plainly("the ring does not carry Map")
+    }
+    let view = try sosmain.context().process().map(memory: &ring, access: RW) catch {
+        return failed("the ring's mapping", &error)
+    }
+    let at = try view.base() catch { return failed("the ring's base", &error) }
+    let len = try view.len() catch { return failed("the ring's length", &error) }
+    let shape = try layout(info.to_server, info.to_client) catch {
+        return failed("the ring's layout", &error)
+    }
+    let window = try window_at(at, len, &shape) catch { return failed("the ring", &error) }
+    let raw = try window_at(at, len, &shape) catch { return failed("the ring", &error) }
+    report_attached(&info)
+    return Link(inlet: move inlet, end: Endpoint.client_given(window, shape), raw: raw,
+                shape: shape, ring: move ring, mac: info.mac, replied: 0,
+                reply_from: Ipv4Addr.unspecified(), reply_bytes: 0, datagrams: 0, wrong: false,
+                failed: None)
+}
+
+/// `Attach` of `to_server` and `to_client` slots, and the ring in its reply
+/// checked as input. Answers the client's end, or the exit code.
+func attach(inlet: PipeInlet, to_server: UInt16, to_client: UInt16) -> Result<Link, Int> {
+    var body = NetdevBody.empty()
+    let n = body.attach(to_server, to_client)
+    var reply = try inlet.send(body: &body.bytes, len: n) catch { return failed("attach", &error) }
+    let frame = try frame_of(&reply) catch { return failed("attach", &error) }
+    let info = try attach_reply(&frame) catch { return failed("attach", &error) }
+    return take_ring(&var reply, &info, move inlet)
+}
+
+/// Waits out the link's first state: up, or down and then up.
+func link_up(link: &Link) -> Result<Void, Int> {
+    while {
+        let event = try link.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case LinkUp -> {
+                print("SOS netclient: link up")
+                return
+            },
+            case LinkDown -> {
+                print("SOS netclient: link down")
+                print("SOS netclient: waiting for link")
+            },
+            case _ -> { return failed_plainly("the first event is not the link's") },
+        }
+    }
+}
+
+/// Waits for the echo reply `k`, handing every frame received to `stack`.
+func await_reply(link: &var Link, stack: &var Stack, k: UInt16) -> Result<Void, Int> {
+    while link.replied != k {
+        let event = try link.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case RxReady(_) -> {
+                try link.receive_all(&var stack) catch { return failed("receive", &error) }
+                if let f = link.failed.take() { return failed("transmit", &f) }
+            },
+            case _ -> {},
+        }
+    }
+    return
+}
+
+/// The driver's counts.
+func driver_stats(link: &Link) -> Result<NetdevStats, Int> {
+    var body = NetdevBody.empty()
+    let n = body.stats()
+    let frame = try link.call(&body, n) catch { return failed("stats", &error) }
+    try stats_reply(&frame) catch { return failed("stats", &error) }
+}
+
+/// The stack, given 10.0.2.15/24 with 10.0.2.2 as gateway, which announces
+/// the address.
+func start_stack(l: &var Link) -> Result<Box<Stack>, Int> {
+    var stack = try boxed_stack(MacAddr(octets: l.mac)) catch {
+        return failed_plainly("no room for the stack")
+    }
+    let config = try Config(addr: Ipv4Addr(10, 0, 2, 15), netmask: Ipv4Addr(255, 255, 255, 0),
+                            gateway: Ipv4Addr(10, 0, 2, 2)) catch {
+        return failed("config", &error)
+    }
+    stack.value().configure(config, &var l)
+    if let f = l.failed.take() { return failed("announce", &f) }
+    return move stack
+}
+
+/// The stack, `pings` echo requests each answered before the next, and the
+/// counts.
+func ping_flow(l: &var Link, pings: UInt16) -> Int {
+    var stack = try start_stack(&var l) catch { return error }
+    let peer = Ipv4Addr(10, 0, 2, 2)
+    report_pinging(Ipv4Addr(10, 0, 2, 15), peer)
+    var data: [UInt8; ECHO_BYTES] = [0; ECHO_BYTES]
+    var i = 0
+    while i < ECHO_BYTES {
+        data[i] = i as UInt8
+        i = i + 1
+    }
+    var k: UInt16 = 1
+    while k <= pings {
+        try stack.value().ping(peer, IDENT, k, &data, 0, &var l) catch {
+            return failed("ping", &error)
+        }
+        if let f = l.failed.take() { return failed("ping", &f) }
+        try await_reply(&var l, &var stack.value(), k) catch { return error }
+        report_reply(k, &l)
+        k = k + 1
+    }
+    let stats = try driver_stats(&l) catch { return error }
+    report_stats(&stats)
+    report_drops(drops(&stack.value()))
+    EXIT_OK
+}
+
+// =============================================================================
+// The scenarios
+// =============================================================================
+
+func link_up_only(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    EXIT_OK
+}
+
+/// The link is down when the driver starts. The harness raises it once this
+/// line is out: the first event is `LinkDown`, then `LinkUp`, then a ping is
+/// answered.
+func link_down_first(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    ping_flow(&var l, 1)
+}
+
+/// A frame of 2000 bytes, which a slot holds and the MTU does not, and one of
+/// 10, under an Ethernet header: neither is sent, and each is counted. A ping
+/// after them is answered.
+func tx_length(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    try l.send_raw(2000) catch { return failed("a frame of 2000 bytes", &error) }
+    try l.send_raw(10) catch { return failed("a frame of 10 bytes", &error) }
+    ping_flow(&var l, 1)
+}
+
+/// After a ring fault the driver ends the connection: a call answers
+/// `PeerClosed`.
+func after_fault(l: &Link) -> Int {
+    var body = NetdevBody.empty()
+    let n = body.stats()
+    let answered = call(&l.inlet, &body, n)
+    match answered {
+        case Err(Pipe(status)) -> print("SOS netclient: stats after the fault: {}", status),
+        case Err(why) -> { return failed("stats after the fault", &why) },
+        case Ok(_) -> { return failed_plainly("stats after the fault: answered") },
+    }
+    EXIT_OK
+}
+
+/// The `ToServer` head stored three past the index range, and a doorbell.
+func ring_index_past(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    let n = l.shape.slots(Ring.ToServer)
+    poke(&var l.raw, l.shape.head_offset(Ring.ToServer), 2 * n + 3)
+    try l.ring_tx_range(SlotRange(first: 0, count: 1)) catch { return failed("tx", &error) }
+    after_fault(&l)
+}
+
+/// One frame sent and its slot given back, then the `ToServer` head stored
+/// back to where it began.
+func ring_index_order(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try start_stack(&var l) catch { return error }
+    while {
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case TxDone(_) -> break,
+            case _ -> {},
+        }
+    }
+    print("SOS netclient: one frame sent")
+    poke(&var l.raw, l.shape.head_offset(Ring.ToServer), 0)
+    try l.ring_tx_range(SlotRange(first: 0, count: 1)) catch { return failed("tx", &error) }
+    after_fault(&l)
+}
+
+/// A length word of 4096 in the first `ToServer` slot, which holds 2048, and
+/// the head moved past it.
+func ring_length_past(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    poke(&var l.raw, l.shape.length_offset(Ring.ToServer, 0), 4096)
+    poke(&var l.raw, l.shape.head_offset(Ring.ToServer), 1)
+    try l.ring_tx_range(SlotRange(first: 0, count: 1)) catch { return failed("tx", &error) }
+    after_fault(&l)
+}
+
+/// The `ToClient` tail stored one past the index range, and the doorbell that
+/// tells the driver slots are free.
+func ring_tail_past(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    let n = l.shape.slots(Ring.ToClient)
+    poke(&var l.raw, l.shape.tail_offset(Ring.ToClient), 2 * n + 1)
+    var body = NetdevBody.empty()
+    let len = body.rx_return(SlotRange(first: 0, count: 1))
+    try tell(&l.inlet, &body, len) catch { return failed("rx_return", &error) }
+    after_fault(&l)
+}
+
+/// An `Attach` for rings of 256 slots each way, about a mebibyte, which the
+/// driver's memory cannot hold: refused with `NoMemory`, the connection kept.
+/// An `Attach` of eight each way is then answered, and a ping.
+func attach_too_large(inlet: PipeInlet) -> Int {
+    var body = NetdevBody.empty()
+    let n = body.attach(256, 256)
+    let frame = try call(&inlet, &body, n) catch { return failed("attach", &error) }
+    said("attach of 256 and 256", attach_reply(&frame))
+    var link = try attach(move inlet, SLOTS, SLOTS) catch { return error }
+    try link_up(&link) catch { return error }
+    ping_flow(&var link, 1)
+}
+
+/// An `Attach` that carries a handle: a page of this client's heap. A request
+/// carries none, so it is refused with `BadOp`, and the handle is released.
+/// A plain `Attach` is then answered.
+func attach_handle(inlet: PipeInlet) -> Int {
+    let page = try Heap<0>().share(len: PAGE) catch { return failed("the page", &error) }
+    var handles = PipeHandles.none()
+    handles.put(at: 0, memory: move page)
+    var body = NetdevBody.empty()
+    let n = body.attach(SLOTS, SLOTS)
+    let reply = try inlet.send_with(body: &body.bytes, len: n, handles: &var handles) catch {
+        return failed("attach with a handle", &error)
+    }
+    let frame = try frame_of(&reply) catch { return failed("attach with a handle", &error) }
+    said("attach carrying a handle", attach_reply(&frame))
+    let _ = move reply
+    let link = try attach(move inlet, SLOTS, SLOTS) catch { return error }
+    EXIT_OK
+}
+
+/// `Pin` on the ring the driver gave: the handle does not carry `Physical`,
+/// so the kernel ends this process.
+func ring_no_pin(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    print("SOS netclient: pinning the ring")
+    let pinned = try l.ring.pin() catch { return failed("pin", &error) }
+    failed_plainly("pin: answered")
+}
+
+/// `Unpin` on the ring the driver gave: the handle does not carry
+/// `Physical`, so the kernel ends this process.
+func ring_no_unpin(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    print("SOS netclient: unpinning the ring")
+    try l.ring.unpin() catch { return failed("unpin", &error) }
+    failed_plainly("unpin: answered")
+}
+
+/// A request of each op, before `Attach` and after it, and the status each is
+/// answered with.
+func protocol_states(inlet: PipeInlet) -> Int {
+    var body = NetdevBody.empty()
+    var n = body.raw(99, 0)
+    var frame = try call(&inlet, &body, n) catch { return failed("an op that is none", &error) }
+    said("an op that is none", empty_reply(&frame))
+    n = body.tx(SlotRange(first: 0, count: 1))
+    frame = try call(&inlet, &body, n) catch { return failed("tx", &error) }
+    said("tx before attach", empty_reply(&frame))
+    n = body.rx_return(SlotRange(first: 0, count: 1))
+    frame = try call(&inlet, &body, n) catch { return failed("rx_return", &error) }
+    said("rx_return before attach", empty_reply(&frame))
+    n = body.wait_event()
+    frame = try call(&inlet, &body, n) catch { return failed("wait_event", &error) }
+    said("wait_event before attach", event_reply(&frame))
+    n = body.stats()
+    frame = try call(&inlet, &body, n) catch { return failed("stats", &error) }
+    said("stats before attach", stats_reply(&frame))
+    n = body.attach(0, SLOTS)
+    frame = try call(&inlet, &body, n) catch { return failed("attach", &error) }
+    said("attach of no slots", attach_reply(&frame))
+    var l = try attach(move inlet, SLOTS, SLOTS) catch { return error }
+    n = body.attach(SLOTS, SLOTS)
+    frame = try l.call(&body, n) catch { return failed("attach", &error) }
+    said("a second attach", attach_reply(&frame))
+    try link_up(&l) catch { return error }
+    // A `WaitEvent` the driver has no event for, held, and a second one.
+    n = body.wait_event()
+    let held = try l.inlet.post(body: &body.bytes, len: n) catch {
+        return failed("a held wait_event", &error)
+    }
+    frame = try l.call(&body, n) catch { return failed("wait_event", &error) }
+    said("wait_event while one is held", event_reply(&frame))
+    n = body.tx(SlotRange(first: SLOTS, count: 1))
+    frame = try l.call(&body, n) catch { return failed("tx", &error) }
+    said("tx past the ring", empty_reply(&frame))
+    n = body.rx_return(SlotRange(first: SLOTS, count: 1))
+    frame = try l.call(&body, n) catch { return failed("rx_return", &error) }
+    said("rx_return past the ring", empty_reply(&frame))
+    let _ = move held
+    EXIT_OK
+}
+
+/// The peer answers `burst 20` with twenty datagrams, in a ring of eight
+/// slots, whose first is taken by the ARP reply. The client takes frames
+/// without giving a slot back until all eight are full, then gives one back at
+/// a time and takes the frame it makes room for. The datagrams arrive intact
+/// and in order, and none is dropped.
+func slow_client(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try start_stack(&var l) catch { return error }
+    let opened = try stack.value().udp_open(LISTEN_PORT) catch { return failed("udp_open", &error) }
+    var ask: [UInt8; 8] = [0; 8]
+    put_burst_ask(&var ask)
+    let to = SocketAddr(addr: Ipv4Addr(10, 0, 2, 2), port: BURST_PORT)
+    try stack.value().udp_send(opened.id, to, &ask, 0, &var l) catch {
+        return failed("udp_send", &error)
+    }
+    if let f = l.failed.take() { return failed("udp_send", &f) }
+    // Every slot held: nothing is given back until the ring is full.
+    var held: UInt = 0
+    while held < (SLOTS as UInt) {
+        held = held + (try take_frames(&var l, &var stack.value()) catch { return error })
+    }
+    print("SOS netclient: holding {} frames", held)
+    while l.datagrams < BURST {
+        try l.give_back(1) catch { return failed("rx_return", &error) }
+        let _ = try take_frames(&var l, &var stack.value()) catch { return error }
+    }
+    if l.wrong { return failed_plainly("a datagram was not the one expected") }
+    print("SOS netclient: {} datagrams, in order", l.datagrams)
+    let stats = try driver_stats(&l) catch { return error }
+    report_stats(&stats)
+    EXIT_OK
+}
+
+/// `burst 20`, as the datagram's bytes.
+func put_burst_ask(ask: &var [UInt8; 8]) {
+    var t = Text(bytes: [0; 64], len: 0)
+    put_text(&var t, "burst ")
+    put_number(&var t, BURST as UInt)
+    var i = 0
+    while i < 8 {
+        ask[i] = t.bytes[i]
+        i = i + 1
+    }
+}
+
+/// Waits for an event that names received frames, and takes them without
+/// giving a slot back; answers how many came in.
+func take_frames(l: &var Link, stack: &var Stack) -> Result<UInt, Int> {
+    while {
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case RxReady(_) -> {
+                let got = try l.receive_held(&var stack) catch { return failed("receive", &error) }
+                if let f = l.failed.take() { return failed("transmit", &f) }
+                if got > 0 { return got }
+            },
+            case _ -> {},
+        }
+    }
+}
+
+/// Two frames sent, and the process ends with its receive buffers posted: the
+/// driver finds it gone while the device may still write to the ring.
+func client_dies(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try start_stack(&var l) catch { return error }
+    var data: [UInt8; ECHO_BYTES] = [0; ECHO_BYTES]
+    try stack.value().ping(Ipv4Addr(10, 0, 2, 2), IDENT, 1, &data, 0, &var l) catch {
+        return failed("ping", &error)
+    }
+    if let f = l.failed.take() { return failed("ping", &f) }
+    // The announcement and the ARP request: the echo waits for the peer's
+    // answer, which this client never reads.
+    var sent: UInt = 0
+    while sent < 2 {
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case TxDone(range) -> { sent = sent + (range.count as UInt) },
+            case _ -> {},
+        }
+    }
+    print("SOS netclient: two frames sent, leaving with the receive buffers posted")
+    EXIT_OK
+}
+
+/// A `WaitEvent` posted with no event to answer it, held by the driver, and
+/// its claim dropped. The next `WaitEvent` is answered, not refused `Busy`.
+func wait_abandoned(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var body = NetdevBody.empty()
+    let n = body.wait_event()
+    let claim = try l.inlet.post(body: &body.bytes, len: n) catch {
+        return failed("a held wait_event", &error)
+    }
+    print("SOS netclient: wait_event posted")
+    // No tick arms in this image, so the yield returns only once the driver
+    // has taken the request, attached it and parked in `wait`.
+    let me = try sosmain.context().process().thread_self() catch { return failed("thread", &error) }
+    try me.yield_now() catch { return failed("yield", &error) }
+    let _ = move claim
+    print("SOS netclient: claim dropped")
+    ping_flow(&var l, 1)
+}
+
+/// Waits for the one frame the peer sent unasked, which the driver can
+/// publish only into a buffer it posted when it attached.
+func greeted(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    while {
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case RxReady(_) -> break,
+            case _ -> {},
+        }
+    }
+    let _ = try l.end.poll() catch { return failed("poll", &error) }
+    var frame: [UInt8; SLOT] = [0; SLOT]
+    let n = try l.end.receive(&var frame) catch { return failed("receive", &error) }
+    print("SOS netclient: heard {} bytes from {} to {}: {}", n, MacText(octets: mac_at(&frame, 6)),
+          MacText(octets: mac_at(&frame, 0)), Text.of(&frame[14..(n as Int)]))
+    EXIT_OK
+}
+
+/// The six bytes of `frame` from `at`.
+func mac_at(frame: &[UInt8; SLOT], at: Int) -> [UInt8; 6] {
+    var octets: [UInt8; 6] = [0; 6]
+    var i = 0
+    while i < 6 {
+        octets[i] = frame[at + i]
+        i = i + 1
+    }
+    octets
+}

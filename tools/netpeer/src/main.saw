@@ -4,18 +4,22 @@
 //!         listens on a loopback port the system picks and prints `port N` as
 //!         its first line, accepts the one connection QEMU's `-netdev stream`
 //!         makes, and answers the guest's frames as the script NAME (`ping`,
-//!         `burst`, `log` or `silent`; src/peer.saw) says. It prints a line
-//!         for each thing it saw, and `peer: closed after N frames` when the
-//!         guest's end of the stream closes, then exits 0
+//!         `burst`, `log`, `silent` or `greet`; src/peer.saw) says. It prints
+//!         a line for each thing it saw, and `peer: closed after N frames`
+//!         when the guest's end of the stream closes, then exits 0
 //!
 //! A frame crosses the stream as a four-byte big-endian length and the frame.
-//! The peer sends only what a guest frame caused, so a run does not depend
-//! on any clock. A refusal is a line `error: ...` and a nonzero exit.
+//! The peer sends only what a guest frame caused, and the one frame `greet`
+//! sends when its standard input says the guest is ready (a byte, or the end
+//! of the input), so a run does not depend on any clock. A refusal is a line
+//! `error: ...` and a nonzero exit.
 
 import std.data.{Data}
 import std.env.{Env}
+import std.file.{File}
+import std.path.{Path}
 import std.net.{TcpListener, TcpStream, IoErrorKind}
-import netpeer.peer.{Peer, Script}
+import netpeer.peer.{Handled, Peer, Script}
 import netpeer.framing.{Reassembler, length_prefixed}
 
 /// Why the peer stopped, in words a reader can act on.
@@ -30,7 +34,7 @@ extension Failure: Error {
 }
 
 func usage() -> String {
-    "usage: netpeer serve --script ping|burst|log|silent"
+    "usage: netpeer serve --script ping|burst|log|silent|greet"
 }
 
 func main() -> Int {
@@ -70,6 +74,15 @@ func serve(script: Script) -> Result<Void, Failure> {
     }
     var peer = Peer(script: script)
     var pending = Reassembler()
+    if script.greets() {
+        try wait_for_go()
+    }
+    let hello = peer.greeting()
+    let heard = try send(&stream, &hello)
+    if not heard {
+        print("peer: closed after 0 frames")
+        return
+    }
     while true {
         let chunk = try stream.read() catch {
             return Failure(message: "read: {error}")
@@ -95,12 +108,31 @@ func serve(script: Script) -> Result<Void, Failure> {
     print("peer: closed after {peer.count()} frames")
 }
 
+/// Blocks until a byte arrives on standard input, or it closes: the
+/// harness's word that the guest has brought its device up, which a frame
+/// sent sooner may not survive (QEMU drops what it flushes to a device that
+/// is not ready).
+func wait_for_go() unsafe -> Result<Void, Failure> {
+    var input = try File.open(Path(s: "/dev/stdin")) catch {
+        return Failure(message: "standard input: {error}")
+    }
+    let _ = try input.read(size: 1) catch {
+        return Failure(message: "standard input: {error}")
+    }
+    return
+}
+
 /// Logs what `frame` caused and sends the replies; false when the other end
 /// has gone, which is how a guest that has finished looks to a peer answering
 /// its last frame.
 func answer(stream: &TcpStream, peer: &var Peer,
             frame: &Data) -> Result<Bool, Failure> {
     let handled = peer.handle(&frame)
+    return try send(&stream, &handled)
+}
+
+/// Logs the lines of `handled` and sends its replies, as `answer` does.
+func send(stream: &TcpStream, handled: &Handled) -> Result<Bool, Failure> {
     var i = 0
     while i < handled.lines.len() {
         let text = handled.lines.get(i) ?? ""
