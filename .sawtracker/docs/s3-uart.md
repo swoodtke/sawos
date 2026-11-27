@@ -7,8 +7,11 @@ the reviewer have read it.
 measures the console's syscalls, which a claimant looping in syscalls keeps
 moving. It asks whether the console connection has had a message taken since
 its last wake, from a `taken` count on the pipe that root reads through its
-inlet with a new `PipeInletOp.Taken` (§4.6). Dropping the measure instead
-would kill a healthy driver whose root line waits behind other clients'.
+inlet with a new `PipeInletOp.Taken` (§4.6). The oldest line alone would
+also serve at today's sizes: it waits behind at most `PIPE_INFLIGHT` Writes
+of 127 bytes, the ring and the FIFO, about 0.3 s at 115200, inside two 1 s
+periods. The take count is kept because it depends on neither the ring's
+depth nor the rate.
 
 **Changes in edit 3.1**, from the owner's answers to revision 3:
 killing a stalled console checked every second stands; `Lost` and `Garbled`
