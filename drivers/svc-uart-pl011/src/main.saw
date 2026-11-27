@@ -17,8 +17,10 @@
 //                or answered `Busy` while `MAX_HELD` are held; `Write` goes
 //                out the transmitter and is answered `Ok`; `Sync` and `Mark`
 //                are answered `Ok`; `Pending` is answered with the count of
-//                buffered bytes; a request `uartproto` refuses is answered
-//                `BadOp`.
+//                buffered bytes; `Stats` is answered with the counters this
+//                device has (bytes received and lost, bytes written, which
+//                are queued and sent at once); a request `uartproto` refuses
+//                is answered `BadOp`.
 //   Interrupt    the device has bytes. Drain, ack, then answer as many held
 //                reads as there are bytes for.
 //   Abandoned    a client dropped its claim on a read this driver is holding.
@@ -45,7 +47,8 @@
 import sos.{BootSet, IoMemory, Interrupt, Waiter, WaitResult, WaitPayload,
             PipeOutlet, PipeRequest, PipeMsg, AttachMode, ReplyWaitError,
             SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartStatus, UartBody, Frame, BODY_BYTES, InBuf}
+import uartproto.{UartOp, UartStatus, UartStats, UartBody, Frame, BODY_BYTES,
+                  InBuf, count_up}
 import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
@@ -453,6 +456,8 @@ func serve(waiter: &Waiter, uart: &Uart,
     var messages: Int = 0
     var abandoned: Int = 0
     var order: UInt = 0
+    var received: UInt32 = 0
+    var written: UInt32 = 0
     var window = Window.closed()
 
     var wake = try waiter.wait()
@@ -466,7 +471,7 @@ func serve(waiter: &Waiter, uart: &Uart,
             // Every device read happens before the ack (spec §9's release
             // rule). After the ack the line is live again, so a register read
             // moved below it would race the next byte.
-            drain_device(&uart, &var input)
+            received = count_up(received, drain_device(&uart, &var input))
             try irq.ack()
             // Then answer as many held reads as there are bytes for. These are
             // ordinary `reply` ops on obligations this driver has been keeping;
@@ -543,12 +548,24 @@ func serve(waiter: &Waiter, uart: &Uart,
                         },
                         case Write -> {
                             write_out(&uart, &frame)
+                            written = count_up(written,
+                                               frame.payload_len() as UInt32)
                             let n = body.ok()
                             wake = try answer(move obligation, &body, n,
                                               &waiter, &var window)
                         },
                         case Pending -> {
                             let n = body.ok_byte(input.count as UInt8)
+                            wake = try answer(move obligation, &body, n,
+                                              &waiter, &var window)
+                        },
+                        case Stats -> {
+                            let stats = UartStats(
+                                received: received,
+                                lost: input.dropped as UInt32,
+                                frame_errors: 0, parity_errors: 0, breaks: 0,
+                                queued: written, sent: written, writes_held: 0)
+                            let n = body.ok_stats(&stats)
                             wake = try answer(move obligation, &body, n,
                                               &waiter, &var window)
                         },
@@ -589,12 +606,15 @@ func serve(waiter: &Waiter, uart: &Uart,
                   window_discarded: window.discarded, window_traps: traps)
 }
 
-/// Empty the receiver into the buffer. This is the only device read in the
-/// loop.
-func drain_device(uart: &Uart, into: &var InBuf) {
+/// Empty the receiver into the buffer, and answer how many bytes it held.
+/// This is the only device read in the loop.
+func drain_device(uart: &Uart, into: &var InBuf) -> UInt32 {
+    var taken: UInt32 = 0
     while uart.has_byte() {
         into.push(uart.take_byte())
+        taken = count_up(taken, 1)
     }
+    taken
 }
 
 /// Put a `Write` request's payload out the transmitter.

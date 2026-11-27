@@ -2,8 +2,9 @@
 // lengths, and the decoders' guards. A shared enum would change client and
 // driver together and no case would notice, so the numbers are written here.
 
-import uartproto.{ASCII_SUBSTITUTE, BODY_BYTES, Frame, MAX_PAYLOAD, OP_BYTE,
-                  PAYLOAD_BYTE, UartBody, UartOp, UartStatus}
+import uartproto.{ASCII_SUBSTITUTE, BODY_BYTES, COUNTS_BYTES, Frame, MAX_PAYLOAD,
+                  OP_BYTE, PAYLOAD_BYTE, STATS_BYTES, UartBody, UartCounts, UartOp,
+                  UartStats, UartStatus}
 
 /// Holds `ok`, naming what failed when it does not.
 func check(ok: Bool, what: String) {
@@ -36,19 +37,25 @@ func main() {
     check(UartOp.Mark as UInt8 == 4, "Mark is 4")
     check(UartOp.Pending as UInt8 == 5, "Pending is 5")
     check(UartOp.from(raw: 0).is_none(), "no op 0")
-    check(UartOp.from(raw: 6).is_none(), "no op 6")
+    check(UartOp.Stats as UInt8 == 6, "Stats is 6")
+    check(UartOp.from(raw: 7).is_none(), "no op 7")
     check(UartOp.from(raw: 255).is_none(), "no op 255")
     check(UartStatus.Ok as UInt8 == 0, "Ok is 0")
     check(UartStatus.BadOp as UInt8 == 1, "BadOp is 1")
     check(UartStatus.Unsupported as UInt8 == 2, "Unsupported is 2")
     check(UartStatus.Busy as UInt8 == 3, "Busy is 3")
-    check(UartStatus.from(raw: 4).is_none(), "no status 4")
+    check(UartStatus.Lost as UInt8 == 4, "Lost is 4")
+    check(UartStatus.Garbled as UInt8 == 5, "Garbled is 5")
+    check(UartStatus.from(raw: 6).is_none(), "no status 6")
     check(UartStatus.Ok.describe().equals("Ok") && UartStatus.BadOp.describe().equals("BadOp")
           && UartStatus.Unsupported.describe().equals("Unsupported")
-          && UartStatus.Busy.describe().equals("Busy"), "each status's name")
+          && UartStatus.Busy.describe().equals("Busy")
+          && UartStatus.Lost.describe().equals("Lost")
+          && UartStatus.Garbled.describe().equals("Garbled"), "each status's name")
     check(UartOp.Read.describe().equals("read") && UartOp.Write.describe().equals("write")
           && UartOp.Sync.describe().equals("sync") && UartOp.Mark.describe().equals("mark")
-          && UartOp.Pending.describe().equals("pending"),
+          && UartOp.Pending.describe().equals("pending")
+          && UartOp.Stats.describe().equals("stats"),
           "each op's name")
     check(BODY_BYTES == 128, "a body is 128 bytes")
     check(OP_BYTE == 0 && PAYLOAD_BYTE == 1, "the op, then the payload")
@@ -58,6 +65,8 @@ func main() {
     check(not UartOp.Sync.takes_payload(), "Sync takes none")
     check(not UartOp.Mark.takes_payload(), "Mark takes none")
     check(not UartOp.Pending.takes_payload(), "Pending takes none")
+    check(not UartOp.Stats.takes_payload(), "Stats takes none")
+    check(COUNTS_BYTES == 16 && STATS_BYTES == 32, "four counters, eight counters")
 
     // Request builders.
     var b = UartBody.empty()
@@ -98,11 +107,44 @@ func main() {
     n = r.ok_byte(0x5A)
     check(n == 2 && r.bytes[0] == 0 && r.bytes[1] == 0x5A, "Ok and a byte")
 
+    // A `Stats` reply: each counter at its own offset, little-endian.
+    let stats = UartStats(received: 0x0102_0304, lost: 0x1112_1314,
+                          frame_errors: 0x2122_2324, parity_errors: 0x3132_3334,
+                          breaks: 0x4142_4344, queued: 0x5152_5354,
+                          sent: 0x6162_6364, writes_held: 0x7172_7374)
+    n = r.ok_stats(&stats)
+    check(n == 33 && r.bytes[0] == 0, "Stats is Ok and 32 bytes")
+    check(r.bytes[1] == 0x04 && r.bytes[2] == 0x03 && r.bytes[3] == 0x02
+          && r.bytes[4] == 0x01, "received, little-endian")
+    check(r.bytes[5] == 0x14 && r.bytes[8] == 0x11, "lost")
+    check(r.bytes[9] == 0x24 && r.bytes[12] == 0x21, "frame errors")
+    check(r.bytes[13] == 0x34 && r.bytes[16] == 0x31, "parity errors")
+    check(r.bytes[17] == 0x44 && r.bytes[20] == 0x41, "breaks")
+    check(r.bytes[21] == 0x54 && r.bytes[24] == 0x51, "queued")
+    check(r.bytes[25] == 0x64 && r.bytes[28] == 0x61, "sent")
+    check(r.bytes[29] == 0x74 && r.bytes[32] == 0x71, "writes held")
+    check(UartStats.zero().sent == 0 && UartStats.zero().received == 0,
+          "the zero counters")
+
+    // A mark: its status, then four counters.
+    let counts = UartCounts(lost: 0x0102_0304, frame: 5, parity: 6, breaks: 7)
+    n = r.mark(UartStatus.Lost, &counts)
+    check(n == 17 && r.bytes[0] == 4 && r.bytes[1] == 0x04 && r.bytes[4] == 0x01
+          && r.bytes[5] == 5 && r.bytes[9] == 6 && r.bytes[13] == 7,
+          "a Lost mark and its counters")
+    n = r.mark(UartStatus.Garbled, &counts)
+    check(n == 17 && r.bytes[0] == 5, "a Garbled mark")
+    check(Frame(len: 17, bytes: r.bytes).word(1) == 0x0102_0304,
+          "a counter read back")
+    check(Frame(len: 3, bytes: r.bytes).word(1) == 0x0304,
+          "a word cut by the reply's end reads zero past it")
+
     // A request the protocol accepts, at the ends of each length.
     check(is_op(message(1, 1, 0).request(), UartOp.Read), "Read, no payload")
     check(is_op(message(1, 3, 0).request(), UartOp.Sync), "Sync, no payload")
     check(is_op(message(1, 4, 0).request(), UartOp.Mark), "Mark, no payload")
     check(is_op(message(1, 5, 0).request(), UartOp.Pending), "Pending, no payload")
+    check(is_op(message(1, 6, 0).request(), UartOp.Stats), "Stats, no payload")
     check(is_op(message(1, 2, 0).request(), UartOp.Write), "Write, no payload")
     check(is_op(message(BODY_BYTES as UInt, 2, 0).request(), UartOp.Write),
           "Write, a full payload")
@@ -110,12 +152,13 @@ func main() {
     check(message(0, 1, 0).op().is_none(), "no bytes, no op")
     check(message(0, 1, 0).request().is_none(), "no bytes, refused")
     check(message(1, 0, 0).request().is_none(), "op 0 refused")
-    check(message(1, 6, 0).request().is_none(), "op 6 refused")
+    check(message(1, 7, 0).request().is_none(), "op 7 refused")
     check(message(1, 255, 0).request().is_none(), "op 255 refused")
     check(message(2, 1, 0).request().is_none(), "Read with a byte refused")
     check(message(2, 3, 0).request().is_none(), "Sync with a byte refused")
     check(message(2, 4, 0).request().is_none(), "Mark with a byte refused")
     check(message(2, 5, 0).request().is_none(), "Pending with a byte refused")
+    check(message(2, 6, 0).request().is_none(), "Stats with a byte refused")
     check(message(BODY_BYTES as UInt, 3, 0).request().is_none(),
           "Sync with a full payload refused")
 
@@ -137,6 +180,8 @@ func main() {
     let unsupported = message(1, 2, 0)
     check(is_status(&unsupported, UartStatus.Unsupported), "status 2")
     check(is_status(&message(1, 3, 0), UartStatus.Busy), "status 3")
-    check(message(1, 4, 0).status().is_none(), "4 is no status")
+    check(is_status(&message(1, 4, 0), UartStatus.Lost), "status 4")
+    check(is_status(&message(1, 5, 0), UartStatus.Garbled), "status 5")
+    check(message(1, 6, 0).status().is_none(), "6 is no status")
     check(message(0, 0, 0).status().is_none(), "no bytes, no status")
 }

@@ -2,8 +2,9 @@
 // reply decoded to its value or its error, and the transport's failures
 // passed through.
 
-import uartproto.{BODY_BYTES, Frame, MAX_PAYLOAD, Uart, UartError, UartTransport,
-                  empty_reply, read_reply}
+import uartproto.{BODY_BYTES, Frame, MAX_PAYLOAD, Uart, UartBody, UartCounts,
+                  UartError, UartStats, UartStatus, UartTransport, empty_reply,
+                  pending_reply, read_reply, stats_reply}
 
 /// Holds `ok`, naming what failed when it does not.
 func check(ok: Bool, what: String) {
@@ -85,11 +86,74 @@ func main() {
     // Malformed: no bytes, a status that is none, Ok without its byte or with
     // one too many, a refusal with a byte.
     check(reads(reply(0, 0, 0), UartError.Malformed), "a read answered nothing")
-    check(reads(reply(1, 4, 0), UartError.Malformed), "a read answered status 4")
+    check(reads(reply(1, 6, 0), UartError.Malformed), "a read answered status 6")
     check(reads(reply(1, 0, 0), UartError.Malformed), "a read answered Ok alone")
     check(reads(reply(3, 0, 0), UartError.Malformed), "a read answered Ok and two")
     check(reads(reply(2, 2, 0), UartError.Malformed), "a refusal with a byte")
     check(reads(reply(2, 9, 0x5A), UartError.Malformed), "a byte after a status that is none")
+
+    // A mark: `Lost` or `Garbled` and four counters, in the reply's bytes;
+    // any other length is malformed, and only a read can be marked.
+    let counts = UartCounts(lost: 0x0102_0304, frame: 5, parity: 6, breaks: 7)
+    var mark_body = UartBody.empty()
+    let lost_len = mark_body.mark(UartStatus.Lost, &counts)
+    let lost_frame = Frame(len: lost_len, bytes: mark_body.bytes)
+    check(reads(lost_frame, UartError.Lost(counts)), "a read marked Lost")
+    check(not reads(lost_frame, UartError.Garbled(counts)),
+          "a Lost is not a Garbled")
+    check(not reads(lost_frame, UartError.Lost(UartCounts(lost: 0x0102_0304,
+          frame: 5, parity: 6, breaks: 8))), "a Lost carries every counter")
+    let garbled_len = mark_body.mark(UartStatus.Garbled, &counts)
+    let garbled_frame = Frame(len: garbled_len, bytes: mark_body.bytes)
+    check(reads(garbled_frame, UartError.Garbled(counts)), "a read marked Garbled")
+    check(reads(Frame(len: 16, bytes: lost_frame.bytes), UartError.Malformed),
+          "a mark one byte short")
+    check(reads(Frame(len: 18, bytes: lost_frame.bytes), UartError.Malformed),
+          "a mark one byte long")
+    check(reads(reply(1, 4, 0), UartError.Malformed), "a Lost with no counters")
+    check(reads(reply(1, 5, 0), UartError.Malformed), "a Garbled with no counters")
+    check(is_err(pending_reply(&lost_frame), UartError.Malformed),
+          "a pending cannot be marked")
+    check(is_err(client(lost_frame).pending(), UartError.Malformed),
+          "a pending answered Lost")
+    check(syncs(lost_frame, UartError.Malformed), "a sync cannot be marked")
+    check(syncs(reply(1, 4, 0), UartError.Malformed), "a sync answered Lost alone")
+    check(syncs(reply(1, 5, 0), UartError.Malformed), "a sync answered Garbled alone")
+    check(is_err(empty_reply(&reply(1, 4, 0)), UartError.Malformed),
+          "empty_reply refuses Lost")
+    check(UartError.Lost(counts).describe().equals("input lost")
+          && UartError.Garbled(counts).describe().equals("input garbled"),
+          "the marks' names")
+
+    // Stats: the op alone, called; eight counters in the reply.
+    var sb = UartBody.empty()
+    let stats = UartStats(received: 1, lost: 2, frame_errors: 3, parity_errors: 4,
+                          breaks: 5, queued: 0x0102_0304, sent: 7, writes_held: 8)
+    let stats_len = sb.ok_stats(&stats)
+    let stats_frame = Frame(len: stats_len, bytes: sb.bytes)
+    var st = client(stats_frame)
+    check(try! st.stats() == stats, "a stats answers its counters")
+    check(st.transport.sent_len == 1 && st.transport.sent[0] == 6
+          && st.transport.calls == 1, "a stats is the op alone, called")
+    check(is_err(client(reply(1, 1, 0)).stats(), UartError.BadOp),
+          "a stats refused BadOp")
+    check(is_err(client(reply(1, 2, 0)).stats(), UartError.Unsupported),
+          "a stats refused Unsupported")
+    check(is_err(client(reply(1, 0, 0)).stats(), UartError.Malformed),
+          "a stats answered Ok alone")
+    check(is_err(client(Frame(len: 32, bytes: stats_frame.bytes)).stats(),
+                 UartError.Malformed), "a stats one counter byte short")
+    check(is_err(client(Frame(len: 34, bytes: stats_frame.bytes)).stats(),
+                 UartError.Malformed), "a stats one byte long")
+    check(is_err(client(reply(0, 0, 0)).stats(), UartError.Malformed),
+          "a stats answered nothing")
+    check(is_err(client(reply(2, 1, 0)).stats(), UartError.Malformed),
+          "a stats refusal with a byte")
+    check(is_err(client(lost_frame).stats(), UartError.Malformed),
+          "a stats answered Lost")
+    check(is_err(client(reply(1, 9, 0)).stats(), UartError.Malformed),
+          "a stats answered status 9")
+    check(try! stats_reply(&stats_frame) == stats, "stats_reply")
 
     // Pending: the op alone, called; the count in the reply's one byte.
     var p = client(reply(2, 0, 3))

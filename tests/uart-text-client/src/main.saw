@@ -12,6 +12,8 @@
 //!   connection's ring holds, which its transport carries by waiting for the
 //!   driver;
 //! - `Write`s of no payload and of a full one, and a line split over two;
+//! - a `Stats` after them, whose queued and sent counts are the bytes they
+//!   wrote and whose loss and error counts are zero;
 //! - a `Read`, posted, then a `Sync`. A connection is served in order, so once
 //!   the `Sync` is answered the driver has served the `Read`. A claim answered
 //!   by then was answered at once: `Unsupported` from a device with no input,
@@ -32,7 +34,7 @@
 
 import sos.{System, Process, BootSet, PipeHandles, SosStatus}
 import uartproto.{Frame, MAX_PAYLOAD, PAYLOAD_BYTE, Uart, UartBody, UartError,
-                  UartOp, empty_reply, read_reply}
+                  UartOp, UartStats, empty_reply, read_reply}
 import uartpipe.{PipeTransport, uart}
 
 /// The client end of the driver's connection, as `process.toml` declares it.
@@ -147,6 +149,29 @@ func writes(c: &var Client) -> Result<Void, SosStatus> {
     return
 }
 
+/// The bytes `burst` and `writes` tell, the last line's included: what a
+/// `Stats` after them reports as queued and as sent.
+static TOLD: UInt32 = 364
+
+/// A `Stats` counts the writes' bytes and none lost or damaged. The received
+/// count is the device's, not the script's, so it is not held.
+func stats(c: &var Client) -> Result<Void, SosStatus> {
+    let s = try ok("stats", c.u.stats())
+    if s.queued != TOLD || s.sent != TOLD {
+        print("SOS uartclient: stats: queued {} sent {}, wanted {}",
+              s.queued, s.sent, TOLD)
+        return MISMATCH
+    }
+    let damage = s.lost | s.frame_errors | s.parity_errors | s.breaks
+    if (damage | s.writes_held) != 0 {
+        print("SOS uartclient: stats: lost {} frame {} parity {} breaks {} held {}",
+              s.lost, s.frame_errors, s.parity_errors, s.breaks, s.writes_held)
+        return MISMATCH
+    }
+    try c.say("SOS uartclient: stats: every byte queued and sent, none lost\n")
+    return
+}
+
 /// A `Read`, answered at once or held, told apart by a `Sync`. Against a
 /// driver that holds it, three more are held and a fifth is answered `Busy`.
 func read(c: &var Client) -> Result<Void, SosStatus> {
@@ -185,8 +210,11 @@ func refusals(c: &var Client) -> Result<Void, SosStatus> {
     try c.say("SOS uartclient: a request of no bytes: BadOp\n")
     try refused("op 0", c.u.raw(0, 0), UartError.BadOp)
     try c.say("SOS uartclient: op 0: BadOp\n")
-    try refused("op 6", c.u.raw(6, 0), UartError.BadOp)
-    try c.say("SOS uartclient: op 6: BadOp\n")
+    try refused("op 7", c.u.raw(7, 0), UartError.BadOp)
+    try c.say("SOS uartclient: op 7: BadOp\n")
+    try refused("stats carrying a byte", c.u.raw(UartOp.Stats as UInt8, 1),
+                UartError.BadOp)
+    try c.say("SOS uartclient: a stats carrying a byte: BadOp\n")
     try refused("op 255", c.u.raw(255, 0), UartError.BadOp)
     try c.say("SOS uartclient: op 255: BadOp\n")
     try refused("read carrying a byte", c.u.raw(UartOp.Read as UInt8, 1), UartError.BadOp)
@@ -235,6 +263,7 @@ func script(c: &var Client) -> Result<Void, SosStatus> {
     try ok("mark", c.u.mark())
     try burst(&var c)
     try writes(&var c)
+    try stats(&var c)
     try read(&var c)
     try refusals(&var c)
     try carrying(&var c)

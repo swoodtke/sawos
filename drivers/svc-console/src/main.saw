@@ -12,7 +12,8 @@
 // the obligation to answer it, and the process holds no endpoint handle. Every
 // request is answered at once, with the status `consolecore.console_status`
 // gives it: a `Write`'s payload goes to the console and is answered `Ok`, as
-// are `Sync` and `Mark`; a `Read` is answered `Unsupported`, since the kernel
+// are `Sync` and `Mark`; `Stats` is answered `Ok` and the printed byte count
+// as queued and sent; a `Read` is answered `Unsupported`, since the kernel
 // console has no input for a process; anything the protocol refuses is
 // answered `BadOp`. The driver holds no obligation, so no read parks.
 //
@@ -35,7 +36,7 @@
 import sos.{Waiter, WaitResult, BootSet, PipeOutlet, PipeRequest, AttachMode,
             SosStatus, SystemRight, PIPE_BODY_BYTES}
 import uartproto.{BODY_BYTES, Frame, UartBody, UartOp}
-import consolecore.{Tally, console_status, writes}
+import consolecore.{Tally, asks_stats, console_status, writes}
 import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
@@ -154,7 +155,11 @@ func serve(waiter: &Waiter) -> Result<Report, SosStatus> {
                         marked = true
                     }
                     tally.count(status, printed)
-                    let n = body.refuse(status)
+                    var n = body.refuse(status)
+                    if asks_stats(&frame) {
+                        let stats = tally.stats()
+                        n = body.ok_stats(&stats)
+                    }
                     wake = try answer(move r, &body, n, &waiter)
                 },
                 // Unreachable: `is_message` established the tag one line up.

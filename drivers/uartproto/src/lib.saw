@@ -11,9 +11,11 @@
 //! Sync   3  -                     -
 //! Mark   4  -                     -
 //! Pending 5 -                     the count of input bytes buffered
+//! Stats  6  -                     eight counters, `UartStats`
 //! ```
 //!
-//! A reply that is not `Ok` carries the status byte alone.
+//! A reply that is not `Ok` carries the status byte alone, except `Lost` and
+//! `Garbled`, which carry four counters (`UartCounts`).
 //!
 //! Nothing here is kernel surface. A device protocol belongs to the device's
 //! driver and its clients; the kernel supplies the connection, the message and
@@ -37,9 +39,24 @@
 //! `BadOp` (a message of no bytes, an op byte that names no op, or a payload
 //! on an op that takes none), then `Unsupported` (an op this driver's device
 //! cannot do), then `Busy` (a `Read` the driver would hold, when it holds as
-//! many as it will). Every driver serves `Write`, `Sync` and `Mark`; a driver
-//! whose device has no input answers every `Read` and `Pending`
+//! many as it will). Every driver serves `Write`, `Sync`, `Mark` and `Stats`;
+//! a driver whose device has no input answers every `Read` and `Pending`
 //! `Unsupported`, at once.
+//!
+//! `Lost` and `Garbled` answer a `Read` only, and mark a place in the input.
+//! A driver that lost input bytes, because its buffer was full or its device
+//! overran, or that saw input damaged (a parity error, a frame error, a
+//! break), keeps one mark at the position of the first such event. The reader
+//! gets every byte before the mark, then one `Read` answered with the mark,
+//! then the bytes after it. The mark consumes no byte. `Lost` is the mark
+//! when any byte was lost; `Garbled` when none was and an error was seen,
+//! whose damaged byte is delivered, among those before the mark. Both carry
+//! the same counters: bytes lost ("at least"), frame errors, parity errors
+//! and breaks, each a little-endian `u32`, counted since the previous mark.
+//! While a mark is unreported the driver drops every byte that arrives and
+//! counts it into the mark, so every loss sits at the one position the mark
+//! names and the bytes after it arrived whole and contiguous. A driver whose
+//! device cannot lose or damage input never answers either.
 //!
 //! # The ops
 //!
@@ -50,14 +67,18 @@
 //!               of shipped parts. A read past the most it holds is answered
 //!               `Busy` at once, and the client may ask again.
 //!   - `Write` - a tell: post, drop the claim, never look back. The driver
-//!               writes the payload out, then answers `Ok`, which goes nowhere
-//!               for a claim that was dropped. A client that calls instead
-//!               learns that its bytes are out. Every payload length, none
+//!               answers `Ok` once the payload is queued, which goes nowhere
+//!               for a claim that was dropped. Queued is not sent: a driver
+//!               with a transmit buffer answers before the bytes reach the
+//!               device, and one without answers after. A client that calls
+//!               instead learns that its bytes are accepted, and `Sync` is
+//!               how it learns they are out. Every payload length, none
 //!               included, is a write, so a `Write` is never refused.
-//!   - `Sync`  - a call answered `Ok`. A connection's ring is FIFO, so an
-//!               answered `Sync` proves every message posted before it has
-//!               been served; that is how a client that only tells learns when
-//!               its writes reached the device.
+//!   - `Sync`  - a call answered `Ok` once every byte written before it has
+//!               left the device. A connection's ring is FIFO, so the answer
+//!               also proves every message posted before it has been served;
+//!               that is how a client that only tells learns when its writes
+//!               reached the device.
 //!   - `Mark`  - a call answered `Ok`, and pure instrumentation: it tells the
 //!               driver to take a trap reading, so the serve loop's cost can be
 //!               measured over a window the case controls. It carries no
@@ -69,7 +90,13 @@
 //!               takes nothing. A client that reads alone waits on it for a
 //!               byte to be buffered before it asks for one, instead of on a
 //!               clock; each call is one round trip, answered at once.
-
+//!   - `Stats` - a call answered `Ok` and the counters of `UartStats`, each a
+//!               little-endian `u32` that holds at its top: bytes received,
+//!               bytes lost, frame errors, parity errors, breaks, bytes
+//!               queued for transmit, bytes sent, writes held. A driver
+//!               counts what its device does and answers zero for what its
+//!               device cannot do. It reads no device and takes nothing.
+//!
 //! A refusal is a reply, so a malformed request that was posted and its claim
 //! dropped is refused to nobody: the client that wants to know calls.
 //!
@@ -92,6 +119,7 @@ public enum UartOp: UInt8 {
     case Sync = 3,
     case Mark = 4,
     case Pending = 5,
+    case Stats = 6,
 }
 
 extension UartOp {
@@ -103,6 +131,7 @@ extension UartOp {
             case Sync -> "sync",
             case Mark -> "mark",
             case Pending -> "pending",
+            case Stats -> "stats",
         }
     }
 
@@ -121,6 +150,10 @@ public enum UartStatus: UInt8 {
     case BadOp = 1,
     case Unsupported = 2,
     case Busy = 3,
+    /// A `Read`'s mark: input bytes were lost at this position.
+    case Lost = 4,
+    /// A `Read`'s mark: none were lost, and input was damaged.
+    case Garbled = 5,
 }
 
 extension UartStatus {
@@ -131,9 +164,52 @@ extension UartStatus {
             case BadOp -> "BadOp",
             case Unsupported -> "Unsupported",
             case Busy -> "Busy",
+            case Lost -> "Lost",
+            case Garbled -> "Garbled",
         }
     }
 }
+
+/// The counters a `Lost` or `Garbled` mark carries.
+public struct UartCounts {
+    /// Bytes lost, at least: a device overrun is counted as one.
+    public lost: UInt32,
+    public frame: UInt32,
+    public parity: UInt32,
+    public breaks: UInt32,
+}
+
+@synthesize
+extension UartCounts: Equatable {}
+
+/// The bytes of a mark's counters.
+public static COUNTS_BYTES: Int = 16
+
+/// What a `Stats` answers.
+public struct UartStats {
+    public received: UInt32,
+    public lost: UInt32,
+    public frame_errors: UInt32,
+    public parity_errors: UInt32,
+    public breaks: UInt32,
+    public queued: UInt32,
+    public sent: UInt32,
+    public writes_held: UInt32,
+}
+
+@synthesize
+extension UartStats: Equatable {}
+
+extension UartStats {
+    /// Every counter zero.
+    public static func zero() -> UartStats {
+        UartStats(received: 0, lost: 0, frame_errors: 0, parity_errors: 0,
+                  breaks: 0, queued: 0, sent: 0, writes_held: 0)
+    }
+}
+
+/// The bytes of a `Stats` answer's counters.
+public static STATS_BYTES: Int = 32
 
 /// Where the op byte sits, and where the payload starts.
 public static OP_BYTE: Int = 0
@@ -221,6 +297,44 @@ extension UartBody {
         self.bytes[1] = b
         2
     }
+
+    /// An `Ok` and a `Stats`' counters.
+    public func ok_stats(&var self, s: &UartStats) -> UInt {
+        self.bytes[0] = UartStatus.Ok as UInt8
+        self.put_word(1, s.received)
+        self.put_word(5, s.lost)
+        self.put_word(9, s.frame_errors)
+        self.put_word(13, s.parity_errors)
+        self.put_word(17, s.breaks)
+        self.put_word(21, s.queued)
+        self.put_word(25, s.sent)
+        self.put_word(29, s.writes_held)
+        (1 + STATS_BYTES) as UInt
+    }
+
+    /// A mark: `status`, which is `Lost` or `Garbled`, and its counters.
+    public func mark(&var self, status: UartStatus, c: &UartCounts) -> UInt {
+        self.bytes[0] = status as UInt8
+        self.put_word(1, c.lost)
+        self.put_word(5, c.frame)
+        self.put_word(9, c.parity)
+        self.put_word(13, c.breaks)
+        (1 + COUNTS_BYTES) as UInt
+    }
+
+    /// `v` little-endian at `at`.
+    func put_word(&var self, at: Int, v: UInt32) {
+        self.bytes[at] = (v & 0xFF) as UInt8
+        self.bytes[at + 1] = ((v >> 8) & 0xFF) as UInt8
+        self.bytes[at + 2] = ((v >> 16) & 0xFF) as UInt8
+        self.bytes[at + 3] = ((v >> 24) & 0xFF) as UInt8
+    }
+}
+
+/// `count + by`, held at the type's top rather than wrapping or trapping: a
+/// count a client can drive must not be able to end the driver.
+public func count_up(count: UInt32, by: UInt32) -> UInt32 {
+    if count > 0xFFFF_FFFF - by { 0xFFFF_FFFF } else { count + by }
 }
 
 /// How many input bytes a driver buffers.
@@ -359,6 +473,16 @@ extension Frame {
         if at < 0 || (at as UInt) >= self.len { return 0 }
         self.bytes[at]
     }
+
+    /// The little-endian `u32` at byte `at` of a received reply; the bytes
+    /// past its end read zero.
+    public func word(&self, at: Int) -> UInt32 {
+        let b0 = self.byte(at) as UInt32
+        let b1 = self.byte(at + 1) as UInt32
+        let b2 = self.byte(at + 2) as UInt32
+        let b3 = self.byte(at + 3) as UInt32
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
 }
 
 // =============================================================================
@@ -374,6 +498,10 @@ public enum UartError {
     /// The driver holds as many reads as it will: the protocol's `Busy`. The
     /// read may be asked again.
     case Busy,
+    /// A `Read`'s mark: input bytes were lost at this position.
+    case Lost(counts: UartCounts),
+    /// A `Read`'s mark: input was damaged at this position, and none lost.
+    case Garbled(counts: UartCounts),
     /// A reply no request of this op can produce: a status byte that is none,
     /// or a length the status does not have.
     case Malformed,
@@ -395,6 +523,8 @@ extension UartError {
             case BadOp -> "BadOp",
             case Unsupported -> "Unsupported",
             case Busy -> "Busy",
+            case Lost(_) -> "input lost",
+            case Garbled(_) -> "input garbled",
             case Malformed -> "a malformed reply",
             case Gone -> "the driver is gone",
             case Transport(_) -> "the transport failed",
@@ -427,12 +557,29 @@ func refusal(status: UartStatus) -> UartError? {
         case BadOp -> UartError.BadOp,
         case Unsupported -> UartError.Unsupported,
         case Busy -> UartError.Busy,
+        // Only a `Read` can be marked, and its decoder looks before it asks.
+        case Lost -> UartError.Malformed,
+        case Garbled -> UartError.Malformed,
     }
 }
 
-/// A `Read`'s reply: `Ok` and one byte, or a refusal alone.
+/// The counters a mark's reply carries.
+func counts_of(reply: &Frame) -> UartCounts {
+    UartCounts(lost: reply.word(1), frame: reply.word(5),
+               parity: reply.word(9), breaks: reply.word(13))
+}
+
+/// A `Read`'s reply: `Ok` and one byte, a mark and its counters, or a
+/// refusal alone.
 public func read_reply(reply: &Frame) -> Result<UInt8, UartError> {
     guard let status = reply.status() else { return UartError.Malformed }
+    if status == UartStatus.Lost || status == UartStatus.Garbled {
+        if reply.len != (1 + COUNTS_BYTES) as UInt { return UartError.Malformed }
+        if status == UartStatus.Lost {
+            return UartError.Lost(counts_of(&reply))
+        }
+        return UartError.Garbled(counts_of(&reply))
+    }
     if let refused = refusal(status) {
         if reply.len != 1 { return UartError.Malformed }
         return refused
@@ -444,6 +591,11 @@ public func read_reply(reply: &Frame) -> Result<UInt8, UartError> {
 /// A `Pending`'s reply: `Ok` and the count as one byte, or a refusal alone.
 /// A driver buffers at most `INPUT_BYTES`, which one byte holds.
 public func pending_reply(reply: &Frame) -> Result<Int, UartError> {
+    if let status = reply.status() {
+        if status == UartStatus.Lost || status == UartStatus.Garbled {
+            return UartError.Malformed
+        }
+    }
     let count = try read_reply(&reply)
     count as Int
 }
@@ -455,6 +607,20 @@ public func empty_reply(reply: &Frame) -> Result<Void, UartError> {
     if reply.len != 1 { return UartError.Malformed }
     if let refused = refusal(status) { return refused }
     return
+}
+
+/// A `Stats`' reply: `Ok` and the counters, or a refusal alone.
+public func stats_reply(reply: &Frame) -> Result<UartStats, UartError> {
+    guard let status = reply.status() else { return UartError.Malformed }
+    if let refused = refusal(status) {
+        if reply.len != 1 { return UartError.Malformed }
+        return refused
+    }
+    if reply.len != (1 + STATS_BYTES) as UInt { return UartError.Malformed }
+    return UartStats(received: reply.word(1), lost: reply.word(5),
+                     frame_errors: reply.word(9), parity_errors: reply.word(13),
+                     breaks: reply.word(17), queued: reply.word(21),
+                     sent: reply.word(25), writes_held: reply.word(29))
 }
 
 // =============================================================================
@@ -535,6 +701,13 @@ extension Uart<T: UartTransport> {
         let n = self.body.bare(UartOp.Pending)
         let reply = try self.transport.call(&self.body.bytes, n)
         pending_reply(&reply)
+    }
+
+    /// The driver's counters.
+    public func stats(&var self) -> Result<UartStats, UartError> {
+        let n = self.body.bare(UartOp.Stats)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        stats_reply(&reply)
     }
 
     /// Asks the driver to take its trap reading.

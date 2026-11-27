@@ -2261,11 +2261,13 @@ _UART_CLIENT_LINES = [
     "SOS uartclient: one line in two writes",
     "SOS uartclient: a write sent as a call",
     "SOS uartclient: sync answered Ok",
+    "SOS uartclient: stats: every byte queued and sent, none lost",
 ]
 _UART_CLIENT_AFTER_READ = [
     "SOS uartclient: a request of no bytes: BadOp",
     "SOS uartclient: op 0: BadOp",
-    "SOS uartclient: op 6: BadOp",
+    "SOS uartclient: op 7: BadOp",
+    "SOS uartclient: a stats carrying a byte: BadOp",
     "SOS uartclient: op 255: BadOp",
     "SOS uartclient: a read carrying a byte: BadOp",
     "SOS uartclient: a sync carrying a byte: BadOp",
@@ -12102,18 +12104,18 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        *_UART_CLIENT_CONSOLE,
                        "root: client ended status=65536",
-                       # Every request; the seven `BadOp`s; the read; and
+                       # Every request; the eight `BadOp`s; the read; and
                        # the bytes of every `Write`. The traps run from the
                        # mark: one per byte printed, one per answer that
-                       # landed (seventeen: two of the burst's writes found
+                       # landed (nineteen: two of the burst's writes found
                        # the ring full and one write found no handle for its
                        # claim, and went as calls), two per tell whose `Ok`
-                       # did not (fifty-four), one per handle the carrying
+                       # did not (fifty-six), one per handle the carrying
                        # `Sync` brought, released, and the closing `stats()`
                        # read.
-                       "SOS console drv: served=71 refused=7 unsupported=1 "
-                       "printed=837",
-                       "SOS console drv: after the mark traps=967",
+                       "SOS console drv: served=75 refused=8 unsupported=1 "
+                       "printed=945",
+                       "SOS console drv: after the mark traps=1081",
                        "root: console ended status=65536"],
         "expect_clean_exit": True,
     },
@@ -12132,19 +12134,19 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        *_UART_CLIENT_UART,
                        "root: client ended status=65536",
-                       # The four reads it held, dropped. Seventeen calls
+                       # The four reads it held, dropped. Nineteen calls
                        # answered (the fifth read's `Busy`, the two writes of
                        # the burst that found the ring full and the write
                        # that found no handle for its claim among them) and
-                       # fifty-five tells whose `Ok` did not land; the
+                       # fifty-seven tells whose `Ok` did not land; the
                        # rest of the window's traps are each held read's
                        # attach, the wait after it, the wait after its
                        # abandonment and its release, the four handles the
                        # carrying `Sync` brought, released, and the closing
                        # `stats()` read.
-                       "SOS uartsvc drv: served=76 abandoned=4 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=17 "
-                       "discarded=55 traps=148",
+                       "SOS uartsvc drv: served=80 abandoned=4 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=19 "
+                       "discarded=57 traps=154",
                        "root: console ended status=65536"],
         "expect_clean_exit": True,
     },
@@ -24470,9 +24472,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_out": ["{banner}",
                            *_UART_CLIENT_CONSOLE,
                            "root: client ended status=65536",
-                           "SOS console drv: served=71 refused=7 "
-                           "unsupported=1 printed=837",
-                           "SOS console drv: after the mark traps=967",
+                           "SOS console drv: served=75 refused=8 "
+                           "unsupported=1 printed=945",
+                           "SOS console drv: after the mark traps=1081",
                            "root: console ended status=65536"],
             "expect_clean_exit": True,
         },

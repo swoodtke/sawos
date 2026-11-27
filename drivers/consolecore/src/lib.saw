@@ -3,10 +3,11 @@
 //!
 //! The kernel console has no input for a process, so every `Read` and
 //! `Pending` is answered `Unsupported` at once; a `Write`'s payload goes to
-//! the console and is answered `Ok`, as are `Sync` and `Mark`; anything the
-//! protocol refuses is answered `BadOp`.
+//! the console and is answered `Ok`, as are `Sync`, `Mark` and `Stats`;
+//! anything the protocol refuses is answered `BadOp`. `Stats` counts the
+//! printed bytes as queued and sent, and has nothing else to count.
 
-import uartproto.{Frame, UartOp, UartStatus}
+import uartproto.{Frame, UartOp, UartStats, UartStatus, count_up}
 
 /// The status the console driver answers `frame` with.
 public func console_status(frame: &Frame) -> UartStatus {
@@ -24,10 +25,9 @@ public func writes(frame: &Frame) -> Bool {
     if let op = frame.request() { op == UartOp.Write } else { false }
 }
 
-/// `count + by`, held at the type's top rather than wrapping or trapping: a
-/// count a client can drive must not be able to end the driver.
-public func count_up(count: UInt32, by: UInt32) -> UInt32 {
-    if count > 0xFFFF_FFFF - by { 0xFFFF_FFFF } else { count + by }
+/// Whether `frame` is a `Stats` the driver answers with its counters.
+public func asks_stats(frame: &Frame) -> Bool {
+    if let op = frame.request() { op == UartOp.Stats } else { false }
 }
 
 /// What the driver has served.
@@ -56,7 +56,20 @@ extension Tally {
             case Unsupported -> { self.unsupported = count_up(self.unsupported, 1) },
             case Ok -> {},
             case Busy -> {},
+            // The console has no input to lose or damage, and never answers
+            // either.
+            case Lost -> {},
+            case Garbled -> {},
         }
         self.printed = count_up(self.printed, bytes)
+    }
+
+    /// What a `Stats` answers: every printed byte is queued and sent at
+    /// once, and the console receives, loses and holds nothing.
+    public func stats(&self) -> UartStats {
+        var s = UartStats.zero()
+        s.queued = self.printed
+        s.sent = self.printed
+        s
     }
 }
