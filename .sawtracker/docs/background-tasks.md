@@ -1,562 +1,631 @@
 # SO-141 design: sosrt runs Saw's background tasks
 
-Claims are marked **[read F:L]** (read in the tree at that place), **[probed]**
-(a compile I ran; sources under
-`/private/tmp/claude-501/-Users-shawn-Projects-sawos/34c0d76b-723c-482d-939f-716d368f6e5c/scratchpad/so141/`)
-or **UNVERIFIED**. `ABI` is sawlang v0.24.5's `runtime/ABI.md` and `LS` its
-`LANGUAGE_SPEC.md`, both in `.toolchains/cb66b632…/`. No QEMU probe was run.
+Revision 2. This is a design only: no tracked file changed. Claims are marked
+three ways:
 
-## 0. What the probes settled first
+- **[read F:L]**: read in the tree at that file and those lines.
+- **[probed]**: a compile I ran. The sources are under
+  `/private/tmp/claude-501/-Users-shawn-Projects-sawos/34c0d76b-723c-482d-939f-716d368f6e5c/scratchpad/so141/`.
+- **UNVERIFIED**: neither.
 
-- With both entries declared, a sawos `main` program that calls `Task.spawn`
-  compiles against the real tree (`sosmain`, `sos`, `sosrt`, …, freestanding,
-  `--runtime`, riscv32). The only `__saw_rt_*` symbols left undefined are
-  the eight seams of the executor set: `thread_executor`,
-  `set_thread_executor`, `clock_monotonic_nanos`, `sleep_ns`, and
-  `reactor_create`, `_poll`, `_wake` and `_destroy` **[probed: b/main.saw]**.
-  So the issue's "fails at link" is exactly those eight.
-- Adding a channel adds `lock_acquire` and `_release` **[probed: a/chan2.saw]**.
-  A `Channel.receive` in thread context also reaches std's thread gate, the
-  eight `__saw_rt_pthread_*` seams **[probed: a/chan.saw]**. Those are not
-  in the set this unit builds (Q4).
-- Without the declarations, `Task.spawn` is refused with `spawn.freestanding`
-  **[probed: a/nodecl.saw]**.
-- One module may declare both entries while another declares only the drive,
-  and it compiles **[probed: c/]**.
-- A `sync` function may call `__saw_background_close` **[probed: a/probe.saw]**.
-  A `sync` body cannot join a task (`effect.sync`), but it may call a
-  `blocking` helper that does **[probed: a/syncspawn.saw]**. A
-  `thread_create(run:)` entry is `sync`
-  **[read kernel/sysapi/src/system.saw:920]**, so a thread that joins tasks
-  does it in a `blocking` helper.
+Abbreviations: `ABI` is sawlang v0.24.5's `runtime/ABI.md` and `LS` its
+`LANGUAGE_SPEC.md`, in `.toolchains/cb66b632…/`. Main pins v0.24.5. `SMP` is
+the tracker doc `SO:smp` r3. No QEMU probe was run: every item checked in this
+revision was settled by reading.
 
-Two of the issue's premises are stale:
+## Changes in revision 2
 
-- **arm64's `TPIDR_EL0` already travels with each thread.** No kernel change is
-  needed. Every switch saves it into the thread's FP area at
-  `THREAD_REGISTER_OFFSET` (536) and loads the incoming thread's, which is zero
-  for a new thread **[read hal/arm64/kernel/lib.saw:136-147, 738-743,
-  800-829]**. riscv32 and riscv32-flat save `tp` in the trap frame
-  **[read hal/riscv32-common/kernel/trap.S:67,128;
-  hal/riscv32-common/kernel/lib.saw:87]**. The S3 saves `THREADPTR` there
-  too **[read hal/xtensa-esp32s3/kernel/boot.S:620-621, 690-691]**.
-- **The thread register is already taken.** It holds the thread's lock-owner
-  identity: the address of its `ThreadBlock`, or an odd number. That word is
-  written once and must never change **[read kernel/sysapi/src/rt.saw:175-214]**.
-  So it cannot also be the executor word.
+- **Waits are bounded in the kernel, not the runtime (owner's ruling).**
+  - **Kernel deadlines and wakes.** Every park the kernel offers reads a
+    per-thread *wait word*: a monotonic deadline the thread writes into its
+    own memory, registered once. A new no-handle op, `THREAD_WAKE_OP(id)`,
+    ends a thread's wakeable park early, or latches if the thread is not
+    parked. Two new statuses report the outcomes: `TimedOut` and `Woken`.
+  - **A bare park.** A new no-handle op, `PARK_OP`, parks on nothing until
+    the deadline or a wake. `sleep_ns` and `reactor_poll` are now that op.
+  - **No kernel objects per thread.** The per-thread Waiter, Timer and Event
+    of r1 are gone, and so is the r1 bridge (a second Timer and Event, the
+    reserved top-bit keys and the cross-thread forwarding).
+  - **Questions and comments that dissolve.** Q2 (waits with no bound) and
+    Q3 (reserved keys) dissolve, and so does the reviewer's t1 (the reserved
+    key half in `Waiter.add`): no key is reserved anywhere.
+  - **New sections:** §2 (the kernel ops) and §3 (each park's deadline and
+    wake). The runtime sections that followed in r1 shrink and are renumbered
+    (§4–§8).
+- **Every runtime wrapper bounds its wait in one trap.** The trap is the wait
+  itself; writing the deadline is a memory store. That covers `Waiter.wait`,
+  `PipeInlet.send`, `PipeReply.resolve`, `PipeRequest.reply_wait` and
+  `Thread.join`. `reactor_wake` wakes each parked thread by its ID.
+- **Q1, quotas (lead's call: raise the defaults).** The premise is gone.
+  The executor now costs a child one Handle row per process (its Clock) and
+  nothing per thread. So **no default changes**: Handles stays 12 and the
+  rest as they are **[read kernel/core/limits.saw:506-544]**. This differs
+  from the call as written, which assumed per-thread objects.
+- **Q4 (lead's call), the thread gate, is a follow-up out of scope.** The
+  missing seams are named in §9.
+- **Q5 (lead's call), deadlock reports:** a process whose tasks all wait
+  forever parks, and the kernel's deadlock line is enough.
+- **Q6 (lead's call), threads with no block:** `set_thread_executor` on a
+  thread with no block panics with a sawos message naming
+  `enter_thread_block` (§4).
+- **The reviewer's t2** is a case that pins `sleep_ns` directly (§8, R-7).
+  ABI says nothing cuts `sleep_ns` short **[read ABI:249-253]**. So the
+  mid-sleep wake ends the kernel park, but the sleep absorbs it and keeps it
+  for the next poll; the sleep still lasts its whole delay. The case pins all
+  three (Q3 below confirms the reading).
+- **The units are reordered:** spec first, then the kernel's two units, then
+  the runtime's three, which shrink (§9).
+- **r1's UNVERIFIED items:**
+  - **The runner routes a kernel compile's refusal to its case:** now read
+    **[read tools/sos_runner.py:17364-17371, 18311-18331]**.
+  - **Turn order in a sweep:** live slots are walked in ascending slot order
+    **[read std/taskgroup.saw:438-443]**. That slots are handed out in spawn
+    order on a fresh group stays UNVERIFIED, and the channel case asserts its
+    order so a miss fails loudly.
+  - **No longer apply:** `Waiter.add` without `Attach`, a Timer arm near
+    `u64::MAX`, and which parked thread a Waiter delivery reaches. All three
+    went with the bridge.
 
-## 1. The executor word
+## 0. What the probes settled (unchanged from r1)
 
-**Where it lives: a new field of `ThreadBlock`.** The thread register names
-the block, and `thread_executor` is one register read and one load. It is the
-hottest seam (std reads it on nearly every task operation
-**[read std/taskgroup.saw:1309, 2026, 4362 and others]**), so it has to be
-cheap and must not trap or take a lock.
+- **Exactly eight seams are missing.** With both background entries
+  declared, a sawos `main` program that calls `Task.spawn` compiles against
+  the tree, and only the eight executor seams stay undefined
+  **[probed: b/main.saw]**.
+- **A channel adds two more:** `lock_acquire` and `_release`
+  **[probed: a/chan2.saw]**.
+- **A thread-context `Channel.receive` adds the eight `__saw_rt_pthread_*`
+  gate seams** **[probed: a/chan.saw]**.
+- **Without the declarations, a spawn is refused** with
+  `spawn.freestanding` **[probed: a/nodecl.saw]**.
+- **Several modules may declare the drive**, as long as one declares both
+  entries **[probed: c/]**.
+- **A `sync` body cannot join a task, but it may call a `blocking` helper
+  that does** **[probed: a/syncspawn.saw]**.
+- **The executor word needs no HAL change.** arm64's `TPIDR_EL0` already
+  travels with each thread **[read hal/arm64/kernel/lib.saw:136-147,
+  800-829]**. riscv32's `tp` **[read hal/riscv32-common/kernel/trap.S:67,128]**
+  and the S3's `THREADPTR` **[read hal/xtensa-esp32s3/kernel/boot.S:620-621,
+  690-691]** are in the trap frame.
+- **The thread register is taken** by the lock-owner identity
+  **[read kernel/sysapi/src/rt.saw:175-214]**.
 
-The alternatives:
+## 1. The executor word (unchanged from r1)
 
-- The thread register itself is taken (above).
-- A table keyed by thread ID needs a lock or a hash on every read, and a bound.
+The executor word is a field of `ThreadBlock`, which the thread register
+names: one register read and one load **[read rt.saw:282-285]**.
 
-ABI asks only that the word be per thread and never freed by the runtime
-**[read ABI:951-973]**. std's record outlives the thread in std's registry,
-and the block lives as long as its thread.
+- **Who has a block:** the main thread of every `main` program, root's
+  included, and every `thread_create(run:)` thread. Their blocks are in
+  `sosmain._start`'s frame and in the start record
+  **[read rt/main/src/lib.saw:131-132; rt.saw:407-408]**.
+- **Who has none:** a raw `thread_create(entry:)` thread, and an
+  `@export _start` program's main thread, unless it calls
+  `enter_thread_block`.
 
-`ThreadBlock` grows from `{thread, id}` to `{thread, id, executor, record}`.
-`record` points at the thread's runtime record (§2). `StartRecord`, which
-starts with the block, grows by two words, so the "four words" in
-`thread_create(run:)`'s documentation becomes six
-**[read rt.saw:282-285, 333-343; system.saw:905]**.
+`ThreadBlock` becomes `{thread, id, executor, record, wait}`. `wait` is the
+thread's wait word (§2), one doubleword, eight-aligned. `StartRecord` grows to
+match, so the "four words" in `thread_create(run:)`'s documentation changes
+**[read system.saw:905]**. `enter_thread_block` registers the wait word with
+`WAIT_WORD_OP`, which is one trap at each thread's start.
 
-**The kernel change per HAL:** none (§0).
+## 2. The kernel: deadlines and the wake
 
-**Which threads have a word:**
+### The shape: a registered wait word, not a deadline argument per op
 
-| thread | block | executor word |
+A thread registers one doubleword in its own memory with
+`WAIT_WORD_OP(addr)`. The kernel reads it, through the copy-in door, at every
+park the thread makes.
+
+Why the word and not an argument on each op:
+
+- **No op changes shape.** The ops are fixed arity
+  **[read kernel/sysapi/src/floor.saw:28-35]**. An absolute 64-bit deadline
+  is two registers on riscv32 and the S3, and `PipeInletOp.Call` already
+  fills all three of its arguments (args, length, reply buffer)
+  **[read floor.saw:1202-1215]**. A deadline argument would mean new wide
+  forms of `Waiter.Wait`, `Call`, `Resolve`, `ReplyWait`, `Join` and
+  `LOCK_WAIT`.
+- **One trap per bounded wait.** The deadline is a store to the thread's own
+  memory, and the op is the only trap. A "set the deadline" op would make two.
+- **Every existing park is unchanged.** A word of 0 is today's park, bit for
+  bit, so no existing caller, the C floor's included, sees a new status
+  unless it wrote one.
+
+### The word's values
+
+The word holds a deadline on the Monotonic clock, in nanoseconds: the
+machine counter `hal.timer_now_ns()`, the reading `ClockOp.Now` answers and
+the time every Timer is armed in **[read kernel/core/time.saw:15-18, 425-430;
+kernel/sysapi/src/clock.saw:52-60]**.
+
+| word | the park is |
+|---|---|
+| `0` | **plain**: today's park. No deadline, and a wake does not end it; a wake latches for later |
+| `UInt64.max` (`NEVER_NS`) | **wakeable**, with no deadline |
+| any other | **wakeable**, with that deadline |
+
+### The order at an op that would park
+
+1. An op that can answer now answers as today. Readiness wins over every
+   deadline: a ready attachment, an exited thread, a settled reply.
+2. Otherwise, on a wakeable word:
+   - a latched wake clears the latch and answers `Woken`, without parking;
+   - otherwise, a deadline at or before now answers `TimedOut`, without
+     parking;
+   - otherwise the thread parks with the deadline recorded.
+3. A plain word parks as today.
+
+Neither at-once answer is a park, so it does not meet the section rule. A
+park inside a held section still faults as today
+**[read kernel/core/dispatch.saw:5874; spec.md:4185-4192]**.
+
+### The statuses
+
+There are two new `SosStatus` values. Neither is a fault, because the caller
+could not have known: the clock or another thread decided.
+
+- **`TimedOut = 12`**: "the wait's deadline came first". The park ended at
+  its deadline, or the deadline had passed at the op. Nothing the op waits
+  for was consumed; §3 gives what each op leaves.
+- **`Woken = 13`**: "another thread woke this wait". The park was ended by
+  `THREAD_WAKE_OP`, or a latched wake was waiting at the op. Nothing was
+  consumed either.
+
+Both are distinct from every existing status **[read
+kernel/abi/src/status.saw:154-163]**:
+
+- `WouldBlock` is a poll op's "not now", with no park.
+- `Revoked` is "the thing waited on is gone".
+- `PeerClosed` is the far end gone.
+
+Numbers 12 and 13 are the next free ones.
+
+### The three ops
+
+All three are made with `NO_HANDLE` and continue the band below
+`LOCK_WAKE_OP` **[read kernel/abi/src/ops.saw:168-195]**: `WAIT_WORD_OP`
+`0xFFF8`, `THREAD_WAKE_OP` `0xFFF7` and `PARK_OP` `0xFFF6`. `OP_BAND_FLOOR`
+moves to `PARK_OP` **[read ops.saw:1222]**. Op numbers are not ABI.
+
+- **`WAIT_WORD_OP(addr)`** registers the calling thread's wait word, and 0
+  unregisters it. A later registration replaces the earlier one.
+  - An address that is not eight-aligned is the `BadAlign` fault.
+  - A doubleword the copy-in door refuses now is that door's fault.
+  - The kernel keeps only the address, and reads it again at each park. A
+    word unmapped later is the door's fault at that park, as for any buffer
+    **[read spec.md, §2.2 "Copy-out is checked"]**.
+  - A thread with no word registered parks plain.
+- **`THREAD_WAKE_OP(id)`** wakes the thread `id` names (spec §7's ID):
+  - parked in a **wakeable** park: the park ends with `Woken`, and the
+    thread is readied;
+  - in a **plain** park, or not parked: the thread's latch is set, and its
+    next wakeable park answers `Woken` at once.
+
+  It answers `Ok`. The IDs it accepts are decoded as `LOCK_WAIT_OP` decodes
+  an owner **[read spec.md:4269-4302]**:
+  - a thread of the caller's own process that has run and not exited: woken;
+  - one that has exited, or whose slot was freed: `Revoked`;
+  - a thread of another live process, or any ID naming no thread there ever
+    was: the `BadArg` fault.
+
+  A thread may wake itself, which sets its own latch.
+
+  **Who may wake whom:** a thread of the same process, by ID, with no handle
+  and no right. This is `LOCK_WAKE_OP`'s precedent: it acts only inside the
+  caller's process, whose threads already share every byte, and a thread with
+  no Thread handle of its own (one with no block) must still be able to wake
+  and be woken. The runtime's records keep each thread's ID (§5).
+- **`PARK_OP`** parks the caller on nothing. It is always wakeable: a park on
+  nothing that a wake could not end would end only at its deadline, or
+  never. It takes the deadline from the wait word, where 0 or `NEVER_NS`
+  means none. It answers `TimedOut` or `Woken`, never `Ok`.
+
+### The latch
+
+The latch is one flag per thread, in the kernel. It is cleared only when it
+ends a wakeable park: at the op, which answers `Woken` without parking. A
+wake that finds the thread parked wakeable ends that park directly and
+leaves no latch. Plain parks neither read nor clear it, so the kernel's own
+waits are never cut short:
+
+- the runtime's lock waits and the output lock's wait are made with the
+  word at 0 (§6);
+- so is every park by code that never writes a word.
+
+A slot's latch starts clear and is reset when the slot is reused.
+
+### The kernel side
+
+- **Four new `ThreadSlot` fields** **[read kernel/core/threads.saw:161-268]**:
+  - `wait_word`: the registered address, or 0;
+  - `wait_deadline`: the deadline while parked, or `NEVER_NS`;
+  - `wakeable`;
+  - `wake_latched`.
+- **The schedule.** `reprogram_timer` takes the earliest parked deadline
+  beside the tick and the Timers **[read time.saw:455-480, 327-339]**.
+  `on_timer_interrupt` expires every parked thread whose deadline is at or
+  before now, beside `expire_timers` **[read kernel/core/irq.saw:193-209]**.
+  A scan of the thread slab costs what `earliest_timer_deadline`'s scan of
+  the Timers costs.
+- **The deadlock test.** `has_external_wake_source` also answers yes for a
+  parked thread with a finite deadline **[read irq.saw:402-424]**. That
+  thread will be readied by the clock, as an armed Timer's waiter is.
+
+## 3. Each park's deadline and wake
+
+On `TimedOut` and `Woken` the kernel takes the thread off whatever it is
+parked on, as the op's own wake would, and answers the status.
+
+| op | park **[read]** | what an early end leaves |
 |---|---|---|
-| root's first thread, and any `main` program's main thread | in `sosmain._start`'s frame **[read rt/main/src/lib.saw:131-132]** (root uses `sosmain` **[read root/src/main.saw:71]**) | yes |
-| a `thread_create(run:)` thread | head of its start record **[read rt.saw:407-408]** | yes |
-| a `thread_create(entry:)` / `(stack_top:arg:)` thread, an `@export _start` program's main thread | none, unless its code calls the public `sos.rt.enter_thread_block` with a block it keeps for the thread's life | no |
+| `Waiter.Wait` | the Waiter's blocked list (`block_on_wait`, waitables.saw:821) | the thread is unlinked from the list; no record is written and nothing is consumed |
+| `ThreadOp.Join` | the target's joiner list (`block_on_join`, threads.saw:785; dispatch.saw:2150-2172) | the thread is unlinked; the target is untouched, and a later join reads its code |
+| `LOCK_WAIT_OP` | `lock_at`/`lock_holder` (dispatch.saw:2265-2291) | `lock_unpark` with the status, then `lock_recompute(holder)`, so the raise this waiter made is undone (sched.saw:585-612). The waiters flag stays set, and the holder's give traps once for nobody, which is harmless |
+| `PARK_OP` | nothing | nothing |
+| `PipeInletOp.Call`, room park | `call_pipe` (waitables.saw:853) | nothing was staged; the call fields are cleared, and the value register is `NO_HANDLE` |
+| `PipeInletOp.Call`, reply park | the exchange's `caller` tie (waitables.saw:885) | below |
+| `PipeReplyOp.Resolve` | the same tie (`park_resolve`, dispatch.saw:5160-5167) | below |
+| `PipeRequestOp.ReplyWait` | its reply leg never parks, and its wait leg is a `Waiter.Wait` park (dispatch.saw:5439-5503) | as `Waiter.Wait`; the reply was delivered, and the value register reads `ReplyWaitLeg.Wait` |
 
-The bodies:
+**The fused Call's reply park, when the word is wakeable.** A plain `Call`
+mints no claim handle: the parked thread is the claim **[read
+threads.saw:205-225]**. A park that can end early has to give the claim back,
+so a wakeable `Call` is a `Post` and a wakeable `Resolve` made in one trap:
 
-- `thread_executor`: reads the register. A zero or odd word answers 0.
-  Otherwise it answers `block.executor`.
-- `set_thread_executor`: stores into the block and answers 0. With no block
-  it answers `-1`.
+- At the stage it mints the claim into the caller's table as a `PipeReply`
+  handle, as `Post` does. A table with no room is refused as `Post` refuses
+  it (`QuotaExceeded` or `NoResource`), with nothing staged.
+- It then parks on that claim as a wakeable `Resolve` does.
+- On `TimedOut` or `Woken` the value register carries the claim's handle
+  word. The caller holds the claim, and resolves it later.
+- On a delivered reply the claim handle is spent, and nothing in the
+  answer differs from a plain `Call`.
 
-On `-1`, std panics with "executor: the runtime cannot keep this thread's
-executor record (no thread-specific word)" **[read std/taskgroup.saw:1314-1316]**.
-So a spawn on a thread without a block is a clean panic, never a record shared
-with another thread, which ABI forbids **[read ABI:970-973]** (Q6).
+So a bounded `send` never loses a reply to a timeout. Its cost is the handle
+row a `Post` costs, which is why a plain `Call` keeps no claim.
 
-## 2. The seams
+**A wakeable `Resolve` borrows its claim and spends it only at delivery.**
+A plain `Resolve` unbinds the claim's handle at the park and hands its
+reference to the thread **[read dispatch.saw:5160-5167]**. A wakeable one
+instead takes a reference of its own for the tie and keeps the handle bound,
+recording its index in the slot. The handle is the claim, so on `TimedOut`
+or `Woken` the claim is still there under the same word.
 
-### The thread's runtime record
+- **Delivery** unbinds the handle if it still names the exchange (an index
+  and generation check).
+- **Another thread's `Resolve` on that handle while it is parked** is the
+  `BadState` fault: a claim has one resolver.
+- **Another thread's release** drops only the handle's reference. The parked
+  thread's tie keeps the exchange alive, and delivery finds the handle gone
+  and simply delivers.
 
-The record is per thread and runtime-owned. It holds:
+**SMP** (the owner's rule: nothing assumes one core). Under SMP's first
+stage, every kernel entry holds the one big lock **[read SMP:56-70]**.
 
-- `next`, the registry link;
-- `claimed`;
-- the poll set: a Waiter `W`, a Timer `T` and an Event `E`, with `T` and `E`
-  attached to `W` persistently under the record's two keys;
-- the bridge set: a Timer `Tb` and an Event `Eb` (§3);
-- `parked`, the handle of the Event the thread is parked with right now, or 0;
-- `seen`, the last wake generation this thread acted on;
-- the lock pair (§2, the lock seams) and its depth.
+- **The latch.** A wake's "set the latch, or end the park" and a park's
+  "check the latch, then park" are two kernel sections under that lock, so
+  they cannot interleave, on one core or two.
+- **A cross-core wake.** A wake that readies a thread on the other core
+  raises that core's `NEED_RESCHED` and sends its reschedule IPI, as every
+  cross-core wake does **[read SMP:306-320]**.
+- **Deadlines.** Expiry rides core 0's comparator with every Timer
+  **[read SMP:336-345]**, so a core-1 thread's expiry is a cross-core wake
+  and an IPI. When per-core Timers land (SMP §11), thread deadlines move with
+  them.
+- **The wait word** is read only by the owning thread's trap, on whichever
+  core it runs.
+- **Nothing more** of this design depends on there being one core.
 
-**Where records live.** Records are allocated through the runtime's own
-allocator (`rt_alloc`, called as a function) and pushed with a compare-and-swap
-onto a process-wide list that only ever grows. Like std's own records, they are
-never freed **[read std/taskgroup.saw:1323-1330]**. So a stale pointer from
-another thread always lands in a valid record.
+## 4. The seams (the runtime, revised)
 
-**How a thread gets one.** The thread claims a record at its first blocking
-poll, sleep, bridged wait or lock acquire: it compare-and-swaps `claimed` on a
-free record, or makes a new one, and keeps the record's address in
-`block.record`. The kernel objects are made lazily: the poll set at the first
-blocking poll or sleep, the bridge set at the first bridged wait.
+The bodies live in `sos.exec`, placed between `waiter` and `pipe` in the
+facade's order **[read kernel/sysapi/src/lib.saw:77-109]**, and are written
+over raw floor ops.
 
-**When it is released.** A record goes back to the free list at the thread's
-close (§4). Its kernel objects stay with it for the next thread. If the thread
-ended holding a runtime lock (lock depth above 0), the record is never
-released.
+**The process-wide state:**
 
-**Its quota:**
+- one Monotonic Clock handle, got with `ClockGet` on the first clock read
+  and published by compare-and-swap; it is the only quota the executor costs
+  (Q1, above);
+- `REACTOR`, a static wake generation.
 
-- The poll set costs 1 Waiter, 1 Event, 1 Timer and 3 Handle rows.
-- The bridge set costs 1 Event, 1 Timer and 2 Handle rows more.
-- Per process, two handles are minted once and kept: a Process sibling
-  (`SystemOp.ProcessSelf` on the parked System handle, `SYSTEM_HANDLE`
-  **[read floor.saw:1585]**) to create Waiters and Events, and a Monotonic
-  Clock (`SystemOp.ClockGet`). Each is published by compare-and-swap, and a
-  thread that loses the race releases its spare.
-- Root's rows are unlimited **[read spec.md:2055]**. A child's defaults are
-  Waiters 2, Events 4, Timers 4 and Handles 12
-  **[read kernel/core/limits.saw:506-544]**, so two task-running threads use
-  both default Waiters (Q1).
+**The per-thread record:** each thread has one, never freed. It holds its
+`id`, `parked`, `seen`, the lock pair and the depth. It keeps no kernel
+object.
 
-**What it needs.** The rights it spends (`ProcessSelf`, `ClockGet`,
-`EventCreate`, `WaiterCreate`, and `Read`, `TimerCreate`, `Arm`, `Wait`,
-`Attach`, `Signal`) are read before they are spent, as `sosmain` does. A
-missing right, a quota refusal, or no System handle at all is a panic from the
-seam that names the missing piece. A panic is the runtime's own code, not the
-program's.
+**The bodies:**
 
-### The bodies
+- **`thread_executor` / `set_thread_executor`:** the block's field. On a
+  thread with no block, `set_thread_executor` panics with
+  `"sos: this thread has no block; a thread that runs tasks enters one with
+  sos.rt.enter_thread_block before it spawns"` (Q6). That is the runtime's
+  own panic, not program code. `thread_executor` answers 0 there.
+- **`clock_monotonic_nanos`:** `ClockOp.Now`, in nanoseconds, one trap
+  **[read clock.saw:103-110; floor.saw:815-827]**.
+- **`sleep_ns(ns)`:** zero returns at once.
+  1. Compute `D = now + ns`, saturating to `NEVER_NS`.
+  2. Set `parked = 1` and write `D` to the wait word.
+  3. `PARK_OP` until it answers `TimedOut`. A `Woken` answer is a reactor
+     wake: set `seen` to "none", so the next poll returns at once, and park
+     again with the same `D`. Nothing cuts the sleep short
+     **[read ABI:237-253]**.
+  4. Write 0 to the word and set `parked = 0`.
 
-Every op below is a raw floor op on handle words, as the growth hook is
-written **[read rt.saw:613-627]**. None calls a typed wrapper, because
-wrappers drive (§3).
-
-- **`thread_executor`, `set_thread_executor`:** §1. No trap.
-- **`clock_monotonic_nanos`:** `ClockOp.Now` on the process's Monotonic Clock
-  (`sos_clock_now`). It answers nanoseconds, a 64-bit copy-out record,
-  doubleword `CLOCK_NOW_TIME_SLOT` **[read clock.saw:52-60, 103-110;
-  floor.saw:815-827]**. That is one trap, plus `ClockGet` on the first call.
-  It is the kernel's own unit, so nothing is scaled.
-- **`sleep_ns(ns)`:**
-  - Zero returns at once.
-  - On a thread with a record, it arms `T` for `ns` and waits on `W` until a
-    record with `T`'s key arrives.
-  - An `E` record that arrives first is a reactor wake. The sleep does not end
-    on it, but sets `seen` to "none" so the next poll returns at once, and
-    waits again. The wake is not lost, and the sleep is not cut short
-    **[read ABI:237-253]**.
-  - A thread with no record makes a temporary Waiter and a Timer it gives to
-    the Waiter, waits, and releases the Waiter.
-  - Whether the kernel takes an `after_ns` near `u64::MAX` is
-    **UNVERIFIED**. If it refuses, the sleep is made in chunks.
-- **`reactor_create(r_out)`:** stores the address of one static `REACTOR`
-  (a wake generation, `Atomic<Int>`) and answers 0. It makes no kernel object.
-  Every thread's objects are its own.
-- **`reactor_destroy`:** nothing. The loser of std's publish race destroys
-  the same static it got **[read std/taskgroup.saw:3218-3236]**.
+  A thread with no block registers a word on its own stack for the sleep,
+  parks, and unregisters it, for three traps more. It has no other word, so
+  nothing is overwritten.
+- **`reactor_create`:** stores `&REACTOR`; it makes nothing.
+  **`reactor_destroy`:** nothing **[read std/taskgroup.saw:3218-3236]**.
 - **`reactor_poll(r, timeout_ms, count_out)`:**
-  1. `g = REACTOR.gen`. If `g != rec.seen`, set `seen = g`, store a count of
-     1 and answer 0. On a thread with no record, `seen` is taken as "none".
-  2. A `timeout_ms` of 0 stores a count of 0 and answers 0, with no trap. This
-     is the drive's per-turn poll **[read ABI:1491-1493]**.
-  3. Otherwise claim the record and its poll set. Arm `T` for
-     `timeout_ms × 10^6` ns when the timeout is positive. A negative timeout
-     leaves `T` disarmed.
-  4. Set `parked = E`, then read `gen` again. If it changed, set `parked = 0`,
-     store a count of 1 and answer 0.
-  5. Call `sos_waiter_wait(W)`, then set `parked = 0` and
-     `seen = REACTOR.gen`, and disarm `T`.
-  6. Store a count of 1 for an `E` record and 0 for a `T` record, and answer 0.
+  1. If `gen != seen`, set `seen = gen` and answer a count of 1.
+  2. A `timeout_ms` of 0 answers a count of 0, with no trap.
+  3. Otherwise set `parked = 1`, then read `gen` again; if it moved, take the
+     first step's answer.
+  4. Write the word: `now + timeout_ms × 10^6`, or `NEVER_NS` for a negative
+     timeout.
+  5. `PARK_OP`.
+  6. Write 0 to the word, set `parked = 0` and `seen = gen`.
+  7. Answer a count of 1 for `Woken` and 0 for `TimedOut`.
 
-  A failed wait (`Revoked`) is a broken instance, and the seam panics, naming
-  the status. A negative timeout with nothing that can ever wake parks for
-  good. When that leaves the whole machine with nothing runnable, the kernel's
-  deadlock line reports it **[read spec.md:4091-4111]**. ABI's
-  single-threaded panic does not apply, because another thread may wake the
-  poll (Q5).
-- **`reactor_wake(r)`:** `REACTOR.gen.fetch_add(1)`. Then, for every record
-  on the list whose `parked` is nonzero, `sos_event_signal(parked, 1)`.
-  - This is the broadcast ABI asks for **[read ABI:995-1004, 1086-1095]**.
-    Every parked poller and every bridged waiter returns.
-  - A thread that is not parked meets the new generation at its next poll, so
-    a wake with nothing parked is not lost.
-  - The waker needs no block and no record, so it can be any thread,
-    including one the executor knows nothing about.
-  - Signalling never parks and never fails for room
-    **[read event.saw:59-66]**.
-  - `parked` and `gen` are a Dekker pair, all sequentially consistent: the
-    poller stores `parked` and then reads `gen`, and the waker writes `gen` and
-    then reads `parked`. So at least one of them sees the other. An Event left
-    holding bits makes one later poll return early, which ABI allows.
-- **`lock_acquire(state)`, `lock_release(state)`:** one word, with zero meaning
-  free **[read ABI:1267-1288]**.
-  - **The word.** While the lock is held, the word holds the holder's record
-    address. On a thread with no block it holds the holder's odd identity
-    instead (`rt_lock_owner`).
-  - **Acquire.** Compare-and-swap the word from 0 to `me`. On success, bump
-    `rec.depth`. When depth goes from 0 to 1, take the record's own
-    inheritance pair with the thread's ID. Nobody else ever takes that pair,
-    so this never waits.
-  - **Contention.** On failure, read the holder `h`:
-    - An even `h` is a record: `LOCK_WAIT_OP` on `h`'s pair. The kernel
-      raises the holder to the waiter's level and answers once the holder has
-      given back every runtime lock it holds. Then the waiter swaps again.
-    - An odd `h` is a holder with no block: yield and swap again.
-  - **Release.** Compare-and-swap the word from `me` to 0 and drop the depth.
-    At zero, give the pair back (`LOCK_WAKE_OP` if its waiters flag is set).
-  - **Why a pair in the record.**
-    - Inheritance comes from spec §7's own lock, so a waiter above a preempted
-      holder parks instead of spinning on it **[read spec.md:4237-4302]**.
-    - A stale `h` is always valid memory, because records are never freed.
-    - The `Mutex` user's window may park (a print), which a section-guarded
-      spin would turn into a `SectionHeld` fault **[read spec.md:4185-4192]**.
-  - **Reuse.** A reused record hands a waiter the wrong thread's progress to
-    wait for. That is spurious but it ends, and the waiter swaps again.
-  - **The hazards, stated, not fixed:**
-    - A holder with no block is spun on, like the arena when no section word
-      is registered **[read rt/common/src/lib.saw:380-384]**.
-    - A holder that exits holding a lock leaves it held for good. `Revoked`
-      from the wait panics, naming the lock, as the output lock's wait does.
-- **The no-program-code rule** **[read ABI:93-102]**. Every body above makes
-  floor ops (the `sos_syscall*` C stubs), atomics and `rt_alloc`, and nothing
-  else. None calls a typed wrapper, a drive or a callback. `rt_alloc` takes
-  only `SpinLock`s, never this seam, so `lock_acquire` cannot recurse.
+  It makes two traps (the clock read and the park), and none for a zero
+  timeout.
+- **`reactor_wake(r)`:** `gen.fetch_add(1)`, then `THREAD_WAKE_OP(rec.id)`
+  for every record whose `parked` is set. `Revoked` is ignored: that thread
+  is gone. The trap is the thread-wake op, one per parked thread, made from
+  any thread.
+  - **The Dekker pair.** `parked` and `gen` pair up, sequentially
+    consistent, as in r1. A thread that is not parked sees `gen` at its next
+    poll.
+  - **The latch.** A wake that races a thread's return from its park lands
+    in the latch, so that thread's next wakeable park returns early, which
+    ABI allows **[read ABI:1086-1095]**.
+- **`lock_acquire` / `lock_release`:** unchanged from r1 (§6).
+- **The no-program-code rule:** every body makes floor ops, atomics and
+  `rt_alloc`, and nothing else **[read ABI:93-102]**.
 
-**The kernel image keeps none of this** (§6). The bodies live in a new `sos`
-module, `sos.exec`, not in `sosrt`.
+## 5. The drive (revised)
 
-## 3. The drive
+`sos.floor` declares both background entries and wraps them as
+`background_drive()` and `background_close()`.
 
-**The entries live in `sos.floor`.** It declares both entries in one
-`extern "C"` block, beside the syscall externs, and wraps them as
-`public(package) background_drive()` and `background_close()`. The floor is
-compiled into every process. The claim is then the program's, decided at the
-link **[read ABI:1456-1466]**, and every wrapper reaches the drive without an
-import cycle. Only `sos.exec` (`end_thread_tasks`, §4) calls the close.
+**Every wrapper is already counted.** Every wrapper ends at the non-seam
+`sos_syscall*` stubs, which the window fence already counts as running tasks
+**[read floor.saw:28-35; LS:11145-11160]**.
 
-**The rule.** A seam never drives; only the typed wrappers do
-**[read ABI:1534-1538]**.
+**How a wrapper bounds its wait:**
 
-**Every wrapper is already counted.** Every `sos` wrapper ends at
-`sos_syscall1`/`sos_syscall3`, the user HAL's C stubs, which are externs with
-no body in the program and not seams **[read floor.saw:28-35]**. So the
-compiler's window fence already counts each one as running tasks
-**[read LS:11145-11160]**, and adding the drive refuses nothing new there.
+1. Call `a = background_drive()`. On `-1`, make the op with the word at 0
+   (plain, as today) and stop.
+2. Otherwise write the word:
+   - `1` (a past instant) for `0`, so a ready op answers and anything else
+     answers `TimedOut` at once, and the user's event is still served once
+     per turn;
+   - `NEVER_NS` for `INT64_MAX`;
+   - `a` itself for a deadline, since the drive's answer is already
+     absolute monotonic nanoseconds **[read ABI:1523-1531]**.
+3. Set `parked = 1` and check `gen`, as the poll does. Then make the op,
+   which is the one trap, then write 0 to the word and set `parked = 0`.
+4. On `TimedOut` or `Woken`, go back to step 1.
+5. Anything else is the op's answer.
 
-**How a wrapper drives.** A wrapper calls `background_drive()` before it parks
-and reads the answer **[read ABI:1523-1531]**:
+| wrapper | re-issued as |
+|---|---|
+| `Waiter.wait` | the same `Wait` |
+| `PipeRequest.reply_wait(_with)` | after a `TimedOut` or `Woken` wait leg, a bounded `Waiter.wait`, because the reply was delivered |
+| `PipeInlet.send(_with)` | a bounded `Resolve` of the claim handed back (§3) |
+| `PipeReply.resolve` | the same `Resolve` on the same word; the typed `consumes` wrapper spends the claim only at delivery |
+| `Thread.join` | the same `Join` |
 
-- `-1`: it parks as it does today.
-- `0`: it drives again. A bridged wrapper first makes a zero-length bridged
-  wait, so a ready user event is still served between turns and a task that
-  never parks cannot starve it.
-- `INT64_MAX`: the wait must end on a reactor wake.
-- `D`: the wait must end by the monotonic instant `D`. The Timer is armed for
-  `D` minus the clock's reading, floored at 0.
+**Waits that do not drive:**
 
-**The bridge.** A bridged wait parks on the waited-on Waiter with the thread's
-bridge set attached, so either one ends it:
+- `Lock.take`: the thread may hold another `sos.Lock` its tasks would take
+  **[read spec.md:4269-4271]**. Its park is plain.
+- The seams' parks: the output lock, the console's calls, the lock seam,
+  heap growth. They are plain and never drive.
 
-1. `Waiter.add` the bridge Timer `Tb` and Event `Eb` to the caller's Waiter,
-   persistent, under the record's two runtime keys.
-2. Arm `Tb` by the answer.
-3. Set `parked = Eb` and check `gen`.
-4. Wait.
-5. Set `parked = 0`.
-6. Remove both keys, unless the wait answered `Revoked`, which releases them.
-7. Disarm `Tb`.
+**Nesting and the two hazards (a held `sos.Lock` or `Section` across a
+driving wrapper; a task that never parks) are as in r1.** The r1 table's
+"none: unbounded" rows are gone.
 
-**What the wait's answer means:**
+## 6. The lock seams (unchanged from r1)
 
-- A user key returns the record to the caller.
-- One of the thread's own keys means it drives again.
-- Another thread's runtime key reached the wrong thread: several threads park
-  on one Waiter, and a delivery wakes one of them **[read waiter.saw:72-75]**.
-  The receiver forwards it by signalling the owner's `Eb` (named by the key),
-  then drives again.
+The word holds the holder's record address, or its odd identity on a thread
+with no block.
 
-**The keys.** Runtime keys have the top bit of the word set and encode the
-record's index and which object fired. A user key equal to one is the kernel's
-key-reuse termination **[read waiter.saw:118-121]**. So the top half of the key
-space becomes the runtime's on any Waiter a thread with live tasks waits on
-(spec text, Q3).
+- **Contention:** `LOCK_WAIT_OP` on the holder record's inheritance pair,
+  with the wait word at 0, so the park is plain. A latched wake can never
+  surface there as `Woken`.
+- **Release:** gives the pair back at depth 0.
+- **A holder with no block** is spun on.
+- **`Revoked`** panics, naming the lock.
 
-**When the bridge cannot be attached.** A caller's Waiter without `Attach`
-answers the add with a status (**UNVERIFIED**: `AccessDenied`, as other ops
-answer). Then the wrapper falls back to the unbounded form.
+## 7. The close and the kernel image (unchanged from r1)
 
-**Cost.** A bridged wait costs 6 traps instead of 1: 2 adds, the arm, the wait,
-2 removes, and a clock read for a deadline. That is paid only while tasks are
-live.
+**The close.** `end_thread_tasks()` closes the group and gives the thread's
+record back. It runs in `sosmain._start` after `__saw_main`, and in
+`run_thread` after `run` returns; an `@export _start` program calls it
+itself. `Process.exit` and `Thread.exit` do not close
+**[read ABI:1545-1561; std/taskgroup.saw:4166-4180]**.
 
-**Per wait:**
+**The kernel image.** The kernel compiles `kcore`, `sosrt`, `sosabi`,
+`imgformat` and `hal`, and never `sos` **[read
+tools/sosimage/src/boardcheck.saw:58-62]**. So it declares neither entry, and
+the `kernel_spawn_refused` case pins that **[read
+tools/sos_runner.py:18311-18331]**.
 
-| wait | drives? | bound |
-|---|---|---|
-| `Waiter.wait` | yes | the bridge on the caller's Waiter |
-| `PipeRequest.reply_wait(_with)` | yes | with tasks live, split into `reply` (never parks) and a bridged `Waiter.wait`. The error legs keep their meaning: `Reply(s)` from the reply, `Wait(s)` from the wait |
-| `PipeInlet.send(_with)` (the fused Call) | yes, until the answer is not 0 | none: it parks on the reply inside the kernel, with no Waiter to bound (Q2) |
-| `PipeReply.resolve` | yes, until not 0 | none. Attaching the claim to the thread's own Waiter could meet a claim the caller already attached, which the kernel answers by ending the process **[read waiter.saw:72-75]** (Q2) |
-| `Thread.join` | yes, until not 0 | none: a Thread is no Waiter-attachable kind **[read waiter.saw; system.saw, `add(process:)`]** (Q2) |
-| `Lock.take`'s park | **no** | the thread may hold another `sos.Lock` its tasks take, and a re-take is the kernel's `BadState` fault **[read spec.md:4269-4271]**. A lock's hold is short |
-| the output lock's park (`rt_output_lock`) | **no**: it is a seam | tasks wait while the holder finishes one line |
-| the console's Call on a full ring, and `console_sync` (inside `rt_write` and `rt_abort`) | **no**: seams | tasks wait for the driver |
-| a pool heap's growth (inside `rt_alloc`) | **no**: a seam | it never parks: every op answers at once **[read rt/common/src/lib.saw:780-787]** |
-| `reactor_poll`, `sleep_ns`, `lock_acquire` | **no**: seams | std's own sweep around them runs the tasks |
+## 8. Cases
 
-**Nesting.** A wrapper reached inside a task's turn makes a nested drive,
-which skips the tasks further up the stack and never answers `-1`
-**[read ABI:1538-1543]**. So a task in `Waiter.wait` always bridges. Each
-level of nesting holds a turn's frames on the thread's stack, which matters on
-the S3's stacks.
+### The kernel's cases
 
-**Two hazards for the spec text:**
+Each is a stock-root package that calls the floor ops directly. They run on
+riscv32, arm64 and riscv32-flat, and in the S3 smoke. Every floor is a
+one-sided reading on `Clock.now()`, and every order is fixed by construction,
+using spec §7's rule that at one level a yield returns only once every
+runnable thread has run until it blocked **[read CLAUDE.md, the timing
+rule]**.
 
-- A thread that holds a `sos.Lock`, or is inside a `Section`, across a driving
-  wrapper runs its tasks there. A task that takes the same lock ends the
-  process. Parking inside a section already does
-  **[read spec.md:4185-4192]**.
-- A wrapper's drive answering `0` forever (a task that never parks) keeps an
-  unbridged wrapper from reaching its op, as any cooperative thread would.
+- **K-1 `wait_word_refusals`:** an odd address is the `BadAlign` fault; an
+  address in no row is the door's fault; `THREAD_WAKE_OP` with a stock
+  child's thread ID is the `BadArg` fault.
+  **Mutant:** registration skips the alignment check, and the first
+  half reads no fault.
+- **K-2 `deadline_waiter`:** a Waiter with an Event nobody signals. The word
+  is `now + 20 ms`, and `Wait` answers `TimedOut`, with at least 20 ms
+  elapsed. Then:
+  - a past deadline (word `1`) answers `TimedOut`;
+  - with the Event signalled first, the same past word answers `Ok` with the
+    record (readiness wins);
+  - after the timeout the Event, signalled once, is still delivered by a
+    plain `Wait` (nothing was consumed).
 
-## 4. The close
+  **Mutants:** the readiness check placed after the deadline check makes the
+  third line `TimedOut`; expiry that never unlinks the thread ends in the
+  kernel's line for a stale list.
+- **K-3 `deadline_join`, `deadline_lock`, `deadline_park`:** the same floor
+  shape for `Join` (of a thread parked plain on an Event), `LOCK_WAIT` (a
+  holder parked plain) and `PARK_OP`.
+  - **`deadline_lock` also prints the holder's level** before and after the
+    waiter's timeout, read as the priority cases read it: raised, then back
+    to its base.
+  - **`deadline_park`** runs alone in its image, with no tick: its only wake
+    source is its own deadline.
 
-`sos.exec` gains a public `end_thread_tasks()`. It calls
-`__saw_background_close()` and then gives the thread's runtime record back.
-It is called:
+  **Mutants:** without the `lock_recompute`, `deadline_lock`'s level stays
+  raised; if `has_external_wake_source` ignores thread deadlines,
+  `deadline_park` prints the deadlock line.
+- **K-4 `deadline_pipe`:** a server child that takes and never replies. Then:
+  1. a wakeable `Call` with `now + 20 ms` answers `TimedOut` with a claim
+     handle;
+  2. the server replies;
+  3. a plain `Resolve` of that handle gets the reply;
+  4. a wakeable `Resolve` that times out leaves the same handle, which a
+     later plain `Resolve` resolves;
+  5. a full ring with a wakeable `Call` answers `TimedOut` with `NO_HANDLE`
+     and nothing staged: the server's later take finds only the messages
+     before it;
+  6. `ReplyWait` with a wakeable word answers the `Wait` leg's `TimedOut`.
 
-- **`sosmain._start`**, after `__saw_main()` returns and before `flush`/`end`
-  **[read rt/main/src/lib.saw:142-145]**. `__saw_main` has already closed what
-  `main` spawned **[read ABI:1414-1416, 1476-1478]**, so this close is almost
-  always empty. ABI still names this point **[read ABI:1556-1559]**, and it
-  gives the record back.
-- **`sos.rt.run_thread`**, after `run(record.arg)` returns and before
-  `sos_thread_exit` **[read rt.saw:407-420]**. An abandoned record spawned
-  nothing and skips it.
-- **An `@export _start` program** owns its threads' ends. It calls
-  `sos.exec.end_thread_tasks()` as each thread's last Saw code. A thread that
-  ends without it abandons its tasks with the thread, as `Process.exit` does.
+  **Mutants:** a wakeable `Call` that mints no claim loses the reply (step 3
+  reads `PeerClosed`); a wakeable `Resolve` that unbinds at the park makes
+  step 4's handle `BadHandle`.
+- **K-5 `thread_wake`:** thread T, at main's level.
+  1. T parks wakeable in `Waiter.Wait`. Main yields (so T is parked), wakes
+     T, and T prints `woken`.
+  2. Main wakes T before T's next op. T's next wakeable `PARK_OP` answers
+     `Woken` at once (the latch).
+  3. T parks **plain** on an Event. Main wakes T, then signals the Event. T
+     prints `ok` with the record, and T's next wakeable park answers `Woken`
+     (the plain park kept the latch).
+  4. A wake of an exited thread of the process answers `Revoked`.
 
-**Why `Process.exit` doesn't close.**
+  **Mutants:** a wake that ignores the plain or wakeable mode turns line 3
+  into `woken`; no latch turns line 2 into a park until the harness timeout,
+  and the case fails.
+- **K-6 SMP:** none in this design. SMP's own `core_wake` case **[read
+  SMP:500]** gains a row in that unit: a core-1 thread in a wakeable park,
+  woken from core 0.
 
-- The kernel's teardown frees every object and the whole region at once
-  **[read system.saw, `exit`]**, so nothing a close would release outlives it.
-- A close runs program code: cancelled tasks finish through their own code.
-- A close can wait without bound: a task that ignores its cancel, or one
-  parked in a join, holds it open **[read ABI:1549-1553; LS:12406-12413]**.
-- `exit` is often called inside a task's turn, where a close panics
-  **[read std/taskgroup.saw:4178-4180]**.
+### The runtime's cases
 
-`Thread.exit` doesn't close either, for the last two reasons. A thread that
-exits that way leaves its std record and its runtime record claimed.
+These are r1's cases, each kept with the mutant r1 named for it.
 
-## 5. Threads
+- **R-1 `task_spawn_join`.**
+- **R-2 `task_sleep_floor`:** a kernel-clock floor.
+- **R-3 `task_channel_wake`:** the lock seams.
+- **R-4 `task_close_at_thread_end`.**
+- **R-5 `task_two_threads`:** the executor word, per thread and per HAL.
+- **R-6 `task_cross_thread_wake`:** a wake from another thread ends a poll
+  with a negative timeout. **Mutant:** a `reactor_wake` that does nothing
+  ends in the deadlock line.
+- **R-7 `sleep_ns_direct`** (t2): `main` declares
+  `extern "C" { func __saw_rt_sleep_ns(ns: UInt64)
+  func __saw_rt_reactor_poll(r: Int, timeout_ms: Int,
+  count_out: UnsafePointer<Int>) -> Int }` and calls them in thread
+  context, with no task.
+  1. Thread W, at main's level, loops yielding until
+     `sos_exec_parked_parks() ≥ 1` (a count of `PARK_OP`s entered, exported
+     as `sos_arena_contended` is). It then calls `__saw_rt_reactor_wake` and
+     exits.
+  2. `main` reads `Clock.now()`, calls `__saw_rt_sleep_ns(50 ms)`, and reads
+     the clock again. It prints `slept at least 50 ms: true` and
+     `park woken: true` (from `sos_exec_parks_woken() ≥ 1`).
+  3. `main` then calls `__saw_rt_reactor_poll(&REACTOR, -1, …)`, which
+     returns at once because the wake was kept, and prints `wake kept`.
 
-**Each thread drives its own group, and nothing assumes one thread per process
-or one core** (the owner's SMP rule):
+  The order is fixed by construction: W wakes only after main is counted
+  parked.
+  **Mutants:**
+  - `sleep_ns` returning on `Woken` makes the first line `false`;
+  - a `THREAD_WAKE_OP` that ends no park makes the second line `false`;
+  - a `sleep_ns` that drops the wake (leaves `seen`) parks the poll forever,
+    and the case ends in the deadlock line.
+- **R-8 `task_bounded_waits`:** replaces r1's bridge case.
+  1. `main` spawns a task that sleeps 5 ms and then signals an Event.
+  2. `main` calls `waiter.wait()` on that Event and prints `woken by the
+     task`.
+  3. The same shape follows with `Thread.join` (a thread whose exit waits
+     for the task's message) and `PipeInlet.send` (a server in the same
+     process, served by the task).
 
-- The executor word is read and written only by its own thread.
-- The record list grows by compare-and-swap and is read with atomic loads.
-- `claimed`, `parked`, `seen` and `gen` are atomics with sequentially
-  consistent ordering where they pair up (the wake Dekker in §2).
-- The two process-wide handles are published by compare-and-swap.
-- The lock seam is a compare-and-swap on the word plus a kernel park.
-- The forwarding in a bridged wait assumes only that the kernel hands a ready
-  record to some parked thread **[read waiter.saw:72-75]**. Which thread is
-  **UNVERIFIED**, and nothing here depends on it.
-- Nothing relies on the uniprocessor kernel **[read spec.md:4349-4352]**.
+  **Mutants:** a wrapper that skips the drive, or writes the word as 0,
+  parks with nothing armed, and the case ends in the deadlock line.
+- **R-9 `kernel_spawn_refused`.**
 
-**`reactor_wake` from another thread:** it bumps the generation and signals
-the Event of every thread parked in a poll or a bridged wait. Each such wait
-returns, and that thread's executor looks again. A thread between parks sees
-the generation at its next poll. The waker may be any thread, one with no
-block included, since it touches no record of its own.
+Every runtime case also runs in the S3 smoke.
 
-There are no user-mode interrupt handlers in SOS: an Interrupt is a waitable.
-So ABI's "never from a handler" rule **[read ABI:1482-1485]** has no site.
-
-## 6. The kernel image
-
-The kernel compiles `kcore`, `sosrt`, `sosabi`, `imgformat` and `hal`, and never
-`sos` **[read tools/sosimage/src/boardcheck.saw:58-62]**. The declarations
-(`sos.floor`) and the executor set (`sos.exec`) are both in `sos`, so a kernel
-declares neither entry, and a `Task.spawn` there is refused
-(`spawn.freestanding`, **[probed: a/nodecl.saw]**).
-
-`sosrt` takes none of this for a second reason too: the kernel harness entry
-`tests/taskdump.saw` exports its own reactor, clock and executor-word stubs
-**[read tests/taskdump.saw:34-125]**, and a second export of the same symbols
-from `sosrt` would collide.
-
-**The guard** is a kernel-entry case, `kernel_spawn_refused`: a kernel source
-with one `Task.spawn`, and `expect_build_error: "spawn.freestanding"`.
-Whether `_expected_build_failure` routes a kernel compile's failure the way it
-routes a package's is **UNVERIFIED** **[read tools/sos_runner.py:1538-1550]**;
-the unit adds the routing if not. Mutant: move the declarations into `sosrt`,
-and the case goes red (the kernel compiles).
-
-## 7. Cases
-
-Every case runs as root, or as a stock root's child where noted, on riscv32,
-arm64 and riscv32-flat. Each package carries a `[sos.xtensa-esp-unknown-elf]`
-section and joins the S3 smoke. None reads the clock to decide what it prints,
-except one one-sided floor.
-
-1. **`task_spawn_join`** — `main` spawns `work(21)`, joins it and prints
-   `joined 42`. **Mutant:** `set_thread_executor` answers `-1`. std panics
-   (§1), and the transcript has the panic line in place of `joined 42`.
-2. **`task_sleep_floor`** — the floor is read on the kernel's clock, beside the
-   runtime's.
-   - **Steps:** `main` reads `Clock.now()` (the typed op), spawns a task that
-     calls `sleep(Duration.ms(20))`, joins it, and reads `Clock.now()` again.
-   - **Prints:** `slept at least 20 ms: true`.
-   - **Why it is safe:** a stalled host only raises the elapsed time.
-   - **Why the kernel's clock:** std compares the deadline with the runtime's
-     clock, so a poll that returns early cannot break the floor. Reading the
-     kernel's clock is what pins the seam's units.
-   - **Mutant:** `clock_monotonic_nanos` answers the reading shifted left by
-     10 bits. Time then runs 1024 times fast, the task wakes after about
-     20 µs, and the case prints `false`.
-3. **`task_channel_wake`** — task A receives on an empty channel; task B,
-   spawned after A, prints `sending` and sends 7; A prints `got 7`.
-   - **Order:** a drive's turn resumes tasks in slot order (sawlang's
-     `background_turn_*` cases), so A parks before B runs
-     (**UNVERIFIED** for the sweep inside a thread-context join; the lines
-     `a parks`, `sending`, `got 7` are asserted in order, which fails loudly if
-     it is not).
-   - **Mutant:** `lock_release` leaves the word set. The next acquire finds
-     its own record as the holder and waits on its own pair, which is the
-     kernel's `BadState` fault, so the case goes red.
-4. **`task_close_at_thread_end`** — the close runs at a thread's end.
-   - **Steps:** a `thread_create(run:)` thread spawns a detached task that
-     loops `while not cancelled() { yield_now() }`, then prints `bg cancelled`.
-     The thread's `run` returns at once, and `main` joins the thread and prints
-     `thread joined`.
-   - **Order:** the task's only turns are inside the close, which runs before
-     the thread exits, so the order is fixed.
-   - **Mutant:** remove `end_thread_tasks()` from `run_thread`. No
-     `bg cancelled` appears.
-5. **`task_two_threads`** — two threads, each with its own group.
-   - **Steps:**
-     1. `main` spawns task M, which receives on channel `c1` and prints
-        `main: m=<v>`, with -1 for an `Err`.
-     2. `main` starts thread T and joins it.
-     3. T's `blocking` helper spawns X (`work(21)`), joins it and prints
-        `t: x=42`. Then `run` returns, and the close runs.
-     4. `main` sends 7 on `c1` and joins M.
-   - **Expect:** `t: x=42`, then `main: m=7`.
-   - **Mutant:** keep the executor word in one static for every thread (or a
-     HAL that stops switching the thread register). T then shares `main`'s
-     record, and T's close cancels M, so the line reads `main: m=-1`.
-6. **`task_cross_thread_wake`** — a wake from another thread ends a poll.
-   - **Steps:**
-     1. Thread T's helper spawns R, which receives on channel `c` and prints
-        `r got 9`.
-     2. T joins R, so T's sweep parks in a poll with a negative timeout.
-     3. `main` yields until `sos_exec_parked_polls()` is at least 1. That is a
-        count of blocking polls entered, exported as `sos_arena_contended` is
-        **[read rt/common/src/lib.saw:395-401]**.
-     4. `main` sends 9 and joins T.
-   - **Order:** by construction. `main` sends only after T has entered the
-     poll, and the generation check covers the gap before its kernel wait.
-   - **Mutant:** `reactor_wake` does nothing. T stays parked, `main` parks in
-     the join, and with no Timer armed the kernel prints its deadlock line
-     **[read spec.md:4091-4111]**.
-7. **`task_bridge_wait`** — `Waiter.wait` drives, and its bridge arms the
-   deadline.
-   - **Steps:** `main` makes an Event and a Waiter and attaches the Event.
-     It spawns a task that sleeps 5 ms and then signals the Event. Then
-     `main` calls `waiter.wait()` and prints `woken by the task`.
-   - **Order:** nothing else signals the Event.
-   - **Mutant:** `Waiter.wait` doesn't drive, or the bridge leaves `Tb`
-     disarmed. Either way `main` parks with no armed Timer, and the kernel
-     prints its deadlock line.
-8. **`kernel_spawn_refused`** — §6.
-9. **Every profile, and the S3** — cases 1–7 run on all three gate profiles
-   and in the S3 smoke. Case 5 is the one that pins each HAL's per-thread
-   thread register.
-
-`sleep_ns` is reached by std's deadlock walk naps
-**[read std/taskgroup.saw:1155, 1201, 3161]**, and no case above pins it
-alone. A mutant that returns at once would pass every case. A case that pins
-it would need a thread-context `sleep` reaching the seam; whether one exists
-outside an executor is **UNVERIFIED** (std's `sleep` is a task park,
-**[read std/task.saw:62-69]**).
-
-## 8. Units
+## 9. Units, spec text, and what is left out
 
 | unit | what | size | model | after |
 |---|---|---|---|---|
-| U0 | the spec text below | S | Opus | — |
-| U1 | `sos.floor`'s declarations and the drive/close wrappers; `sos.exec`: the record list, the eight seams, `end_thread_tasks`, `sos_exec_parked_polls`. `ThreadBlock` grows and moves to `sos.exec`, which sits between `waiter` and `pipe` in the facade's order **[read kernel/sysapi/src/lib.saw:77-109]**. Close calls in `run_thread` and `sosmain`; the doc updates (StartRecord's size, `sosrt`'s "Not implemented here" list). Cases 1, 2, 4, 5, 6 and 8 | L (about 450 lines of Saw, 5 test packages) | Opus | U0 |
-| U2 | the lock seams over the record's pair; case 3 | M (about 150 lines) | Sonnet | U1 |
-| U3 | the wrapper drives: the bridge in `Waiter.wait` and `reply_wait`, and drive-until-not-0 in `send`, `resolve` and `join`; case 7 | M (about 250 lines) | Opus | U1 |
+| S0 | spec text: the kernel's half (§2.2, §2.1, §5.7's ops and statuses, §2.6, §7, §8) and the runtime's half (§10's executor, §7's one-word lock, §8's thread end) | M | Opus | — |
+| K1 | the two statuses, the three ops, the `ThreadSlot` fields, the schedule and the deadlock test, wakeable `Waiter.Wait`, `Join`, `LOCK_WAIT` and `PARK`, and the floor exports (`sos_wait_word`, `sos_thread_wake`, `sos_park`); K-1, K-2, K-3, K-5 | L | Opus | S0 |
+| K2 | wakeable `Call` (the room park, and the claim minted at the stage), the borrowing `Resolve`, and `ReplyWait`; K-4 | M | Opus | K1 |
+| R1 | `sos.floor`'s declarations; `sos.exec`'s records, the eight seams over `PARK_OP` and `THREAD_WAKE_OP`, `end_thread_tasks`, the two counters, and the block's growth and registration; the close calls; R-1, R-2, R-4, R-5, R-6, R-7, R-9 | M (it was L) | Opus | K1 |
+| R2 | the lock seams; R-3 | M | Sonnet | R1 |
+| R3 | the wrapper drives (§5); R-8 | S–M (it was M) | Sonnet | R1, K2 |
 
-U2 and U3 touch different files (`sos.exec`'s lock section versus `pipe.saw`
-and `thread.saw`), so they can run at once.
+R2 and R3 touch different files and can run at once.
 
-**Spec text (U0):**
+**Spec text:**
 
-- **§10** gets a built section before HandlerGroup, "The task executor". It
-  states:
-  - the record and what it costs in quota;
-  - which threads can run tasks;
-  - the reactor's generation and wake;
-  - the wrappers that drive and how each bounds its wait, as the table
-    in §3;
-  - the reserved key half;
-  - the two hazards;
-  - the close points, and why `Process.exit` and `Thread.exit` don't close.
-- **§7, "The runtime's locks"** gains the one-word lock: holder record, the
-  inheritance pair, and the spin for a holder with no block.
-- **§8** gets one sentence at a thread's end: the runtime closes a `main`
-  thread's and a `run:` thread's tasks; an `@export _start` program calls
-  `end_thread_tasks`.
-- **§11:** the thread gate seams (Q4), and the waits that cannot be bounded
-  (Q2).
+- **The kernel half (S0):**
+  - §2.2 `Wait` and §2.1's `Call`, `Resolve` and `ReplyWait` each get their
+    deadline and wake paragraph (§3's table).
+  - §5.7 gets the three no-handle ops and the two statuses.
+  - §2.6 says deadlines are on the Monotonic clock.
+  - §7 gets the wait word, the wake and its latch, the same-process rule, and
+    a line in "Nothing runnable" for parked deadlines.
+  - §8 says `Join`'s early end and that a slot's latch resets.
+- **The runtime half:** §10's "The task executor", without r1's bridge or
+  reserved keys, and the hazards. §11 lists the thread gate below.
 
-## 9. Questions for the owner
+**Left out, as decided:**
 
-1. **Quotas.** A thread that runs tasks costs a child 1 Waiter, 1 Event,
-   1 Timer and 3 handles, plus 1 Event, 1 Timer and 2 handles once it makes a
-   bridged wait, and 2 handles per process. The default Waiter quota is 2.
-   Raise the child defaults, or leave it to launchers?
-2. **Waits with no bound.** `Thread.join`, `PipeReply.resolve` and
-   `PipeInlet.send` cannot bound their waits, so tasks with deadlines are late
-   until the wait ends. Accept that? The alternatives:
-   - (a) with tasks live, split `send` into a post and a bridged wait on the
-     fresh claim, which costs a claim handle;
-   - (b) make a Thread's exit a Waiter-attachable level (a kernel change), so
-     `join` bridges.
-3. **Reserved keys.** May the runtime reserve keys with the top bit set on a
-   Waiter that a thread with live tasks waits on? Without it, `Waiter.wait`
-   cannot bound its wait.
-4. **The thread gate.** A `Channel.receive` (and a `TaskGroup(threads:)`) in
-   thread context reaches std's thread gate, the `__saw_rt_pthread_*` seams,
-   and still fails at link. File it as a follow-up?
-5. **Deadlock reports.** A process whose tasks all wait on nothing that can
-   come parks quietly in its poll. The kernel's deadlock line reports it only
-   when the whole machine stops. Is that enough, or should the runtime count
-   its parked threads and report?
-6. **Threads with no block.** A spawn on a thread with no block panics with
-   std's text ("no thread-specific word"). Keep that, or have
-   `set_thread_executor` panic with a sawos message naming
-   `enter_thread_block`?
+- **The thread gate** (Q4, a follow-up issue). A thread-context
+  `Channel.receive` and a `TaskGroup(threads:)` still fail at link on
+  `__saw_rt_pthread_mutex_init_default`, `_cond_init_default`,
+  `_mutex_lock`, `_mutex_unlock`, `_mutex_destroy`, `_cond_wait`,
+  `_cond_broadcast` and `_cond_destroy` **[probed: a/chan.saw]**. A
+  `TaskGroup(threads:)` adds `__saw_rt_thread_spawn` and `_join` too
+  **[read ABI:1130-1135]**.
+- **Deadlock reports** (Q5): a process whose tasks all wait forever parks,
+  and only the kernel's line reports it.
+
+## 10. Questions for the owner
+
+1. **A typed deadline for programs.** The kernel would offer a deadline and
+   a wake on every wait, but only the runtime uses them here. Should `sos`
+   also give programs a typed form, for example `Waiter.wait(until:
+   Instant)` and `Thread.wake()`, now or as a follow-up?
+2. **The cost of a bounded `send`.** A wakeable `Call` mints its claim at
+   the stage (§3), so a bounded `send` costs one handle row while it waits,
+   and a full table refuses it before anything is staged, as `Post` does.
+   Accept that, or keep the `Call` reply park unbounded and let the runtime
+   compose `Post` and `Resolve` itself? That costs the same row, in one more
+   trap.
+3. **The t2 reading.** ABI says nothing cuts `sleep_ns` short. R-7 pins that
+   a mid-sleep wake ends the kernel park, is absorbed, is kept for the next
+   poll, and does not shorten the sleep. If the reviewer meant the wake to
+   end the sleep itself, that is an ABI change for sawlang, not a sawos
+   choice.
