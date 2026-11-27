@@ -557,6 +557,112 @@ it needs selecting at link time the way `_sos_semihosting` is (§10), so the
 UART path the emulator checks is untouched. Neither is built: nothing here
 can run it, and a board with a USB-to-UART bridge does not need it.
 
+### 4b. UART0 under a driver
+
+A process that serves UART0 takes the 4 KiB page at 0x6000_0000 as its
+window and interrupt matrix source 27 as its line (`board.toml`; §6c found
+27 by probing and §9b's header count gives the same). `drivers/esp32s3io`
+holds its numbers and the order of each service, and its hosted tests record
+every register access. The register file is ESP-IDF v5.4.1's: offsets and
+fields from `components/soc/esp32s3/register/soc/uart_reg.h`, the FIFO's depth
+from `soc_caps.h` (`SOC_UART_FIFO_LEN`, 128) and the access rules from
+`components/hal/esp32s3/include/hal/uart_ll.h`.
+
+```
++0x00  FIFO      a read pops one received byte; a 32-bit store queues one
++0x08  INT_ST    raised and enabled (read-only)
++0x0C  INT_ENA   which interrupts reach the line
++0x10  INT_CLR   a bit stored here clears that interrupt's raw bit
++0x1C  STATUS    RXFIFO_CNT bits 9:0, TXFIFO_CNT bits 25:16
++0x24  CONF1     RXFIFO_FULL_THRHD 9:0, TXFIFO_EMPTY_THRHD 19:10, RX_TOUT_EN 23
++0x60  MEM_CONF  RX_TOUT_THRHD 26:17, in bit times
+```
+
+The interrupt bits, the same in all three: RXFIFO_FULL 0, TXFIFO_EMPTY 1,
+PARITY_ERR 2, FRM_ERR 3, RXFIFO_OVF 4, BRK_DET 7, RXFIFO_TOUT 8. The receive
+set a driver takes is every one of them but TXFIFO_EMPTY (0x19D); the
+transmit one is enabled only while bytes wait to be sent.
+
+**Not touched.** `CLKDIV` and `CLK_CONF` are the console key's (§14i), and
+`CONF0`'s FIFO resets are left alone: the transmit FIFO may hold the kernel's
+last bytes and the receive FIFO bytes typed before the driver started, which
+the driver delivers.
+
+**Bring-up**, in order, after the three values pass the driver's checks (a
+receive threshold of 1 to 127, a transmit threshold of 1 to 128, a timeout of
+1 to 1023 bit times; a refusal writes nothing): `INT_CLR` of the receive set;
+`MEM_CONF` read, then written with the timeout and every other bit as read;
+`CONF1` the same with the two thresholds and RX_TOUT_EN; then `INT_ENA` of
+the receive set. The clear comes first so a timeout that bytes left in the
+FIFO raise while the registers are configured is not erased. Each register
+keeps every bit the driver does not own, except `INT_ENA`, which the driver
+owns whole and writes as a word; each field written is masked to its width, so
+a value past it cannot reach `DIS_RX_DAT_OVF` (CONF1 bit 20), `MEM_FORCE_PD`
+(MEM_CONF bit 27) or the field beside it.
+
+**What the driver relies on at reset**: `MEM_CONF`'s `RX_SIZE` and `TX_SIZE`
+are 1, which gives each FIFO its 128 bytes, and the driver neither writes nor
+checks them. The emulator's `MEM_CONF` reads 0 (below), and its FIFOs are 128
+bytes whatever it says.
+
+**The receive service**, before the line is acknowledged: `INT_ST` read; for
+any receive bit, in this order, `INT_CLR` of the events it showed (parity,
+frame, overflow, break) before any byte is popped; `STATUS.RXFIFO_CNT` read
+and that many `FIFO` reads, the count read again until it is 0; `INT_CLR` of
+the levels it showed (FULL, TOUT) and the drain once more into the same
+batch. An event that rises while draining is therefore never erased by a
+clear that came after it, and stays raised for the next service; and the byte
+that landed at the level's clear is in the batch. No bit the service did not
+see is cleared. Every register access comes before the acknowledgement (spec
+§9). A timeout is treated as "look": it may be raised with the FIFO empty.
+
+**The transmit service** stores whole words to `FIFO` after one `STATUS`
+read, as many as 128 less `TXFIFO_CNT`, and never reads `FIFO`, whose read
+pops the receiver. TXFIFO_EMPTY rises when the FIFO holds fewer bytes than
+`TXFIFO_EMPTY_THRHD`, and its raw bit stays set until cleared, whatever a
+fill has stored since. A driver with bytes left re-arms after every fill by
+clearing the bit and enabling it, so the line rises at the next crossing and
+not at once.
+
+**The emulator** (`esp32s3_soc.uart`, over `esp_soc.uart`, in Espressif's
+QEMU 9.2.2). A call0 program booted with `-kernel` and polling with no
+interrupts printed `STATUS` and `INT_RAW` whenever either changed while the
+host typed into the terminal, then popped the receive FIFO, then stored 100
+bytes and read the transmit side at once:
+
+```
+at reset           CONF1=0  MEM_CONF=0  INT_RAW=0x4003
+INT_CLR of all     INT_RAW=0x4003           (a held condition re-sets)
+thresholds set     INT_RAW=0x4002, then 0x4102 with RXFIFO_CNT=0
+'A' typed          RXFIFO_CNT=1    INT_RAW=0x4102   (timeout; 1 is below 4)
+6 bytes typed      RXFIFO_CNT=7    INT_RAW=0x4103   (full; 7 is above 4)
+200 bytes typed    RXFIFO_CNT 0x60, then 0x80 (128), INT_RAW=0x4103, no bit 4
+pop 128            the bytes in order; then RXFIFO_CNT=1, the 129th
+100-byte burst     TXFIFO_CNT=0  FSM_STATUS=0  INT_RAW=0x4002
+```
+
+- Typed bytes enter a 128-byte receive FIFO in order and `RXFIFO_CNT` counts
+  them. RXFIFO_FULL follows the threshold.
+- RXFIFO_TOUT is modelled, and was raised with the FIFO empty right after it
+  was enabled. A driver treats it as "look" and does not assume a byte;
+  whether the part does the same is not checked.
+- There is no hardware overflow: the model stops taking input while its FIFO
+  is full and the rest waits in the host's pipe. RXFIFO_OVF never rose, so it
+  is the part's alone.
+- Transmit is immediate: `TXFIFO_CNT` and `FSM_STATUS` read 0 after a burst
+  (§4), so TXFIFO_EMPTY is raised whenever enabled. That is how the
+  `external_irq` smoke case raises line 27, and the line follows `INT_ENA`
+  (§6c).
+- The reset values are not the part's. `CONF1` and `MEM_CONF` read 0 where the
+  register file gives 96, 96 and 10, and with a receive threshold of 0 the
+  full bit reads raised on an empty FIFO.
+- The terminal sends whole bytes, so no parity or frame error can be made, and
+  whether the model would report one is not checked.
+
+What only a part can check: a transmit FIFO that holds bytes, so the empty
+threshold's timing; a receive FIFO that overflows at a high rate; the timeout
+with a person at the terminal; and the errors.
+
 ---
 
 ## 5. Exceptions, vectors, privilege

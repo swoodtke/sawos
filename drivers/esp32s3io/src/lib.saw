@@ -1,4 +1,5 @@
-//! The ESP32-S3's GPIO, IO MUX and LEDC as the GPIO and PWM drivers use them.
+//! The ESP32-S3's GPIO, IO MUX and LEDC as the GPIO and PWM drivers use
+//! them, and UART0 as its driver does.
 //!
 //! Every number here is the part's, with its source in
 //! `hal/xtensa-esp32s3/ABI.md` §9: the blocks' bases, the registers' offsets,
@@ -11,6 +12,9 @@
 //! A driver holds its blocks as mapped windows, whose bases are its own; a
 //! `Register` names a register by its block and its offset in it, and its
 //! `address` is the part's, which is what a driver's log and the tests show.
+//! UART0's registers are a `UartRegister` and its orders go through a
+//! `UartPort`, which reads as well as writes, because an interrupt service
+//! reads the status it acts on.
 
 /// The GPIO block: pad levels, output enables, interrupts and the output
 /// matrix.
@@ -313,7 +317,14 @@ public enum ConfigError {
     case PinCountNotPowerOfTwo(count: Int),
     /// Servo pins whose registers are not one naturally aligned window in
     /// the output selects and the IO MUX.
-    case PinsNotAligned(pin: UInt8)
+    case PinsNotAligned(pin: UInt8),
+    /// A UART receive threshold of 0 or past `RX_FULL_MAX`.
+    case RxFullThreshold(value: UInt32),
+    /// A UART transmit threshold of 0 or past `TX_EMPTY_MAX`.
+    case TxEmptyThreshold(value: UInt32),
+    /// A UART receive timeout of 0 bit times, which turns it off, or past
+    /// `RX_TIMEOUT_MAX`.
+    case RxTimeout(bits: UInt32)
 }
 
 @synthesize
@@ -341,7 +352,10 @@ extension ConfigError {
             case MaxPulseWholeFrame(channel) -> "channel {channel}'s greatest pulse is the whole frame",
             case PinsNotConsecutive(pin) -> "pin {pin} is not consecutive with the other servos'",
             case PinCountNotPowerOfTwo(count) -> "{count} servos are not a power of two",
-            case PinsNotAligned(pin) -> "the servo pins from {pin} are not one aligned window"
+            case PinsNotAligned(pin) -> "the servo pins from {pin} are not one aligned window",
+            case RxFullThreshold(value) -> "the receive threshold {value} is not 1..{RX_FULL_MAX}",
+            case TxEmptyThreshold(value) -> "the transmit threshold {value} is not 1..{TX_EMPTY_MAX}",
+            case RxTimeout(bits) -> "the receive timeout {bits} is not 1..{RX_TIMEOUT_MAX} bit times"
         }
     }
 }
@@ -885,4 +899,378 @@ public func place_pwm(reg: Register, lowest: UInt8, count: Int) -> Placed? {
             Placed(window: PwmWindow.Pads, offset: at)
         }
     }
+}
+
+// =============================================================================
+// UART0
+// =============================================================================
+//
+// UART0 as a driver that serves it uses it: the registers a receive and a
+// transmit interrupt touch, the words that bring it up, and the order each
+// service follows (hal/xtensa-esp32s3/ABI.md §4b). The ROM left its divisor
+// and clock alone, and so does everything here.
+
+/// UART0's block, the console's.
+public static UART0_BASE: UInt32 = 0x6000_0000
+
+/// The interrupt matrix source UART0 raises.
+public static UART0_SOURCE: UInt32 = 27
+
+/// The depth of each of UART0's two FIFOs.
+public static UART_FIFO_BYTES: UInt32 = 128
+
+/// A UART0 register: its offset in the block. `Register` names the GPIO, IO
+/// MUX and LEDC blocks, which a GPIO or PWM driver matches over; UART0 has a
+/// type of its own so that match does not grow an arm it can never take.
+public struct UartRegister {
+    offset: UInt32
+}
+
+@synthesize
+extension UartRegister: Equatable {}
+
+extension UartRegister {
+    /// The register's address on the part.
+    public func address(&self) -> UInt32 {
+        UART0_BASE + self.offset
+    }
+}
+
+// The registers a driver touches. Reading `UART_FIFO` pops the receiver, and
+// storing to it queues a byte to transmit, so each is only ever used as its
+// own half.
+static UART_FIFO_OFFSET: UInt32 = 0x00
+static UART_INT_ST_OFFSET: UInt32 = 0x08
+static UART_INT_ENA_OFFSET: UInt32 = 0x0C
+static UART_INT_CLR_OFFSET: UInt32 = 0x10
+static UART_STATUS_OFFSET: UInt32 = 0x1C
+static UART_CONF1_OFFSET: UInt32 = 0x24
+static UART_MEM_CONF_OFFSET: UInt32 = 0x60
+
+/// `FIFO`: a read pops one received byte, a store queues one to transmit.
+public func uart_fifo() -> UartRegister { UartRegister(offset: UART_FIFO_OFFSET) }
+/// `INT_ST`: the interrupts raised and enabled (read-only).
+public func uart_int_st() -> UartRegister { UartRegister(offset: UART_INT_ST_OFFSET) }
+/// `INT_ENA`: which interrupts reach the line.
+public func uart_int_ena() -> UartRegister { UartRegister(offset: UART_INT_ENA_OFFSET) }
+/// `INT_CLR`: a bit stored here clears that interrupt's raw bit.
+public func uart_int_clr() -> UartRegister { UartRegister(offset: UART_INT_CLR_OFFSET) }
+/// `STATUS`: the two FIFOs' counts (read-only).
+public func uart_status() -> UartRegister { UartRegister(offset: UART_STATUS_OFFSET) }
+/// `CONF1`: the FIFO thresholds and the receive timeout's enable.
+public func uart_conf1() -> UartRegister { UartRegister(offset: UART_CONF1_OFFSET) }
+/// `MEM_CONF`: the receive timeout's length.
+public func uart_mem_conf() -> UartRegister { UartRegister(offset: UART_MEM_CONF_OFFSET) }
+
+// The interrupt bits, the same in `INT_ST`, `INT_ENA` and `INT_CLR`.
+/// The receive FIFO holds more than `RXFIFO_FULL_THRHD` bytes.
+public static INT_RXFIFO_FULL: UInt32 = 1 << 0
+/// The transmit FIFO holds fewer than `TXFIFO_EMPTY_THRHD` bytes.
+public static INT_TXFIFO_EMPTY: UInt32 = 1 << 1
+/// A received byte's parity was wrong.
+public static INT_PARITY_ERR: UInt32 = 1 << 2
+/// A received byte's stop bit was wrong.
+public static INT_FRM_ERR: UInt32 = 1 << 3
+/// The receive FIFO overflowed: bytes were dropped, and the hardware does not
+/// say how many.
+public static INT_RXFIFO_OVF: UInt32 = 1 << 4
+/// A break: the line was low for longer than a byte.
+public static INT_BRK_DET: UInt32 = 1 << 7
+/// The receiver has been idle for `RX_TOUT_THRHD` bit times. It can rise with
+/// the FIFO empty, so a service takes it as "look".
+public static INT_RXFIFO_TOUT: UInt32 = 1 << 8
+
+/// The interrupts a driver takes for the receiver: the data's two and the
+/// errors'.
+public static INT_RX: UInt32 = (INT_RXFIFO_FULL | INT_RXFIFO_TOUT | INT_PARITY_ERR |
+                                INT_FRM_ERR | INT_RXFIFO_OVF | INT_BRK_DET)
+
+// `STATUS`'s counts: the receive FIFO's in bits 9:0, the transmit FIFO's in
+// bits 25:16.
+static STATUS_COUNT_MASK: UInt32 = 0x3FF
+static STATUS_TXFIFO_SHIFT: UInt32 = 16
+
+/// The bytes in the receive FIFO, from a `STATUS` word.
+public func uart_rxfifo_cnt(status: UInt32) -> UInt32 {
+    status & STATUS_COUNT_MASK
+}
+
+/// The bytes in the transmit FIFO, from a `STATUS` word.
+public func uart_txfifo_cnt(status: UInt32) -> UInt32 {
+    (status >> STATUS_TXFIFO_SHIFT) & STATUS_COUNT_MASK
+}
+
+// `CONF1`'s fields: the receive threshold in bits 9:0, the transmit threshold
+// in bits 19:10 and the receive timeout's enable at bit 23.
+static CONF1_RX_FULL_MASK: UInt32 = 0x3FF
+static CONF1_TX_EMPTY_SHIFT: UInt32 = 10
+static CONF1_TX_EMPTY_MASK: UInt32 = 0x3FF << 10
+static CONF1_RX_TOUT_EN: UInt32 = 1 << 23
+
+// `MEM_CONF`'s receive timeout, in bit times, in bits 26:17.
+static MEM_CONF_RX_TOUT_SHIFT: UInt32 = 17
+static MEM_CONF_RX_TOUT_MASK: UInt32 = 0x3FF << 17
+
+/// The greatest receive threshold: the interrupt rises above it, so a full
+/// FIFO's worth never would.
+public static RX_FULL_MAX: UInt32 = UART_FIFO_BYTES - 1
+/// The greatest transmit threshold: the interrupt rises below it.
+public static TX_EMPTY_MAX: UInt32 = UART_FIFO_BYTES
+/// The greatest receive timeout, the field's width, in bit times.
+public static RX_TIMEOUT_MAX: UInt32 = 0x3FF
+
+// Each word builder masks its value to its field, so a value past the field
+// never spills into a neighbour (`CONF1`'s `DIS_RX_DAT_OVF` at bit 20,
+// `MEM_CONF`'s `MEM_FORCE_PD` at bit 27). The checks below refuse such a
+// value where it enters; the mask is what holds if one gets through.
+
+/// `CONF1` with the receive threshold `rx_full`, the transmit threshold
+/// `tx_empty` and the receive timeout enabled, every other bit of `old`
+/// kept.
+public func uart_conf1_word(old: UInt32, rx_full: UInt32, tx_empty: UInt32) -> UInt32 {
+    let kept = old & ~(CONF1_RX_FULL_MASK | CONF1_TX_EMPTY_MASK)
+    kept | (rx_full & CONF1_RX_FULL_MASK) |
+        ((tx_empty << CONF1_TX_EMPTY_SHIFT) & CONF1_TX_EMPTY_MASK) | CONF1_RX_TOUT_EN
+}
+
+/// `CONF1` with the transmit threshold `tx_empty`, every other bit of `old`
+/// kept.
+public func uart_conf1_tx_empty(old: UInt32, tx_empty: UInt32) -> UInt32 {
+    (old & ~CONF1_TX_EMPTY_MASK) |
+        ((tx_empty << CONF1_TX_EMPTY_SHIFT) & CONF1_TX_EMPTY_MASK)
+}
+
+/// `MEM_CONF` with the receive timeout `bits` bit times long, every other
+/// bit of `old` kept.
+public func uart_mem_conf_word(old: UInt32, bits: UInt32) -> UInt32 {
+    (old & ~MEM_CONF_RX_TOUT_MASK) |
+        ((bits << MEM_CONF_RX_TOUT_SHIFT) & MEM_CONF_RX_TOUT_MASK)
+}
+
+/// `INT_ENA` for a driver that always takes the receiver's interrupts, and
+/// takes the transmitter's while it has bytes to send.
+public func uart_int_ena_word(transmitting: Bool) -> UInt32 {
+    if transmitting { INT_RX | INT_TXFIFO_EMPTY } else { INT_RX }
+}
+
+/// Refuses a receive threshold the driver cannot use: 0, which raises the
+/// interrupt at any count above 0, so no byte waits to be batched; or past
+/// `RX_FULL_MAX`, above which the interrupt never rises.
+public func check_rx_full(rx_full: UInt32) -> Result<Void, ConfigError> {
+    if rx_full == 0 || rx_full > RX_FULL_MAX {
+        return ConfigError.RxFullThreshold(value: rx_full)
+    }
+    return
+}
+
+/// Refuses a transmit threshold of 0, below which the interrupt never rises,
+/// or past `TX_EMPTY_MAX`, a count the FIFO cannot hold.
+public func check_tx_empty(tx_empty: UInt32) -> Result<Void, ConfigError> {
+    if tx_empty == 0 || tx_empty > TX_EMPTY_MAX {
+        return ConfigError.TxEmptyThreshold(value: tx_empty)
+    }
+    return
+}
+
+/// Refuses a receive timeout of 0 bit times, which would raise the timeout
+/// interrupt with no idle time to wait for (`RX_TOUT_EN`, not a length of 0,
+/// is what turns it off), or past `RX_TIMEOUT_MAX`, the field's width.
+public func check_rx_timeout(rx_timeout_bits: UInt32) -> Result<Void, ConfigError> {
+    if rx_timeout_bits == 0 || rx_timeout_bits > RX_TIMEOUT_MAX {
+        return ConfigError.RxTimeout(bits: rx_timeout_bits)
+    }
+    return
+}
+
+/// Checks the three, in the order of the receive threshold, the transmit
+/// threshold and the timeout.
+public func check_uart_thresholds(rx_full: UInt32, tx_empty: UInt32,
+                                  rx_timeout_bits: UInt32) -> Result<Void, ConfigError> {
+    try check_rx_full(rx_full)
+    try check_tx_empty(tx_empty)
+    try check_rx_timeout(rx_timeout_bits)
+    return
+}
+
+/// What a driver reaches UART0 through: whole words by register, and the
+/// line's acknowledgement.
+public trait UartPort {
+    /// The word of `reg`, read from the device now. A read of `FIFO` pops
+    /// the receiver, so a read is not a `&self` operation.
+    func read_word(&var self, reg: UartRegister) -> UInt32
+    /// Writes `word` to `reg`.
+    func write_word(&var self, reg: UartRegister, word: UInt32)
+    /// Acknowledges the line; false when it was refused.
+    func acknowledge(&var self) -> Bool
+}
+
+/// Brings the receiver up through `port`, after `check_uart_thresholds` has
+/// passed the three values, and writes nothing if it refuses them. The
+/// receive interrupts' raw bits are cleared first, then the timeout's length
+/// (`MEM_CONF`) and the thresholds with the timeout's enable (`CONF1`) are
+/// set, then those interrupts are enabled, so a bit that bytes left in the
+/// FIFO raise while it is configured is not erased. The divisor and the
+/// clock are not touched, and neither is the transmit interrupt, which
+/// `uart_set_tx_interrupt` turns on.
+///
+/// `MEM_CONF` and `CONF1` are read-modify-write, so every bit of either the
+/// part leaves set is kept (the FIFO's size in `MEM_CONF` among them);
+/// `INT_ENA` is the driver's whole, written as `uart_int_ena_word` says. The
+/// FIFOs are not reset, so bytes the console stored or the terminal sent
+/// before the driver started are delivered.
+public func start_uart<P: UartPort>(port: &var P, rx_full: UInt32, tx_empty: UInt32,
+                                    rx_timeout_bits: UInt32) -> Result<Void, ConfigError> {
+    try check_uart_thresholds(rx_full, tx_empty, rx_timeout_bits)
+    port.write_word(uart_int_clr(), INT_RX)
+    let mem = port.read_word(uart_mem_conf())
+    port.write_word(uart_mem_conf(), uart_mem_conf_word(mem, rx_timeout_bits))
+    let conf1 = port.read_word(uart_conf1())
+    port.write_word(uart_conf1(), uart_conf1_word(conf1, rx_full, tx_empty))
+    port.write_word(uart_int_ena(), uart_int_ena_word(false))
+    return
+}
+
+/// Where a service puts the bytes it pops from the receiver.
+public trait RxSink {
+    func put(&var self, b: UInt8)
+}
+
+/// What one receive service found: the interrupts it saw (`INT_ST`'s
+/// receive bits) and how many bytes it popped.
+public struct RxServiced {
+    status: UInt32
+    popped: UInt32
+}
+
+extension RxServiced {
+    /// Whether the service saw any receive interrupt.
+    public func any(&self) -> Bool { self.status != 0 }
+    /// Whether the receive FIFO overflowed.
+    public func overflowed(&self) -> Bool { (self.status & INT_RXFIFO_OVF) != 0 }
+    /// Whether a parity error was seen.
+    public func parity(&self) -> Bool { (self.status & INT_PARITY_ERR) != 0 }
+    /// Whether a frame error was seen.
+    public func frame(&self) -> Bool { (self.status & INT_FRM_ERR) != 0 }
+    /// Whether a break was seen.
+    public func broke(&self) -> Bool { (self.status & INT_BRK_DET) != 0 }
+}
+
+/// The interrupts that are events, raised once for each thing that
+/// happened: a byte's damage and an overflow. A level (`INT_RXFIFO_FULL`,
+/// `INT_RXFIFO_TOUT`) is raised by a condition and is only ever "look".
+static INT_RX_EVENTS: UInt32 = INT_PARITY_ERR | INT_FRM_ERR | INT_RXFIFO_OVF | INT_BRK_DET
+
+/// Pops `STATUS`'s receive count of bytes into `sink`, and reads the count
+/// again until it is 0, so a byte that arrives meanwhile is taken too.
+/// Answers how many.
+func drain_rx<P: UartPort, S: RxSink>(port: &var P, sink: &var S) -> UInt32 {
+    var popped: UInt32 = 0
+    var left = uart_rxfifo_cnt(port.read_word(uart_status()))
+    while left > 0 {
+        var i: UInt32 = 0
+        while i < left {
+            sink.put((port.read_word(uart_fifo()) & 0xFF) as UInt8)
+            i = i + 1
+        }
+        popped = popped + left
+        left = uart_rxfifo_cnt(port.read_word(uart_status()))
+    }
+    popped
+}
+
+/// The receive half of the interrupt service, through `port`: read `INT_ST`;
+/// for any receive interrupt, in this order:
+///
+///   - store to `INT_CLR` the events it showed, before any byte is popped,
+///     so an event that rises while draining stays raised and fires again,
+///     and is never erased by a clear that came after it;
+///   - drain the receiver to 0 (`drain_rx`);
+///   - store to `INT_CLR` the levels it showed (`FULL`, `TOUT`), now that
+///     the FIFO is below them, and drain once more into the same batch, for
+///     the byte that arrived before the clear and that no later level would
+///     report.
+///
+/// No bit it did not see is stored, and a clear whose set is empty is not
+/// stored. A bit that rises after the `INT_ST` read is left for the next
+/// service.
+///
+/// A timeout may be seen with the FIFO empty, which pops nothing. A service
+/// that sees no receive interrupt touches no register but `INT_ST`. The
+/// acknowledgement is the caller's, after every register access of the whole
+/// service.
+public func service_rx<P: UartPort, S: RxSink>(port: &var P, sink: &var S) -> RxServiced {
+    let status = port.read_word(uart_int_st()) & INT_RX
+    if status == 0 {
+        return RxServiced(status: 0, popped: 0)
+    }
+    let events = status & INT_RX_EVENTS
+    if events != 0 {
+        port.write_word(uart_int_clr(), events)
+    }
+    var popped = drain_rx(&var port, &var sink)
+    let levels = status & ~INT_RX_EVENTS
+    if levels != 0 {
+        port.write_word(uart_int_clr(), levels)
+        popped = popped + drain_rx(&var port, &var sink)
+    }
+    RxServiced(status: status, popped: popped)
+}
+
+/// Where a fill takes the bytes it stores to the transmitter.
+public trait TxSource {
+    /// How many bytes are waiting.
+    func available(&self) -> UInt32
+    /// The next byte; the caller asks `available` first.
+    func take(&var self) -> UInt8
+}
+
+/// Stores bytes from `source` to the transmit FIFO through `port`: as many as
+/// the FIFO has room for by one read of `STATUS`, at most `cap`, at most
+/// what `source` has. Answers how many it stored.
+///
+/// Each store is a whole-word write, and nothing reads `FIFO`, which would pop
+/// the receiver. With the count read once the fill cannot overfill, because
+/// nothing else stores to the FIFO while a driver serves it.
+///
+/// `INT_TXFIFO_EMPTY`'s raw bit stays set from the FIFO's last low level
+/// until it is cleared, whatever a fill has stored since. A caller that
+/// still has bytes to send re-arms with `uart_set_tx_interrupt` after every
+/// fill, which clears it now that the FIFO is full again, so the line rises
+/// at the next crossing and not at once.
+public func fill_tx<P: UartPort, S: TxSource>(port: &var P, source: &var S,
+                                              cap: UInt32) -> UInt32 {
+    let held = uart_txfifo_cnt(port.read_word(uart_status()))
+    var room: UInt32 = 0
+    if held < UART_FIFO_BYTES {
+        room = UART_FIFO_BYTES - held
+    }
+    var n = source.available()
+    if n > room { n = room }
+    if n > cap { n = cap }
+    var i: UInt32 = 0
+    while i < n {
+        port.write_word(uart_fifo(), source.take() as UInt32)
+        i = i + 1
+    }
+    n
+}
+
+/// Turns the transmit interrupt on or off through `port`. On: its raw bit
+/// cleared first, so the line rises only for the FIFO's level from now, then
+/// enabled. Off: dropped from `INT_ENA` alone.
+public func uart_set_tx_interrupt<P: UartPort>(port: &var P, on: Bool) {
+    if on {
+        port.write_word(uart_int_clr(), INT_TXFIFO_EMPTY)
+    }
+    port.write_word(uart_int_ena(), uart_int_ena_word(on))
+}
+
+/// Sets the transmit threshold through `port`, every other bit of `CONF1`
+/// kept, and writes nothing if `check_tx_empty` refuses the value.
+public func uart_set_tx_threshold<P: UartPort>(port: &var P,
+                                               tx_empty: UInt32) -> Result<Void, ConfigError> {
+    try check_tx_empty(tx_empty)
+    let conf1 = port.read_word(uart_conf1())
+    port.write_word(uart_conf1(), uart_conf1_tx_empty(conf1, tx_empty))
+    return
 }

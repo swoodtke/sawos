@@ -1,0 +1,454 @@
+// UART0's words and the order of its starts and services, through a fake port
+// that keeps the receive FIFO's bytes, counts what the transmit FIFO holds
+// and records every access, the acknowledgement included.
+
+import esp32s3io.{
+    ConfigError, INT_BRK_DET, INT_FRM_ERR, INT_PARITY_ERR, INT_RX, INT_RXFIFO_FULL,
+    INT_RXFIFO_OVF, INT_RXFIFO_TOUT, INT_TXFIFO_EMPTY, RxSink, TxSource, UART0_BASE,
+    UartPort, UartRegister, check_uart_thresholds, fill_tx, service_rx, start_uart,
+    uart_conf1, uart_conf1_tx_empty, uart_conf1_word, uart_fifo, uart_int_clr,
+    uart_int_ena, uart_int_ena_word, uart_int_st, uart_mem_conf, uart_mem_conf_word,
+    uart_rxfifo_cnt, uart_set_tx_interrupt, uart_set_tx_threshold, uart_status,
+    uart_txfifo_cnt, UART0_SOURCE, check_rx_full, check_rx_timeout, check_tx_empty,
+}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func hex(v: UInt32) -> String {
+    var out = "0x"
+    var shift: UInt32 = 32
+    while shift > 0 {
+        shift = shift - 4
+        let d = ((v >> shift) & 0xF) as Int
+        out = "{out}{"0123456789abcdef".substring(d, d + 1)}"
+    }
+    out
+}
+
+func expect(what: String, got: String, want: Vector<String>) {
+    let w = want.join("\n")
+    if not got.equals(w) {
+        print("{what}, expected:\n{w}\ngot:\n{got}")
+    }
+    assert(got.equals(w), what)
+}
+
+// A UART whose registers are what a test sets. A read of `FIFO` pops `rx`,
+// `STATUS` reports `rx`'s length and `tx_held`, and `more` is a byte that
+// lands in the receiver, raising `more_bits`, at the first `STATUS` read after
+// a `FIFO` read, as one does while a service drains. `after_clear` is the same
+// at the store to `INT_CLR` that follows it, after the clear has taken effect.
+// `raw` is the raw interrupt bits, which `INT_ST` shows and `INT_CLR` clears;
+// a `FIFO` read returns bits above the byte, as the register's reserved bits
+// may. Every access is a line of `log`.
+struct Fake {
+    log: Vector<String>
+    rx: Vector<UInt8>
+    rx_at: Int
+    more: UInt8?
+    more_bits: UInt32
+    after_clear: UInt8?
+    after_clear_bits: UInt32
+    raw: UInt32
+    conf1: UInt32
+    mem_conf: UInt32
+    tx_held: UInt32
+    popped: Bool
+}
+
+extension Fake: NoCopy {}
+
+extension Fake {
+    static func fresh() -> Fake {
+        Fake(log: Vector<String>(), rx: Vector<UInt8>(), rx_at: 0, more: None,
+             more_bits: 0, after_clear: None, after_clear_bits: 0, raw: 0, conf1: 0, mem_conf: 0, tx_held: 0, popped: false)
+    }
+
+    func lines(&self) -> String {
+        self.log.join("\n")
+    }
+}
+
+extension Fake: UartPort {
+    func read_word(&var self, reg: UartRegister) -> UInt32 {
+        try! self.log.push("read {hex(reg.address())}")
+        if reg == uart_int_st() { return self.raw }
+        if reg == uart_conf1() { return self.conf1 }
+        if reg == uart_mem_conf() { return self.mem_conf }
+        if reg == uart_status() {
+            if self.popped {
+                self.popped = false
+                if let b = self.more {
+                    try! self.rx.push(b)
+                    self.raw = self.raw | self.more_bits
+                    self.more = None
+                }
+            }
+            let waiting = (self.rx.len() - self.rx_at) as UInt32
+            return waiting | (self.tx_held << 16)
+        }
+        if reg == uart_fifo() {
+            // A pop of an empty receiver, or any read of `FIFO` in a fill,
+            // is a bug the test names.
+            assert(self.rx_at < self.rx.len(), "a FIFO read with the receiver empty")
+            let b = self.rx.get(self.rx_at)!
+            self.rx_at = self.rx_at + 1
+            self.popped = true
+            return (b as UInt32) | 0xA500
+        }
+        assert(false, "a register the fake does not model")
+        0
+    }
+
+    func write_word(&var self, reg: UartRegister, word: UInt32) {
+        try! self.log.push("write {hex(reg.address())} <- {hex(word)}")
+        if reg == uart_conf1() { self.conf1 = word }
+        if reg == uart_mem_conf() { self.mem_conf = word }
+        if reg == uart_int_clr() {
+            self.raw = self.raw & ~word
+            if let b = self.after_clear {
+                try! self.rx.push(b)
+                self.raw = self.raw | self.after_clear_bits
+                self.after_clear = None
+            }
+        }
+    }
+
+    func acknowledge(&var self) -> Bool {
+        try! self.log.push("ack")
+        true
+    }
+}
+
+struct Collect {
+    bytes: Vector<UInt8>
+}
+
+extension Collect: NoCopy {}
+
+extension Collect: RxSink {
+    func put(&var self, b: UInt8) {
+        try! self.bytes.push(b)
+    }
+}
+
+struct Queue {
+    data: Vector<UInt8>
+    at: Int
+}
+
+extension Queue: NoCopy {}
+
+extension Queue: TxSource {
+    func available(&self) -> UInt32 {
+        (self.data.len() - self.at) as UInt32
+    }
+
+    func take(&var self) -> UInt8 {
+        let b = self.data.get(self.at)!
+        self.at = self.at + 1
+        b
+    }
+}
+
+func queue_of(n: Int) -> Queue {
+    var q = Queue(data: Vector<UInt8>(), at: 0)
+    var i = 0
+    while i < n {
+        try! q.data.push((0x40 + i) as UInt8)
+        i = i + 1
+    }
+    move q
+}
+
+func accepted(r: Result<Void, ConfigError>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+func refused(r: Result<Void, ConfigError>, want: ConfigError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func main() {
+    // Addresses: each register's offset in UART0's page.
+    check(UART0_BASE == 0x6000_0000, "UART0 is at 0x6000_0000")
+    check(UART0_SOURCE == 27, "UART0 raises matrix source 27")
+    check(uart_fifo().address() == 0x6000_0000, "FIFO")
+    check(uart_int_st().address() == 0x6000_0008, "INT_ST")
+    check(uart_int_ena().address() == 0x6000_000C, "INT_ENA")
+    check(uart_int_clr().address() == 0x6000_0010, "INT_CLR")
+    check(uart_status().address() == 0x6000_001C, "STATUS")
+    check(uart_conf1().address() == 0x6000_0024, "CONF1")
+    check(uart_mem_conf().address() == 0x6000_0060, "MEM_CONF")
+
+    // The interrupt bits, and the set a driver takes for the receiver.
+    check(INT_RXFIFO_FULL == 0x001 && INT_TXFIFO_EMPTY == 0x002, "FULL and EMPTY")
+    check(INT_PARITY_ERR == 0x004 && INT_FRM_ERR == 0x008, "parity and frame")
+    check(INT_RXFIFO_OVF == 0x010 && INT_BRK_DET == 0x080, "overflow and break")
+    check(INT_RXFIFO_TOUT == 0x100, "timeout")
+    check(INT_RX == 0x19D, "the receive set is those but the transmitter's")
+    check(uart_int_ena_word(false) == 0x19D, "INT_ENA, receiving")
+    check(uart_int_ena_word(true) == 0x19F, "INT_ENA, receiving and transmitting")
+
+    // STATUS's two counts.
+    check(uart_rxfifo_cnt(0x0123_0045) == 0x045, "the receive count is bits 9:0")
+    check(uart_txfifo_cnt(0x0123_0045) == 0x123, "the transmit count is bits 25:16")
+    check(uart_rxfifo_cnt(0xFFFF_FFFF) == 0x3FF && uart_txfifo_cnt(0xFFFF_FFFF) == 0x3FF,
+          "each count is ten bits")
+
+    // CONF1 and MEM_CONF: the fields set, every other bit kept.
+    check(uart_conf1_word(0x4020_FFFF, 64, 32) == 0x40A0_8040,
+          "CONF1: the thresholds, the timeout enable, other bits kept")
+    check(uart_conf1_word(0, 127, 128) == 0x0082_007F, "CONF1 at the thresholds' ends")
+    check(uart_conf1_tx_empty(0x40A0_8040, 5) == 0x40A0_1440, "CONF1: the transmit threshold alone")
+    check(uart_mem_conf_word(0x1800_0001, 30) == 0x183C_0001,
+          "MEM_CONF: the timeout, other bits kept")
+    check(uart_mem_conf_word(0x07FE_0000, 1) == 0x0002_0000, "MEM_CONF replaces the old timeout")
+    // From all-ones, every bit a field does not own survives: any mask that
+    // reaches past its field clears one.
+    check(uart_conf1_word(0xFFFF_FFFF, 64, 32) == 0xFFF0_8040,
+          "CONF1 from all ones: only the two fields change")
+    check(uart_conf1_tx_empty(0xFFFF_FFFF, 5) == 0xFFF0_17FF,
+          "CONF1's transmit threshold from all ones")
+    check(uart_mem_conf_word(0xFFFF_FFFF, 30) == 0xF83D_FFFF,
+          "MEM_CONF from all ones: only the timeout changes")
+    // A value past its field never reaches a neighbour: DIS_RX_DAT_OVF
+    // (CONF1 bit 20), the transmit field, MEM_FORCE_PD (MEM_CONF bit 27).
+    check(uart_conf1_word(0, 0xFFFF_FFFF, 0) == 0x0080_03FF, "an oversized receive threshold")
+    check(uart_conf1_word(0, 0, 0xFFFF_FFFF) == 0x008F_FC00, "an oversized transmit threshold")
+    check(uart_conf1_tx_empty(0, 0xFFFF_FFFF) == 0x000F_FC00, "an oversized transmit-only threshold")
+    check(uart_mem_conf_word(0, 0xFFFF_FFFF) == 0x07FE_0000, "an oversized timeout")
+
+    // The thresholds the driver accepts.
+    check(accepted(check_uart_thresholds(64, 32, 30)), "the default thresholds")
+    check(accepted(check_uart_thresholds(1, 1, 1)) && accepted(check_uart_thresholds(127, 128, 1023)),
+          "the thresholds' ends")
+    check(refused(check_uart_thresholds(0, 32, 30), ConfigError.RxFullThreshold(0)), "receive 0")
+    check(refused(check_uart_thresholds(128, 32, 30), ConfigError.RxFullThreshold(128)),
+          "receive 128")
+    check(refused(check_uart_thresholds(64, 0, 30), ConfigError.TxEmptyThreshold(0)), "transmit 0")
+    check(refused(check_uart_thresholds(64, 129, 30), ConfigError.TxEmptyThreshold(129)),
+          "transmit 129")
+    check(refused(check_uart_thresholds(64, 32, 0), ConfigError.RxTimeout(0)), "timeout 0")
+    check(refused(check_uart_thresholds(64, 32, 1024), ConfigError.RxTimeout(1024)), "timeout 1024")
+    check(refused(check_rx_full(0), ConfigError.RxFullThreshold(0)) && accepted(check_rx_full(1)),
+          "check_rx_full")
+    check(refused(check_tx_empty(0), ConfigError.TxEmptyThreshold(0)) && accepted(check_tx_empty(128)),
+          "check_tx_empty")
+    check(refused(check_rx_timeout(0), ConfigError.RxTimeout(0)) && accepted(check_rx_timeout(1023)),
+          "check_rx_timeout")
+
+    check(ConfigError.RxFullThreshold(0).describe().equals("the receive threshold 0 is not 1..127"),
+          "the receive threshold's refusal prints")
+    check(ConfigError.TxEmptyThreshold(129).describe().equals("the transmit threshold 129 is not 1..128"),
+          "the transmit threshold's refusal prints")
+    check(ConfigError.RxTimeout(0).describe().equals("the receive timeout 0 is not 1..1023 bit times"),
+          "the timeout's refusal prints")
+
+    // The bring-up: the receive bits cleared first, then MEM_CONF, then CONF1
+    // (each read-modify-write), then INT_ENA whole.
+    var up = Fake.fresh()
+    up.conf1 = 0x4020_FFFF
+    up.mem_conf = 0x1800_0001
+    check(accepted(start_uart(&var up, 64, 32, 30)), "start_uart accepts the defaults")
+    expect("start_uart", up.lines(), [
+        "write 0x60000010 <- 0x0000019d",   // INT_CLR, the receive bits
+        "read 0x60000060",
+        "write 0x60000060 <- 0x183c0001",   // MEM_CONF
+        "read 0x60000024",
+        "write 0x60000024 <- 0x40a08040",   // CONF1
+        "write 0x6000000c <- 0x0000019d",   // INT_ENA, the receive bits
+    ])
+    // From all-ones registers, only the fields change.
+    var ones = Fake.fresh()
+    ones.conf1 = 0xFFFF_FFFF
+    ones.mem_conf = 0xFFFF_FFFF
+    check(accepted(start_uart(&var ones, 64, 32, 30)), "start_uart from all ones")
+    check(ones.conf1 == 0xFFF0_8040 && ones.mem_conf == 0xF83D_FFFF,
+          "start_uart keeps every bit it does not own")
+    // A refusal writes nothing and reads nothing.
+    var no = Fake.fresh()
+    check(refused(start_uart(&var no, 0, 32, 30), ConfigError.RxFullThreshold(0)), "receive 0")
+    check(refused(start_uart(&var no, 64, 129, 30), ConfigError.TxEmptyThreshold(129)),
+          "transmit 129")
+    check(refused(start_uart(&var no, 64, 32, 0), ConfigError.RxTimeout(0)), "timeout 0")
+    check(no.log.len() == 0, "a refused start touches no register")
+
+    // A receive service: INT_ST, the events cleared, the bytes, the count
+    // again for a byte that landed meanwhile, then the levels cleared and a
+    // last drain.
+    var rx = Fake.fresh()
+    rx.raw = INT_RXFIFO_FULL | INT_RXFIFO_TOUT
+    try! rx.rx.push(1)
+    try! rx.rx.push(2)
+    try! rx.rx.push(3)
+    rx.more = 4
+    var got = Collect(bytes: Vector<UInt8>())
+    let done = service_rx(&var rx, &var got)
+    expect("service_rx", rx.lines(), [
+        "read 0x60000008",                  // INT_ST
+        "read 0x6000001c",                  // STATUS: 3
+        "read 0x60000000",
+        "read 0x60000000",
+        "read 0x60000000",
+        "read 0x6000001c",                  // STATUS: 1, a byte arrived
+        "read 0x60000000",
+        "read 0x6000001c",                  // STATUS: 0
+        "write 0x60000010 <- 0x00000101",   // INT_CLR, FULL and TOUT
+        "read 0x6000001c",                  // STATUS: 0 again
+    ])
+    check(got.bytes.len() == 4 && got.bytes.get(0)! == 1 && got.bytes.get(3)! == 4,
+          "the bytes, in order, and only their low eight bits")
+    check(done.popped == 4 && done.any() && not done.overflowed() && not done.parity()
+          && not done.frame() && not done.broke(), "what the service found")
+
+    // A byte and its error landing as the level clear is stored: the byte is
+    // in this batch, the error bit is still raised for the next service.
+    var late = Fake.fresh()
+    late.raw = INT_RXFIFO_FULL
+    try! late.rx.push(1)
+    late.after_clear = 9
+    late.after_clear_bits = INT_FRM_ERR
+    var late_got = Collect(bytes: Vector<UInt8>())
+    let late_done = service_rx(&var late, &var late_got)
+    check(late_got.bytes.len() == 2 && late_got.bytes.get(1)! == 9 && late_done.popped == 2,
+          "a byte that lands at the clear is in the same batch")
+    check((late.raw & INT_FRM_ERR) != 0, "an error that lands at the clear stays raised")
+    check(not late_done.frame(), "and is not reported by this service")
+
+    // An error landing while the service drains is not erased by its clear:
+    // the events were cleared before the drain, the levels' clear is only
+    // the levels.
+    var meanwhile = Fake.fresh()
+    meanwhile.raw = INT_PARITY_ERR | INT_RXFIFO_FULL
+    try! meanwhile.rx.push(1)
+    meanwhile.more = 2
+    meanwhile.more_bits = INT_PARITY_ERR
+    var m_got = Collect(bytes: Vector<UInt8>())
+    let m_done = service_rx(&var meanwhile, &var m_got)
+    check(m_got.bytes.len() == 2 && m_done.parity(), "both bytes, the first error reported")
+    check((meanwhile.raw & INT_PARITY_ERR) != 0, "a second error landing in the drain stays raised")
+    expect("service_rx, error then level", meanwhile.lines(), [
+        "read 0x60000008",
+        "write 0x60000010 <- 0x00000004",   // INT_CLR, the event, before any pop
+        "read 0x6000001c",
+        "read 0x60000000",
+        "read 0x6000001c",
+        "read 0x60000000",
+        "read 0x6000001c",
+        "write 0x60000010 <- 0x00000001",   // INT_CLR, the level
+        "read 0x6000001c",
+    ])
+
+    // Errors with the FIFO empty: each is seen and cleared, the transmit
+    // bit, which is not the receiver's, is neither cleared nor reported.
+    var bad = Fake.fresh()
+    bad.raw = INT_PARITY_ERR | INT_FRM_ERR | INT_RXFIFO_OVF | INT_BRK_DET | INT_TXFIFO_EMPTY
+    var none = Collect(bytes: Vector<UInt8>())
+    let found = service_rx(&var bad, &var none)
+    expect("service_rx, errors", bad.lines(), [
+        "read 0x60000008",
+        "write 0x60000010 <- 0x0000009c",
+        "read 0x6000001c",
+    ])
+    check(found.popped == 0 && found.overflowed() && found.parity() && found.frame()
+          && found.broke(), "each error seen")
+    check(bad.raw == INT_TXFIFO_EMPTY, "only the receive bits were cleared")
+    var one = Fake.fresh()
+    one.raw = INT_FRM_ERR
+    let alone = service_rx(&var one, &var none)
+    check(alone.frame() && not alone.parity() && not alone.broke() && not alone.overflowed(),
+          "only the frame error seen")
+
+    // A timeout with nothing in the FIFO pops nothing and is cleared.
+    var tout = Fake.fresh()
+    tout.raw = INT_RXFIFO_TOUT
+    let empty = service_rx(&var tout, &var none)
+    expect("service_rx, timeout", tout.lines(), [
+        "read 0x60000008",
+        "read 0x6000001c",
+        "write 0x60000010 <- 0x00000100",
+        "read 0x6000001c",
+    ])
+    check(empty.popped == 0 && empty.any(), "a timeout with no byte")
+
+    // No receive interrupt: INT_ST alone is read, and nothing written.
+    var quiet = Fake.fresh()
+    quiet.raw = INT_TXFIFO_EMPTY
+    let nothing = service_rx(&var quiet, &var none)
+    expect("service_rx, transmit only", quiet.lines(), ["read 0x60000008"])
+    check(not nothing.any(), "no receive interrupt")
+
+    // A fill stores what the one STATUS read says fits, whole-word stores to
+    // FIFO, in order, and never reads FIFO.
+    var tx = Fake.fresh()
+    tx.tx_held = 100
+    var q = queue_of(50)
+    let n = fill_tx(&var tx, &var q, 128)
+    check(n == 28 && q.at == 28, "28 fit beside 100")
+    check(tx.log.len() == 29 && tx.log.get(0)!.equals("read 0x6000001c")
+          && tx.log.get(1)!.equals("write 0x60000000 <- 0x00000040")
+          && tx.log.get(28)!.equals("write 0x60000000 <- 0x0000005b"),
+          "one STATUS read, then the stores in order")
+    var capped = Fake.fresh()
+    var q2 = queue_of(50)
+    check(fill_tx(&var capped, &var q2, 10) == 10 && q2.at == 10, "the cap holds")
+    var short = Fake.fresh()
+    var q3 = queue_of(5)
+    check(fill_tx(&var short, &var q3, 128) == 5 && short.log.len() == 6,
+          "a source with less than the room")
+    var full = Fake.fresh()
+    full.tx_held = 128
+    var q4 = queue_of(5)
+    check(fill_tx(&var full, &var q4, 128) == 0 && q4.at == 0 && full.log.len() == 1,
+          "a full FIFO takes nothing")
+
+    // The transmit interrupt and threshold.
+    var on = Fake.fresh()
+    uart_set_tx_interrupt(&var on, true)
+    expect("tx on", on.lines(), [
+        "write 0x60000010 <- 0x00000002",
+        "write 0x6000000c <- 0x0000019f",
+    ])
+    var off = Fake.fresh()
+    uart_set_tx_interrupt(&var off, false)
+    expect("tx off", off.lines(), ["write 0x6000000c <- 0x0000019d"])
+    var thr = Fake.fresh()
+    thr.conf1 = 0x40A0_8040
+    check(accepted(uart_set_tx_threshold(&var thr, 5)), "a threshold in range")
+    expect("tx threshold", thr.lines(), [
+        "read 0x60000024",
+        "write 0x60000024 <- 0x40a01440",
+    ])
+    var bad_thr = Fake.fresh()
+    check(refused(uart_set_tx_threshold(&var bad_thr, 0), ConfigError.TxEmptyThreshold(0)),
+          "a threshold of 0")
+    check(refused(uart_set_tx_threshold(&var bad_thr, 129), ConfigError.TxEmptyThreshold(129)),
+          "a threshold of 129")
+    check(bad_thr.log.len() == 0, "a refused threshold touches no register")
+
+    // TXFIFO_EMPTY's raw bit stays set through a refill; the re-arm after the
+    // fill clears it, and the clear comes after the stores.
+    var refill = Fake.fresh()
+    refill.raw = INT_TXFIFO_EMPTY
+    var q5 = queue_of(40)
+    check(fill_tx(&var refill, &var q5, 128) == 40, "the refill")
+    check((refill.raw & INT_TXFIFO_EMPTY) != 0, "the raw bit survives the refill")
+    uart_set_tx_interrupt(&var refill, true)
+    check((refill.raw & INT_TXFIFO_EMPTY) == 0, "the re-arm clears it")
+    check(refill.log.len() == 43 && refill.log.get(40)!.equals("write 0x60000000 <- 0x00000067")
+          && refill.log.get(41)!.equals("write 0x60000010 <- 0x00000002")
+          && refill.log.get(42)!.equals("write 0x6000000c <- 0x0000019f"),
+          "the stores, then the clear, then the enable")
+}
