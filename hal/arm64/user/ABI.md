@@ -157,7 +157,10 @@ The window is authorized by the board: this HAL publishes one
 (`DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`), and that pair is what the build
 mirrors when it emits the device row a driver obtains. `device_window_ok` is the
 same rule as a runtime predicate, checked at `carve` and at `map`, because a
-caller chooses the bounds. A device window is a handle derived from a device
+caller chooses the bounds. A page is grantable in the 2 MiB block holding
+the console and in the 2 MiB block holding the virtio-mmio transports
+(0x0A00_0000), and nowhere else; a window that runs from one block into the
+other is refused. A device window is a handle derived from a device
 pool root, installed by an op and revoked by unmapping the Mapping (spec §2.5).
 
 **The console handover protocol** applies to whoever holds the console's

@@ -1,0 +1,157 @@
+// Launcher for two children of one program, one after the other, on arm64.
+//
+// The first child is given a virtio-mmio window, maps it and then reads a page
+// it was not granted. The second is created after the first has died and is
+// given nothing, so the kernel gives it the first's body, and so its
+// translation set, and it reads the page the first had mapped. Both reads
+// must fault (`child-window-probe`).
+//
+// The boot set is the rows' order: the two images, the two destinations, then
+// the window.
+
+import sos.{System, Process, Memory, IoMemory, BootHandle, Waiter, WaitResult,
+            WaitPayload, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY: UInt = 66
+static TAG_BOOT: UInt = 31
+static TAG_WINDOW: UInt = 32
+
+/// What a child may ask of its System: print and learn its own Process, and
+/// `Transfer`, which `give` checks on the System it moves.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this launcher attached only a Process"),
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS setreuse: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var image_a = try proc.boot_handle_next() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var image_b = try proc.boot_handle_next() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_a = try proc.boot_handle_next() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_b = try proc.boot_handle_next() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var device = try proc.boot_handle_next() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_a_mem = image_a.take_memory() else {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_b_mem = image_b.take_memory() else {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_a_mem = dest_a.take_memory() else {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_b_mem = dest_b.take_memory() else {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let window = device.take_iomemory() else {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The first child: the window, a masked System, and a wait on its death.
+    let first = try system.process_create(image: &image_a_mem,
+                                          memory: &dest_a_mem) catch {
+        print("SOS setreuse: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &first, key: KEY) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let for_first = try system.mint(rights: CHILD_SYSTEM) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try first.give(system: move for_first, tag: TAG_BOOT) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try first.give(iomemory: move window, tag: TAG_WINDOW) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try first.start(boot_tag: TAG_BOOT) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let first_record = try waiter.wait() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS setreuse: the window holder ended status={}\n",
+          status_of(&first_record))
+    try waiter.remove(KEY) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The second child, made once the first is gone: the same program, with
+    // no window.
+    let second = try system.process_create(image: &image_b_mem,
+                                           memory: &dest_b_mem) catch {
+        print("SOS setreuse: second create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &second, key: KEY) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let for_second = try system.mint(rights: CHILD_SYSTEM) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try second.give(system: move for_second, tag: TAG_BOOT) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try second.start(boot_tag: TAG_BOOT) catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let second_record = try waiter.wait() catch {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS setreuse: the next process ended status={}\n",
+          status_of(&second_record))
+    print("SOS setreuse: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

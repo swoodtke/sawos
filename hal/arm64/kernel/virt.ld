@@ -31,8 +31,9 @@
  * ---------------------------------------------------------------------------
  * EL0 is default-deny: the translation tables give EL0 nothing until a grant
  * says otherwise. Kernel code and data and the GIC are never granted. The
- * UART's page is the board's one device window: a process reaches it only once
- * it is granted, normally by mapping an `IoMemory` for it. The kernel's own
+ * device pages of the console's 2 MiB block and of the virtio-mmio transports'
+ * block are the board's device windows: a process reaches a page only once it
+ * is granted, normally by mapping an `IoMemory` for it. The kernel's own
  * pages are EL1 read/write/execute.
  *
  * The grant window is the first 4 MiB of RAM at page granularity. It has to

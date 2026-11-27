@@ -1,0 +1,63 @@
+// Test child: reads device pages, on arm64.
+//
+// The board's two device blocks have one level-3 table each in a process's
+// translation set. With a window given, this child maps the transport page
+// (0x0A00_3000, index 3 of the transports' block) and reads it, then reads
+// the console block's page at the same index (0x0900_3000), which it was
+// never granted: a table shared between the blocks would let that read
+// through. With nothing given, it reads the transport page unmapped: a set
+// that kept the last occupant's grant would let it through.
+//
+// A read that is refused ends this process with a fault; a read that is let
+// through prints the line saying so and the child exits.
+
+import sos.{System}
+
+/// The transport page a window is granted for, and the page at the same index
+/// of the console's block.
+static TRANSPORT_PAGE: UInt = 0x0A00_3000
+static OTHER_BLOCK_PAGE: UInt = 0x0900_3000
+
+static EXIT_FAILED: UInt = 1
+
+/// A register block of one word, read at its own width.
+struct Word {
+    value: ReadOnly<UInt32>,
+}
+
+func read_word(at: UInt) unsafe -> UInt32 {
+    let regs = UnsafeMemory<Word, Device>(at)
+    regs.value.read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var record = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS winprobe: no window, reading the page\n")
+        let _ = read_word(TRANSPORT_PAGE)
+        let _ = system.debug_print("SOS winprobe: the page was readable\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS winprobe: boot record is not a window\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _mapping = try proc.map(iomemory: &window) catch {
+        print("SOS winprobe: map failed: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let magic = read_word(TRANSPORT_PAGE)
+    print("SOS winprobe: granted page magic={}\n", magic)
+    let _ = system.debug_print("SOS winprobe: reading the other block's page\n")
+    let _ = read_word(OTHER_BLOCK_PAGE)
+    let _ = system.debug_print("SOS winprobe: the other block's page was readable\n")
+    let _ = proc.exit(EXIT_FAILED)
+}

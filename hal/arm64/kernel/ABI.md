@@ -43,7 +43,7 @@ kernel reads a HAL number rather than a shared constant:
 | `GRANT_ROW_BUDGET: UInt` | **A policy cap, not a hardware one.** There are no numbered regions to run out of — a grant is a walk of page descriptors — so what bounds a domain is the kernel's fixed-size grant record, whose length (`MAX_GRANT_ROWS`, here equal to it) this HAL states beside it. On Profile A the same name is the physical wall. The target's `Mapping` quota is clamped to its free rows, so a `map()` meeting either answers `QuotaExceeded` and the budget test behind it is a kernel stop; the difference is what a change that raises it would have to touch. |
 | `map_target_ok(base, top) -> Bool` | **The 4 MiB grant window, asked rather than died in.** `prot_region` already enforces this bound by stopping the machine (`grant_outside_window`) — correct for root's image, placed at boot from HAL constants, where a memory map that outgrew the window is a kernel bug, and wrong for a range a process chose. The kernel asks the predicate first and answers with a status: `NoResource` for a map, whose address the kernel chose, and `BadImage` for a create whose destination, linked at `USER_IMAGE_BASE`, would reach past the window. The HAL's kernel-bug stop stays for the boot path. Page alignment of `base` is not required: the walk rounds down to the page it starts in, exactly as it does for a segment. |
 | `map_source_ok(base, top) -> Bool` | **The other half of the question above.** `map_target_ok` asks about the range that indexes the level-3 table (the input, which must fit the 4 MiB window); this asks about the frames a descriptor's output address names (which must be RAM the linear map covers, `RAM_LEN`). On both riscv32 boards the two have the same body — where a user address is its physical address there is only one question — and that identity is the tier split visible in a single file. |
-| `device_window_ok(base, len) -> Bool` | Whole pages, both ends, inside the one device window this board publishes a level-3 table for. Profile A's rule differs in form (a naturally-aligned power of two, because a window there is one protection entry) and is identical in purpose, which is what makes the predicate per-HAL rather than a shared check with two branches. |
+| `device_window_ok(base, len) -> Bool` | Whole pages, both ends, inside one of the two device windows (2 MiB blocks: the console's and the virtio-mmio transports') this board publishes a level-3 table for; a window that runs from one block into the next is refused. Profile A's rule differs in form (a naturally-aligned power of two, because a window there is one protection entry) and is identical in purpose, which is what makes the predicate per-HAL rather than a shared check with two branches. |
 
 A second group is where this profile's answers are not the identity:
 placement, expressed as one constant and two functions rather than as a tier
@@ -167,10 +167,10 @@ entered once has no storage a second thread could have.
 - **Granting one page needs page-granular tables.** A block is not a grant
   unit, and handing EL0 a 1 GiB or 2 MiB block holding the console would hand
   over every peripheral beside it. So the device space a process sees is a
-  level-2 table whose one live entry is a level-3 table over the console's
-  2 MiB block, which is the minimum that makes a single register page
-  grantable. The page-table pool is described under the translation layout
-  below.
+  level-2 table whose two live entries are level-3 tables, one over the
+  console's 2 MiB block and one over the virtio-mmio transports' block, which
+  is the minimum that makes a single register page grantable. The page-table
+  pool is described under the translation layout below.
 - **No mode witness.** RISC-V needs `mscratch` (0 in the kernel, the running
   thread's frame in user mode) to tell a syscall from a kernel bug. Here the
   hardware picks a different vector per source EL, so the question is answered
@@ -229,12 +229,13 @@ entered once has no storage a second thread could have.
   `PAGE_TABLES` in `lib.saw`, one region rounded up to a page at run time (a
   Saw static has no alignment attribute), laid out as:
   - `PROT_DOMAIN_SLOTS` per-process table sets, one per process body, each
-    `PT_SET_DESCRIPTORS` long: six tables, namely level 1, level 2 over RAM,
+    `PT_SET_DESCRIPTORS` long: seven tables, namely level 1, level 2 over RAM,
     two level-3 tables (`GRANT_PAGES` pages, the 4 MiB grant window),
-    a device level 2 and a device level 3. Within a set the tables sit at
-    `LEVEL2_OFFSET`, `LEVEL3_OFFSET`, `DEVICE_LEVEL2_OFFSET` and
-    `DEVICE_LEVEL3_OFFSET`. A set is what `TTBR0_EL1` selects, with the body
-    index as the ASID.
+    a device level 2 and two device level 3s, one per device window. Within a
+    set the tables sit at `LEVEL2_OFFSET`, `LEVEL3_OFFSET`,
+    `DEVICE_LEVEL2_OFFSET` and `DEVICE_LEVEL3_OFFSET`, the device level 3s one
+    table apart in the order of `DEVICE_WINDOW_BASES`. A set is what
+    `TTBR0_EL1` selects, with the body index as the ASID.
   - the kernel's linear map, `LINMAP_DESCRIPTORS` long and built once: three
     tables (a level 1, a level 2 over the device gigabyte, a level 2 over
     RAM's gigabyte), with no level 3. `TTBR1_EL1` points at it.
@@ -249,7 +250,8 @@ entered once has no storage a second thread could have.
   | 1 `[0]` | 0x0000_0000, the device space | table -> device level 2 |
   | 1 `[1]` | 0x4000_0000, 1 GiB of RAM | table -> level 2 |
   | 1 rest | everything else in the low half | INVALID — which is what makes `UNMAPPED_PROBE` fault |
-  | device 2 | the block holding the console (`DEVICE_WINDOW_BASE`) | table -> device level 3; every other entry INVALID |
+  | device 2 | the block holding the console and the block of the virtio-mmio transports (`DEVICE_WINDOW_BASES`) | a table -> device level 3 each; every other entry INVALID |
+  | device 3 | 512 pages of a device block, one table per block | reset: INVALID (`DESC_ABSENT`). Granted: `Device-nGnRE`, EL0 RW, never executable |
   | 2 | the first 4 MiB of RAM | tables -> level 3: the grant window; every other entry INVALID |
   | 3 | 1024 pages | reset: INVALID (`DESC_ABSENT`). Granted: EL0 RO or RW, `PXN` always |
 

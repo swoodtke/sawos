@@ -642,6 +642,10 @@ DEADLOCK_FROM_IDLE_PKG = os.path.join(TESTS_DIR, "deadlock-from-idle")
 DRIVER_CHILD_PKG = os.path.join(TESTS_DIR, "driver-child")
 CHILD_ECHO_NS16550_PKG = os.path.join(TESTS_DIR, "child-echo-ns16550")
 CHILD_ECHO_PL011_PKG = os.path.join(TESTS_DIR, "child-echo-pl011")
+# The arm64 device-window protection case's launcher and its child, which
+# reads device pages (`tests/set-reuse`, `tests/child-window-probe`).
+SET_REUSE_PKG = os.path.join(TESTS_DIR, "set-reuse")
+CHILD_WINDOW_PROBE_PKG = os.path.join(TESTS_DIR, "child-window-probe")
 SHARE_DOUBLE_MAP_PKG = os.path.join(TESTS_DIR, "share-double-map")
 # Placement's own pair: one region, two address spaces, two different addresses.
 # aarch64 only; riscv32 keeps identity placement, so there the two addresses
@@ -1222,6 +1226,11 @@ ARCHES = [
         # default would swap the hardware under a kernel that cannot say so.
         "qemu_args": ["-M", "virt,gic-version=2", "-cpu", "cortex-a53",
                       "-semihosting"],
+        # The virtio-mmio bus a network device is placed at: the first
+        # transport of the page the board's `VIRTIO24` is
+        # (`hal/arm64/board.toml`), so the transport sits at the window's
+        # start. Transport N is at 0x0A00_0000 + N * 0x200.
+        "net_bus": 24,
         # The base aarch64 triple already has everything this kernel uses, and
         # there is no ABI variant to select.
         "cc_args": [],
@@ -2732,6 +2741,30 @@ TEST_CASES = [
         "src": os.path.join(TESTS_DIR, "trap.saw"),
         "expect_out": None,             # a fault produces no banner
         "expect_clean_exit": False,     # the HAL's kernel-bug path
+    },
+    {
+        # The device windows the arm64 HAL grants pages in: the console's 2 MiB
+        # block and the virtio-mmio transports', and nowhere else. The
+        # predicate is asked about the edges of both blocks, the pages around
+        # them, a window that runs from one block into the next and a window
+        # off the page grain. arm64 only: the other boards' windows are
+        # naturally aligned power-of-two entries, not blocks of pages.
+        "name": "device_window_blocks",
+        "arches": ["arm64"],
+        "src": os.path.join(TESTS_DIR, "device_window.saw"),
+        "expect_out": ["SOS window: console first page ok={one}",
+                       "SOS window: console last page ok={one}",
+                       "SOS window: transports first page ok={one}",
+                       "SOS window: transports last page ok={one}",
+                       "SOS window: transports whole block ok={one}",
+                       "SOS window: between the blocks ok={zero}",
+                       "SOS window: below the console block ok={zero}",
+                       "SOS window: past the transports block ok={zero}",
+                       "SOS window: the interrupt controller ok={zero}",
+                       "SOS window: console block into the next ok={zero}",
+                       "SOS window: transports block into the next ok={zero}",
+                       "SOS window: off the page grain ok={zero}"],
+        "expect_clean_exit": True,
     },
     {
         "name": "panic_seam",
@@ -15866,8 +15899,10 @@ TEST_CASES = [
     },
     {
         # The first virtio-mmio transport a process is given: the image names
-        # `VIRTIO7`, where QEMU puts the network device, and the probe reads
-        # its identity registers (`tests/virtio-probe`). The case boots with
+        # `VIRTIO7` (`VIRTIO24` on arm64, whose window is a page of eight
+        # transports in the second device block), where the runner places the
+        # network device, and the probe reads its identity registers
+        # (`tests/virtio-probe`). The case boots with
         # the network path (`_run_net_qemu`), so it also holds that start-up:
         # the peer's port, the stream connected before the guest runs, and a
         # peer that sees no frame and closes when QEMU does. The registers
@@ -15875,10 +15910,11 @@ TEST_CASES = [
         # (the transports are modern), DeviceID 1 (a network card) and the
         # vendor "QEMU" (0x554D4551).
         "name": "virtio_probe",
-        "arches": ["riscv32", "riscv32-flat"],
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "virtio_probe.toml",
-                       "riscv32-flat": "virtio_probe_flat.toml"},
+                       "riscv32-flat": "virtio_probe_flat.toml",
+                       "arm64": "virtio_probe_arm64.toml"},
         "net": {"script": "ping"},
         "expect_out": ["{banner}",
                        "SOS virtio probe: magic=1953655158 version=2 "
@@ -15892,10 +15928,11 @@ TEST_CASES = [
         # answers its magic, version and vendor, and reads DeviceID 0, which
         # is how a driver tells an empty transport from a card.
         "name": "virtio_probe_empty",
-        "arches": ["riscv32", "riscv32-flat"],
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "virtio_probe_empty.toml",
-                       "riscv32-flat": "virtio_probe_empty_flat.toml"},
+                       "riscv32-flat": "virtio_probe_empty_flat.toml",
+                       "arm64": "virtio_probe_empty_arm64.toml"},
         "net": {"script": "ping", "device": "none"},
         "expect_out": ["{banner}",
                        "SOS virtio probe: magic=1953655158 version=2 "
@@ -15909,10 +15946,11 @@ TEST_CASES = [
         # `force-legacy=false`: the same registers read version 1, which is
         # what a driver refuses.
         "name": "virtio_probe_legacy",
-        "arches": ["riscv32", "riscv32-flat"],
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "virtio_probe_legacy.toml",
-                       "riscv32-flat": "virtio_probe_legacy_flat.toml"},
+                       "riscv32-flat": "virtio_probe_legacy_flat.toml",
+                       "arm64": "virtio_probe_legacy_arm64.toml"},
         "net": {"script": "ping", "legacy": True},
         "expect_out": ["{banner}",
                        "SOS virtio probe: magic=1953655158 version=1 "
@@ -15925,16 +15963,46 @@ TEST_CASES = [
         # Another device on the bus, which `device` places without a netdev
         # (a random-number generator, DeviceID 4).
         "name": "virtio_probe_wrong_device",
-        "arches": ["riscv32", "riscv32-flat"],
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "virtio_probe_wrong_device.toml",
-                       "riscv32-flat": "virtio_probe_wrong_device_flat.toml"},
+                       "riscv32-flat": "virtio_probe_wrong_device_flat.toml",
+                       "arm64": "virtio_probe_wrong_device_arm64.toml"},
         "net": {"script": "ping", "device": "virtio-rng-device"},
         "expect_out": ["{banner}",
                        "SOS virtio probe: magic=1953655158 version=2 "
                        "device=4 vendor=1431127377",
                        "root: probe ended status=65536"],
         "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What a device grant in the transports' block reaches and leaves
+        # behind, on arm64 (`tests/set-reuse`, `tests/child-window-probe`).
+        # The first child is given VIRTIO24's page, maps it and reads it, then
+        # reads the console block's page at the same index, 0x0900_3000, which
+        # it was not granted: each block has a level-3 table of its own, so
+        # that read faults. The second child, the same program with no
+        # window, is made after the first has died and takes its body, so its
+        # translation set: it reads VIRTIO24's page and faults, because
+        # teardown cleared both windows of the set. A read that is let
+        # through prints a line the transcript has no place for, so the
+        # fault lines are missing or out of order.
+        "name": "device_window_sets",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SET_REUSE_PKG,
+        "children": [CHILD_WINDOW_PROBE_PKG, CHILD_WINDOW_PROBE_PKG],
+        "devices": ["VIRTIO24"],
+        "expect_out": ["{banner}",
+                       "SOS winprobe: granted page magic=1953655158",
+                       "SOS winprobe: reading the other block's page",
+                       "SOS: fault load-access-fault",
+                       "SOS setreuse: the window holder ended status=",
+                       "SOS winprobe: no window, reading the page",
+                       "SOS: fault load-access-fault",
+                       "SOS setreuse: the next process ended status=",
+                       "SOS setreuse: done"],
         "expect_clean_exit": True,
     },
 ]

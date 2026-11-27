@@ -1,0 +1,53 @@
+// Which device windows the arm64 HAL offers a process, asked of the predicate
+// the kernel asks at `IoMemoryOp.Carve` and `Map`.
+//
+// The HAL grants device pages in two 2 MiB blocks, the console's (0x0900_0000)
+// and the virtio-mmio transports' (0x0A00_0000), one level-3 table each. A
+// window is inside one block or it is refused: a page in neither, a window
+// that runs from one block into the next, and a window off the page grain all
+// answer false. The numbers here are the board's, written out so that a
+// change to the HAL's window list shows as a different line.
+//
+// No board row lies outside both blocks, so no process can name such a page;
+// the predicate is the one place a page outside is asked about.
+
+import kcore.{console}
+import hal
+
+static PAGE: UInt = 0x1000
+static BLOCK: UInt = 0x20_0000
+
+static CONSOLE_BLOCK: UInt = 0x0900_0000
+static TRANSPORT_BLOCK: UInt = 0x0A00_0000
+
+func yes(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+func show(label: String, base: UInt, len: UInt) unsafe {
+    let uart = console()
+    uart.write_str("SOS window: ")
+    uart.write_str(label)
+    uart.write_str(" ok=")
+    uart.write_hex(yes(hal.device_window_ok(base, len)))
+    uart.write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    show("console first page", CONSOLE_BLOCK, PAGE)
+    show("console last page", CONSOLE_BLOCK + BLOCK - PAGE, PAGE)
+    show("transports first page", TRANSPORT_BLOCK, PAGE)
+    show("transports last page", TRANSPORT_BLOCK + BLOCK - PAGE, PAGE)
+    show("transports whole block", TRANSPORT_BLOCK, BLOCK)
+    show("between the blocks", CONSOLE_BLOCK + BLOCK, PAGE)
+    show("below the console block", CONSOLE_BLOCK - PAGE, PAGE)
+    show("past the transports block", TRANSPORT_BLOCK + BLOCK, PAGE)
+    show("the interrupt controller", 0x0800_0000, PAGE)
+    show("console block into the next", CONSOLE_BLOCK + BLOCK - PAGE,
+         2 * PAGE)
+    show("transports block into the next", TRANSPORT_BLOCK + BLOCK - PAGE,
+         2 * PAGE)
+    show("off the page grain", TRANSPORT_BLOCK + 0x200, PAGE)
+    hal.exit_pass()
+}

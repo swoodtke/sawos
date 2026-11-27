@@ -485,12 +485,13 @@ public func image_link_base(dest_base: UInt) -> UInt {
 /// RAM takes the cursor: the address is the kernel's answer, and the caller
 /// holds no opinion (`map` takes no VA hint on any tier).
 ///
-/// A device window takes its own address. MMIO lives in a level-3 window of its
-/// own here (`DEVICE_WINDOW_BASE`, one 2 MiB span), indexed by the hardware
-/// address, and the addresses in it are the ones the board's region table
-/// publishes, so placing a register block elsewhere in that window would buy a
-/// driver nothing and cost the window a second cursor. This is a deliberate
-/// limit: a translating tier could place MMIO, and this one does not.
+/// A device window takes its own address. MMIO lives in level-3 windows of
+/// their own here (`DEVICE_WINDOW_BASES`, a 2 MiB span each), indexed by the
+/// hardware address, and the addresses in them are the ones the board's region
+/// table publishes, so placing a register block elsewhere in a window would
+/// buy a driver nothing and cost the window a second cursor. This is a
+/// deliberate limit: a translating tier could place MMIO, and this one does
+/// not.
 public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
     if device {
         return pa
@@ -604,8 +605,10 @@ public func map_target_ok(base: UInt, top: UInt) -> Bool {
 /// granularity rule, checked on caller-chosen numbers.
 ///
 /// A page is the finest thing this profile can grant, so a window is judged by
-/// pages: both ends on a page boundary, and inside the one device window the
-/// board publishes a level-3 table for. Profile A's rule differs in form (a
+/// pages: both ends on a page boundary, and inside one of the device windows
+/// (`DEVICE_WINDOW_BASES`) the board publishes a level-3 table for. A window
+/// that starts in one block and runs into the next is refused: each block has
+/// its own table. Profile A's rule differs in form (a
 /// naturally aligned power of two, because a window there is one protection
 /// entry) and not in purpose, which is why the predicate is per-HAL rather than
 /// a shared check with two branches.
@@ -616,7 +619,25 @@ public func device_window_ok(base: UInt, len: UInt) -> Bool {
     if (base % PROT_GRAIN) != 0 {
         return false
     }
-    base >= DEVICE_WINDOW_BASE && len <= DEVICE_WINDOW_BASE + DEVICE_WINDOW_LEN - base
+    let w = device_window_of(base)
+    if w == DEVICE_WINDOWS {
+        return false
+    }
+    len <= DEVICE_WINDOW_BASES[w] + DEVICE_WINDOW_LEN - base
+}
+
+/// Which device window holds `va`: its index in `DEVICE_WINDOW_BASES`, or
+/// `DEVICE_WINDOWS` when `va` is in none of them.
+func device_window_of(va: UInt) -> Int {
+    var i: Int = 0
+    while i < DEVICE_WINDOWS {
+        let base = DEVICE_WINDOW_BASES[i]
+        if va >= base && va - base < DEVICE_WINDOW_LEN {
+            return i
+        }
+        i = i + 1
+    }
+    DEVICE_WINDOWS
 }
 
 /// An address the kernel itself cannot reach on this target. It sits under
@@ -1100,7 +1121,7 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 //   - the kernel's linear map, built once and installed in `TTBR1_EL1`, which
 //     no process switch touches.
 //
-// A per-process set (`build_set`), six tables:
+// A per-process set (`build_set`), seven tables:
 //
 //   level 1 (1 GiB entries, 39-bit VA out of the low translation base)
 //     [0]  0x0000_0000  -> the device level 2
@@ -1114,9 +1135,10 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 //     granted pages    EL0 RO or RW and EL0-executable as the grant asks,
 //                      never executable at EL1
 //   device level 2
-//     one entry, the block containing the console UART -> the device level 3
+//     two entries, the block containing the console UART and the block of the
+//     virtio-mmio transports -> a device level 3 each
 //     rest             invalid
-//   device level 3 (4 KiB device pages over that one 2 MiB block)
+//   device level 3 (two tables, 4 KiB device pages over a 2 MiB block each)
 //     ungranted        invalid (`DESC_ABSENT`)
 //     granted pages    Device-nGnRE, EL0 RW, never executable
 //
@@ -1141,8 +1163,9 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 // gives Profile A.
 //
 // A block is not a grant unit: granting EL0 the block that holds the console
-// would hand over every peripheral beside it. So the console's 2 MiB block is
-// a table in the set, the minimum that makes a single page grantable.
+// would hand over every peripheral beside it. So each device block a process
+// may be granted a page of is a table in the set, the minimum that makes a
+// single page grantable.
 //
 // The kernel image block staying EL1-RWX is the arm64 spelling of "M-mode is
 // unconstrained", not a claim about kernel W^X, which neither profile has.
@@ -1155,18 +1178,19 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
 
 /// Descriptors in one per-process set, written once so the length and the
 /// initializer cannot disagree: level 1, level 2, the two RAM level-3 tables
-/// (`GRANT_PAGES`), the device level 2 and the device level 3. Within a set
-/// the tables sit at `LEVEL2_OFFSET`, `LEVEL3_OFFSET`, `DEVICE_LEVEL2_OFFSET`
-/// and `DEVICE_LEVEL3_OFFSET`.
+/// (`GRANT_PAGES`), the device level 2 and a device level 3 per device window.
+/// Within a set the tables sit at `LEVEL2_OFFSET`, `LEVEL3_OFFSET`,
+/// `DEVICE_LEVEL2_OFFSET` and `DEVICE_LEVEL3_OFFSET`, the device level 3s one
+/// table apart from there (`device_level3`).
 ///
 /// All-zero until built, so the pool costs no image bytes. An unwritten
 /// descriptor is invalid, which is the state a default-deny map wants.
-static PT_SET_DESCRIPTORS: Int = 512 + 512 + 1024 + 512 + 512
+static PT_SET_DESCRIPTORS: Int = 512 + 512 + 1024 + 512 + 512 * 2
 
 /// Bytes in one set. The same number as `PT_SET_DESCRIPTORS * DESC_BYTES`,
 /// spelled in `UInt` because it is address arithmetic; the assert below keeps
 /// the two spellings from drifting.
-static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
+static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512 * 2) * 8
 
 /// How many persistent table sets the pool holds: one per process body.
 ///
@@ -1186,8 +1210,8 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 ///
 /// The cost is paid in `.bss` only. The pool holds this many sets of
 /// `PT_SET_DESCRIPTORS` descriptors, plus the linear map's descriptors and one
-/// table of alignment slack (512): 24 KiB a slot. `.bss` is `NOLOAD`, so this
-/// costs no image bytes; it costs `boot.S`'s zerofill and a set-build per
+/// table of alignment slack (512). `.bss` is `NOLOAD`, so this costs no image
+/// bytes; it costs `boot.S`'s zerofill and a set-build per
 /// slot.
 ///
 /// `virt.ld`'s `ASSERT` on `_bss_end` against `ROOT_LOAD_BASE` is what catches
@@ -1290,11 +1314,23 @@ static TTBR_ASID_SHIFT: Int = 48
 static BLOCK_SHIFT: Int = 21              // a level-2 block is 2 MiB
 static MAIR_INDEX_SHIFT: Int = 2          // descriptor bits 4:2
 
-/// The 2 MiB block the console UART sits in, and its base. The device level-3
-/// table covers exactly this block, so a page grantable to EL0 is a page inside
-/// it (`prot_device` diagnoses anything else).
-static DEVICE_WINDOW_BASE: UInt = (UART_BASE >> BLOCK_SHIFT) << BLOCK_SHIFT
+/// The 2 MiB blocks a process may be granted device pages in, by base: the
+/// block the console UART sits in, then the block of the virtio-mmio
+/// transports. Each has a device level-3 table covering exactly it, so a page
+/// grantable to EL0 is a page inside one of them (`prot_device` diagnoses
+/// anything else). The tables follow `DEVICE_LEVEL3_OFFSET` in this order.
+static DEVICE_WINDOWS: Int = 2
+static TRANSPORT_WINDOW_BASE: UInt = 0x0A00_0000
+static DEVICE_WINDOW_BASES: [UInt; 2] = [
+    (UART_BASE >> BLOCK_SHIFT) << BLOCK_SHIFT,
+    TRANSPORT_WINDOW_BASE,
+]
 static DEVICE_WINDOW_LEN: UInt = 1 << BLOCK_SHIFT
+
+static_assert(TRANSPORT_WINDOW_BASE % DEVICE_WINDOW_LEN == 0,
+              "a device window is a whole level-2 block")
+static_assert(TRANSPORT_WINDOW_BASE <= LINMAP_PHYS_MASK,
+              "the transports' block must fit under the linear-map offset")
 
 // Descriptor bits (ARMv8-A VMSA, 4 KiB granule). Each is a lone architectural
 // bit position, a standalone quantity, which is what a `static` is for. The two
@@ -1461,12 +1497,23 @@ func reset_window(level3: UInt) unsafe {
     }
 }
 
-/// Every page of the device window back to ungranted.
-func reset_device_window(level3: UInt) unsafe {
-    var i: UInt = 0
-    while i < PT_ENTRIES {
-        put_desc(level3, i, DESC_ABSENT)
-        i = i + 1
+/// The device level-3 table of window `w` in the set at `level1`.
+func device_level3(level1: UInt, w: Int) -> UInt {
+    level1 + DEVICE_LEVEL3_OFFSET + (w as UInt) * PAGE_SIZE
+}
+
+/// Every page of every device window back to ungranted, in the set at
+/// `level1`.
+func reset_device_window(level1: UInt) unsafe {
+    var w: Int = 0
+    while w < DEVICE_WINDOWS {
+        let level3 = device_level3(level1, w)
+        var i: UInt = 0
+        while i < PT_ENTRIES {
+            put_desc(level3, i, DESC_ABSENT)
+            i = i + 1
+        }
+        w = w + 1
     }
 }
 
@@ -1617,7 +1664,7 @@ func page_tables_build() unsafe -> UInt {
 /// tables that reach them.
 ///
 /// `TTBR0_EL1` is purely the user's register. A set maps the 4 MiB RAM grant
-/// window and the console's device block at page granularity, both starting
+/// window and the device blocks at page granularity, both starting
 /// ungranted, and every other address in the low half is invalid: no EL1 blocks
 /// over RAM, no EL1 device blocks, no kernel anything.
 ///
@@ -1633,27 +1680,30 @@ func page_tables_build() unsafe -> UInt {
 /// `DFSC` class; both are `EC` 0x24 and both render through `abort_direction`.
 ///
 /// The level-2 and device level-2 tables stay full-size even though few entries
-/// are live (`GRANT_PAGES / PT_ENTRIES` in the RAM level 2, one in the device
-/// level 2): a translation table is a page, so an unused entry frees a
-/// descriptor and never a table.
+/// are live (`GRANT_PAGES / PT_ENTRIES` in the RAM level 2, `DEVICE_WINDOWS` in
+/// the device level 2): a translation table is a page, so an unused entry
+/// frees a descriptor and never a table.
 func build_set(level1: UInt) unsafe {
     let level2 = level1 + LEVEL2_OFFSET
     let level3 = level1 + LEVEL3_OFFSET
     let dev_level2 = level1 + DEVICE_LEVEL2_OFFSET
-    let dev_level3 = level1 + DEVICE_LEVEL3_OFFSET
 
     // Level 1: a table over the device space below RAM, a table over RAM, and
     // nothing else; every other entry stays zero, i.e. invalid.
     put_desc(level1, 0, (dev_level2 as UInt64) | DESC_VALID | DESC_TABLE)
     put_desc(level1, 1, (level2 as UInt64) | DESC_VALID | DESC_TABLE)
 
-    // The device level 2: one live entry, the block holding the console, which
-    // points at a level-3 table so a single register page can be granted to
-    // EL0. Every other entry stays zero: the kernel reaches its own MMIO
-    // through the linear map, so a user set has no reason to name it.
-    put_desc(dev_level2, DEVICE_WINDOW_BASE >> BLOCK_SHIFT,
-             (dev_level3 as UInt64) | DESC_VALID | DESC_TABLE)
-    reset_device_window(dev_level3)
+    // The device level 2: one live entry per device window, each pointing at a
+    // level-3 table so a single register page can be granted to EL0. Every
+    // other entry stays zero: the kernel reaches its own MMIO through the
+    // linear map, so a user set has no reason to name it.
+    var w: Int = 0
+    while w < DEVICE_WINDOWS {
+        put_desc(dev_level2, DEVICE_WINDOW_BASES[w] >> BLOCK_SHIFT,
+                 (device_level3(level1, w) as UInt64) | DESC_VALID | DESC_TABLE)
+        w = w + 1
+    }
+    reset_device_window(level1)
 
     // Level 2 over RAM: the grant window's entries point at the level-3 tables,
     // where permissions are editable a page at a time. Every other entry stays
@@ -1697,7 +1747,7 @@ func grant_outside_window(va: UInt) {
 /// `prot_commit`.
 public func prot_reset() unsafe {
     reset_window(tables_base() + LEVEL3_OFFSET)
-    reset_device_window(tables_base() + DEVICE_LEVEL3_OFFSET)
+    reset_device_window(tables_base())
 }
 
 /// Stage grant `idx` as [base, top) with `perms`, a mask in the `SegFlag`
@@ -1785,12 +1835,12 @@ func install_region(level3: UInt, base: UInt, top: UInt, pa: UInt,
 ///
 /// `idx` is unused, as it is in `prot_region`.
 public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
-    install_device(tables_base() + DEVICE_LEVEL3_OFFSET, base, len)
+    install_device(tables_base(), base, len)
 }
 
-/// Grant the device pages of `[base, base + len)` in the device window at
-/// `dev_level3`: `install_region`'s twin.
-func install_device(dev_level3: UInt, base: UInt, len: UInt) unsafe {
+/// Grant the device pages of `[base, base + len)` in the set at `level1`, each
+/// in the table of the window that holds it: `install_region`'s twin.
+func install_device(level1: UInt, base: UInt, len: UInt) unsafe {
     let attrs = (DESC_VALID | DESC_PAGE | MemoryType.DeviceNGnRE.attr_index()
                  | ATTR_AF | ATTR_NG | (AccessPerm.El0Rw as UInt64)
                  | ATTR_PXN | ATTR_UXN)
@@ -1798,10 +1848,12 @@ func install_device(dev_level3: UInt, base: UInt, len: UInt) unsafe {
     // reason `install_region` gives.
     var va = base - (base & (PAGE_SIZE - 1))
     while va < base + len {
-        if va < DEVICE_WINDOW_BASE || va >= DEVICE_WINDOW_BASE + DEVICE_WINDOW_LEN {
+        let w = device_window_of(va)
+        if w == DEVICE_WINDOWS {
             grant_outside_window(va)
         }
-        put_desc(dev_level3, (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
+        put_desc(device_level3(level1, w),
+                 (va - DEVICE_WINDOW_BASES[w]) >> PAGE_SHIFT,
                  (va as UInt64) | attrs)
         va = va + PAGE_SIZE
     }
@@ -1916,8 +1968,12 @@ public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
         var va = base - (base & (PAGE_SIZE - 1))
         while va < top {
             if device {
-                put_desc(level1 + DEVICE_LEVEL3_OFFSET,
-                         (va - DEVICE_WINDOW_BASE) >> PAGE_SHIFT,
+                let w = device_window_of(va)
+                if w == DEVICE_WINDOWS {
+                    grant_outside_window(va)
+                }
+                put_desc(device_level3(level1, w),
+                         (va - DEVICE_WINDOW_BASES[w]) >> PAGE_SHIFT,
                          DESC_ABSENT)
             } else {
                 put_desc(level1 + LEVEL3_OFFSET, (va - RAM_BASE) >> PAGE_SHIFT,
@@ -1926,7 +1982,7 @@ public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
             va = va + PAGE_SIZE
         }
     } else if device {
-        install_device(level1 + DEVICE_LEVEL3_OFFSET, base, top - base)
+        install_device(level1, base, top - base)
     } else {
         install_region(level1 + LEVEL3_OFFSET, base, top, pa, perms)
     }
@@ -1953,7 +2009,7 @@ public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
 public func prot_clear(p: UInt) unsafe {
     let level1 = set_base(p)
     reset_window(level1 + LEVEL3_OFFSET)
-    reset_device_window(level1 + DEVICE_LEVEL3_OFFSET)
+    reset_device_window(level1)
     invalidate_domain(p)
 }
 
