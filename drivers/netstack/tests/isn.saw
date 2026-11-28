@@ -1,0 +1,62 @@
+// The initial sequence numbers a stack draws: SipHash-2-4 against the
+// paper's vectors (key 00..0F, messages 00, 01, ... of each length), and the
+// RFC 6528 sum of the clock's four-microsecond count and the hash of the four
+// addresses, against numbers computed by a script of its own.
+
+import netstack.addr.{Ipv4Addr, SocketAddr}
+import netstack.isn.{KEY_BYTES, KeyedIsn, siphash}
+import netstack.tcpconn.{IsnSource}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The paper's key, bytes 00 to 0F, as its two words.
+static K0: UInt64 = 0x0706_0504_0302_0100
+static K1: UInt64 = 0x0F0E_0D0C_0B0A_0908
+
+func counting(n: Int) -> [UInt8; 16] {
+    var m: [UInt8; 16] = [0; 16]
+    var i = 0
+    while i < n {
+        m[i] = i as UInt8
+        i = i + 1
+    }
+    m
+}
+
+func vectors() {
+    let m = counting(16)
+    check(siphash(K0, K1, &m[..0]) == 0x726F_DB47_DD0E_0E31, "the empty message")
+    check(siphash(K0, K1, &m[..8]) == 0x93F5_F579_9A93_2462, "one word")
+    check(siphash(K0, K1, &m[..12]) == 0x751E_8FBC_860E_E5FB, "twelve bytes")
+    check(siphash(K0, K1, &m[..15]) == 0xA129_CA61_49BE_45E5, "fifteen bytes")
+}
+
+func numbers() {
+    var key: [UInt8; KEY_BYTES] = [0; KEY_BYTES]
+    var i = 0
+    while i < KEY_BYTES {
+        key[i] = i as UInt8
+        i = i + 1
+    }
+    var source = KeyedIsn.unkeyed()
+    check(not source.is_keyed(), "no key yet")
+    source.key(&key)
+    check(source.is_keyed(), "keyed")
+    let a = SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 1), port: 49152)
+    let b = SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 2), port: 7)
+    source.at(0)
+    check(source.isn(a, b) == 0x1E6A_00BE, "the hash of the four addresses")
+    check(source.isn(b, a) == 0xA5E9_0496, "which are ordered")
+    source.at(1000)
+    check(source.isn(a, b) == 0x1E6D_D14E, "plus four microseconds' count")
+}
+
+func main() {
+    vectors()
+    numbers()
+}

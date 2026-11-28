@@ -1,0 +1,95 @@
+//! Where a stack's TCP table puts the segments it sends: a few at a time,
+//! for the stack to carry down to IPv4 once the table's call has returned.
+//!
+//! The table cannot send through the stack while the stack is lending it the
+//! table, so it sends into an outbox the stack holds beside it. A segment the
+//! outbox has no room for is refused, and the table keeps it owed
+//! (`tcpconn.Table.output`): the stack empties the outbox and asks again until
+//! nothing is refused.
+
+import netstack.addr.{Ipv4Addr}
+import netstack.bytes.{put_bytes}
+import netstack.ether
+import netstack.ipv4
+import netstack.tcp
+import netstack.tcpconn.{SegmentError, SegmentSink}
+
+/// How many segments the outbox holds between two emptyings.
+public static OUTBOX_SEGMENTS: Int = 2
+
+/// The largest segment the table sends: an IPv4 datagram's payload at the
+/// MTU.
+static SEGMENT_BYTES: Int = ether.MTU - ipv4.HEADER_BYTES
+
+/// The segments the table sent since the stack last emptied the outbox.
+public struct Outbox {
+    private bytes: [[UInt8; SEGMENT_BYTES]; OUTBOX_SEGMENTS],
+    private lens: [Int; OUTBOX_SEGMENTS],
+    private dsts: [Ipv4Addr; OUTBOX_SEGMENTS],
+    private count: Int,
+    /// A segment was refused since the last emptying.
+    private refused: Bool,
+}
+
+extension Outbox {
+    /// An empty outbox.
+    public static func empty() -> Outbox {
+        Outbox(bytes: [[0; SEGMENT_BYTES]; OUTBOX_SEGMENTS],
+               lens: [0; OUTBOX_SEGMENTS],
+               dsts: [Ipv4Addr.unspecified(); OUTBOX_SEGMENTS], count: 0,
+               refused: false)
+    }
+
+    /// How many segments wait.
+    public func len(&self) -> Int {
+        self.count
+    }
+
+    /// Where segment `i` goes.
+    public func dst(&self, i: Int) -> Ipv4Addr {
+        self.dsts[i]
+    }
+
+    /// Whether segment `i` answers a segment from a source that may be
+    /// forged: a reset, or a SYN,ACK. A station's own traffic is neither.
+    public func is_reply(&self, i: Int) -> Bool {
+        let flags = self.bytes[i][13]
+        let syn_ack = tcp.SYN | tcp.ACK
+        (flags & tcp.RST) != 0 || (flags & syn_ack) == syn_ack
+    }
+
+    /// Copies segment `i` into `to` from `at`, and answers its length.
+    public func copy_out(&self, i: Int, to: &var [UInt8], at: Int) -> Int {
+        let n = self.lens[i]
+        put_bytes(&var to, at, &self.bytes[i][..n])
+        n
+    }
+
+    /// Forgets every segment, and answers whether one was refused since the
+    /// last emptying.
+    public func empty_out(&var self) -> Bool {
+        let refused = self.refused
+        self.count = 0
+        self.refused = false
+        refused
+    }
+}
+
+extension Outbox: SegmentSink {
+    /// Keeps `segment`, from this stack's address to `dst`, or refuses it
+    /// when the outbox is full. The source is the interface's, which the
+    /// stack writes in the IPv4 header.
+    public func send(&var self, src: Ipv4Addr, dst: Ipv4Addr,
+                     segment: &[UInt8]) -> Result<Void, SegmentError> {
+        if self.count == OUTBOX_SEGMENTS || segment.len() > SEGMENT_BYTES {
+            self.refused = true
+            return SegmentError.Full
+        }
+        let i = self.count
+        put_bytes(&var self.bytes[i], 0, &segment)
+        self.lens[i] = segment.len()
+        self.dsts[i] = dst
+        self.count = i + 1
+        return
+    }
+}

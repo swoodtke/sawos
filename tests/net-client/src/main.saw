@@ -35,6 +35,8 @@
 //!                          first DISCOVER: the client sends another.
 //!   - `dns`                three names asked of the peer's DNS server: two it
 //!                          knows (one by a CNAME) and one it does not.
+//!   - `tcp_echo`           a TCP connection to the peer's echo port: a
+//!                          message written and read back, and the close.
 //!
 //! Nothing here keeps time but `dhcp_retry`: every stack call is given
 //! `now = 0`, and `poll` is never called. Each wait is on an event the driver
@@ -52,13 +54,15 @@ import pktring.{Endpoint, Layout, Ring, RingError, Shared, SharedWindow, SlotRan
 import netdevproto.{AttachInfo, BODY_BYTES, Frame, NetdevBody, NetdevError, NetdevEvent,
                     NetdevStats, SLOT_BYTES, attach_reply, empty_reply,
                     event_reply, layout, stats_reply}
-import netstack.{Config, DROP_KINDS, Delivery, Drop, Ipv4Addr, MacAddr, Sink, SinkError,
-                 SocketAddr, Stack}
+import netstack.{CallError, Config, ConnId, DROP_KINDS, Delivery, Drop, Ipv4Addr, MacAddr,
+                 Sink, SinkError, SocketAddr, Stack, TcpDrop}
 import netstack.bytes.{put_bytes}
 import netstack.dhcp
 import netstack.dhcp.{Client, Lease, Step}
 import netstack.dns
 import netstack.dns.{Query, Resolution}
+import netstack.tcp.{TCP_DROP_KINDS}
+import netstack.tcpconn.{State}
 import netcase.{name}
 import sosmain
 
@@ -95,6 +99,9 @@ static DATAGRAM_BYTES: Int = 600
 
 /// The echo port the peer's `burst` script answers.
 static BURST_PORT: UInt16 = 7
+
+/// The port the peer's `tcp_echo` script serves.
+static TCP_ECHO_PORT: UInt16 = 7
 
 // =============================================================================
 // Words for the transcript
@@ -479,8 +486,9 @@ extension Link: Sink {
 /// The worker's stack. A send holds a whole frame at each of several levels
 /// of the stack and the client, which with the start-up's own frames below
 /// them is more than the main thread's stack holds; the main thread only
-/// starts the worker and joins it.
-static WORK_STACK_WORDS: Int = 8192
+/// starts the worker and joins it. Building the stack holds copies of it in
+/// the frame that boxes it, and the stack holds TCP's buffers.
+static WORK_STACK_WORDS: Int = 65536
 unsafe static var WORK_STACK: [UInt; WORK_STACK_WORDS] = [0; WORK_STACK_WORDS]
 
 func work_stack_top() unsafe -> UInt {
@@ -544,6 +552,7 @@ func scenario(inlet: PipeInlet) -> Int {
     if which.equals("dhcp") { return dhcp_flow(&var link, false) }
     if which.equals("dhcp_retry") { return dhcp_flow(&var link, true) }
     if which.equals("dns") { return dns_flow(&var link) }
+    if which.equals("tcp_echo") { return tcp_echo(&var link) }
     no_scenario(which)
 }
 
@@ -1192,5 +1201,118 @@ func dns_flow(l: &var Link) -> Int {
     let stats = try driver_stats(&l) catch { return error }
     report_stats(&stats)
     report_drops(drops(&stack.value()))
+    EXIT_OK
+}
+
+/// Every TCP segment the stack refused or that ended its connection,
+/// whatever the reason.
+func tcp_drops(stack: &Stack) -> UInt32 {
+    var total: UInt32 = 0
+    var raw = 0
+    while raw < TCP_DROP_KINDS {
+        if let reason = TcpDrop.from(raw: raw as UInt8) { total = total + stack.tcp_drops(reason) }
+        raw = raw + 1
+    }
+    total
+}
+
+/// Hands `stack` the frames the driver publishes until connection `id` is in
+/// `state`; one that ends first is a failure.
+func await_tcp(l: &var Link, stack: &var Stack, id: ConnId, state: State) -> Result<Void, Int> {
+    while stack.tcp_state(id) != state {
+        if stack.tcp_state(id) == State.Closed {
+            return failed_plainly("the connection ended")
+        }
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case RxReady(_) -> {
+                try l.receive_all(&var stack) catch { return failed("receive", &error) }
+                if let f = l.failed.take() { return failed("transmit", &f) }
+            },
+            case _ -> {},
+        }
+    }
+    return
+}
+
+/// Reads from connection `id` into `back` until it holds `want` bytes,
+/// handing `stack` the frames the driver publishes while nothing waits.
+func read_back(l: &var Link, stack: &var Stack, id: ConnId, back: &var Text,
+               want: Int) -> Result<Void, Int> {
+    while back.len < want {
+        let got = try stack.tcp_read(id, &var back.bytes[back.len..want], 0, &var l) catch {
+            if error != CallError.WouldBlock { return failed("tcp_read", &error) }
+            0
+        }
+        if let f = l.failed.take() { return failed("transmit", &f) }
+        back.len = back.len + got
+        if got == 0 {
+            let event = try l.wait_event() catch { return failed("wait_event", &error) }
+            match event {
+                case RxReady(_) -> {
+                    try l.receive_all(&var stack) catch { return failed("receive", &error) }
+                    if let f = l.failed.take() { return failed("transmit", &f) }
+                },
+                case _ -> {},
+            }
+        }
+    }
+    return
+}
+
+func report_tcp_wrote(n: Int) {
+    print("SOS netclient: tcp wrote {} bytes", n)
+}
+
+func report_tcp_read(back: &Text) {
+    print("SOS netclient: tcp read back: {}", back)
+}
+
+func report_tcp_drops(drops: UInt32) {
+    print("SOS netclient: tcp drops={}", drops)
+}
+
+/// A TCP connection to the peer's echo port: connected, a message written,
+/// the echo read back, and closed from this side, the peer's FIN taking it to
+/// TIME-WAIT. Each step waits on what the peer sends. A ping last puts the
+/// final acknowledgment ahead of the echo reply on the wire, so the peer has
+/// taken it before the client ends. The secret is fixed: this program has no
+/// randomness, and its sequence numbers guard nothing.
+func tcp_echo(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try start_stack(&var l) catch { return error }
+    let key: [UInt8; 16] = [0x5A; 16]
+    stack.value().tcp_secret(&key)
+    let peer = Ipv4Addr(10, 0, 2, 2)
+    let to = SocketAddr(addr: peer, port: TCP_ECHO_PORT)
+    let id = try stack.value().tcp_connect(to, 0, &var l) catch {
+        return failed("tcp_connect", &error)
+    }
+    if let f = l.failed.take() { return failed("tcp_connect", &f) }
+    try await_tcp(&var l, &var stack.value(), id, State.Established) catch { return error }
+    print("SOS netclient: tcp connected to 10.0.2.2:7")
+    var message = Text(bytes: [0; 64], len: 0)
+    put_text(&var message, "hello over tcp")
+    let n = try stack.value().tcp_write(id, &message.bytes[..message.len], 0, &var l) catch {
+        return failed("tcp_write", &error)
+    }
+    if let f = l.failed.take() { return failed("tcp_write", &f) }
+    report_tcp_wrote(n)
+    var back = Text(bytes: [0; 64], len: 0)
+    try read_back(&var l, &var stack.value(), id, &var back, n) catch { return error }
+    report_tcp_read(&back)
+    try stack.value().tcp_close(id, 0, &var l) catch { return failed("tcp_close", &error) }
+    if let f = l.failed.take() { return failed("tcp_close", &f) }
+    try await_tcp(&var l, &var stack.value(), id, State.TimeWait) catch { return error }
+    print("SOS netclient: tcp TIME-WAIT")
+    var data: [UInt8; ECHO_BYTES] = [0; ECHO_BYTES]
+    try stack.value().ping(peer, IDENT, 1, &data, 0, &var l) catch { return failed("ping", &error) }
+    if let f = l.failed.take() { return failed("ping", &f) }
+    try await_reply(&var l, &var stack.value(), 1) catch { return error }
+    report_reply(1, &l)
+    let stats = try driver_stats(&l) catch { return error }
+    report_stats(&stats)
+    report_drops(drops(&stack.value()))
+    report_tcp_drops(tcp_drops(&stack.value()))
     EXIT_OK
 }

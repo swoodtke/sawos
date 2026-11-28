@@ -1,5 +1,5 @@
-//! The TCP/IP stack's first layer: Ethernet II, ARP, IPv4, ICMP and UDP for
-//! one interface.
+//! The TCP/IP stack's first layer: Ethernet II, ARP, IPv4, ICMP, UDP and TCP
+//! for one interface.
 //!
 //! A `Stack` is a value with no clock, no device and no sockets of its own.
 //! Whoever drives it hands it frames and the time, and gives it a `Sink` that
@@ -10,8 +10,11 @@
 //!   - upward, `udp_send` sends a datagram from socket id N to an address and
 //!     port, and the stack calls `Sink.deliver` with each datagram for socket
 //!     id N and each echo reply;
+//!   - TCP's connections are ids from `tcp_listen`, `tcp_accept` and
+//!     `tcp_connect`, whose data is written and read with `tcp_write` and
+//!     `tcp_read` and which end with `tcp_close` or `tcp_abort` (`tcpconn`);
 //!   - `poll` ages what waits on time: it retries ARP requests and drops the
-//!     frames whose next hop never answered.
+//!     frames whose next hop never answered, and runs TCP's timers.
 //!
 //! Everything that crosses is plain data: frames and payloads as bytes,
 //! sockets as small ids, addresses as numbers. A device driver and a socket
@@ -22,9 +25,10 @@
 //! `now` is a count of milliseconds on a monotonic clock the caller keeps,
 //! passed to every operation that ages something: ARP entries
 //! (`arp.ENTRY_LIFETIME_MS`), ARP requests (`arp.REQUEST_INTERVAL_MS`),
-//! frames waiting on a resolution (`arp.PENDING_TIMEOUT_MS`) and port
-//! unreachables (`icmp.UNREACHABLE_INTERVAL_MS`). A time earlier than one
-//! the stack has seen counts as no time passing.
+//! frames waiting on a resolution (`arp.PENDING_TIMEOUT_MS`), port
+//! unreachables (`icmp.UNREACHABLE_INTERVAL_MS`), and TCP's retransmissions
+//! and TIME-WAIT. A time earlier than one the stack has seen counts as no
+//! time passing.
 //!
 //! # A received frame is input
 //!
@@ -37,11 +41,12 @@
 //!
 //! # Drops
 //!
-//! Every refusal is counted by its reason (`Stack.drops`). Among them: a frame
+//! Every refusal is counted by its reason (`Stack.drops`, and for a TCP
+//! segment `Stack.tcp_drops`). Among them: a frame
 //! for another station or a multicast group (the filter passes our address
 //! and broadcast), an EtherType other than IPv4 and ARP, a malformed header
 //! of any layer, a bad checksum, an IPv4 fragment (there is no reassembly),
-//! a protocol other than ICMP and UDP, an ICMP type other than echo, a
+//! a protocol other than ICMP, UDP and TCP, an ICMP type other than echo, a
 //! datagram to a closed port, a datagram with no route, and a frame the
 //! device or a socket had no room for: back-pressure is a drop, and the stack
 //! never waits. A reply the stack cannot send is counted the same way, by
@@ -97,12 +102,18 @@ public import netstack.addr.{Ipv4Addr, MacAddr, SocketAddr}
 public import netstack.counters.{COUNT_KINDS, Count, Counters, DROP_KINDS, Drop}
 public import netstack.ipv4.{Config, ConfigError}
 public import netstack.udp.{BindError}
+public import netstack.tcp.{TcpDrop}
+public import netstack.tcpconn.{CallError, ConnId, OpenError}
 
 import netstack.arp
 import netstack.ether
 import netstack.icmp
 import netstack.ipv4
 import netstack.udp
+import netstack.isn
+import netstack.tcp
+import netstack.tcpconn
+import netstack.tcpout
 import netstack.bytes.{elapsed, put_bytes}
 
 /// The most data one UDP datagram carries: the MTU less the IPv4 and UDP
@@ -236,6 +247,11 @@ public struct Stack {
     /// The identification of the next datagram sent.
     private ident: UInt16,
     private tally: Counters,
+    private tcp: tcpconn.Table,
+    private tcp_tally: tcp.TcpCounts,
+    /// What the TCP table sent during a call, for the stack to carry down.
+    private tcp_out: tcpout.Outbox,
+    private tcp_isn: isn.KeyedIsn,
 }
 
 extension Stack {
@@ -245,7 +261,9 @@ extension Stack {
         Stack(link_addr: mac, settings: None, cache: arp.Cache.empty(),
               pending: arp.Pending.empty(), ports: udp.PortTable.empty(),
               unreachable: icmp.RateLimit.fresh(), ident: 0,
-              tally: Counters.zero())
+              tally: Counters.zero(), tcp: tcpconn.Table.empty(),
+              tcp_tally: tcp.TcpCounts.zero(), tcp_out: tcpout.Outbox.empty(),
+              tcp_isn: isn.KeyedIsn.unkeyed())
     }
 
     /// The interface's hardware address.
@@ -336,8 +354,9 @@ extension Stack {
     }
 
     /// Ages what waits on time at `now`: drops the frames whose next hop has
-    /// not answered within `arp.PENDING_TIMEOUT_MS`, and asks again for each
-    /// next hop not asked about for `arp.REQUEST_INTERVAL_MS`.
+    /// not answered within `arp.PENDING_TIMEOUT_MS`, asks again for each
+    /// next hop not asked about for `arp.REQUEST_INTERVAL_MS`, and runs TCP's
+    /// timers (`tcpconn.Table.poll`).
     public func poll<S: Sink>(&var self, now: UInt64, sink: &var S) {
         while let i = self.pending.first_expired(now) {
             self.pending.remove(i)
@@ -347,6 +366,7 @@ extension Stack {
             self.pending.requested(hop, now)
             self.request(hop, &var sink)
         }
+        self.tcp_poll(now, &var sink)
     }
 
     /// Opens a UDP socket bound to `port`, or to an ephemeral port for 0.
@@ -547,7 +567,8 @@ extension Stack {
                                            any_broadcast, now, &var sink),
             case Udp -> self.receive_udp(&packet[..header.total()], header,
                                          any_broadcast, now, &var sink),
-            case Tcp -> self.tally.add_drop(Drop.IpProtocol),
+            case Tcp -> self.receive_tcp(&packet[..header.total()], header,
+                                         any_broadcast, now, &var sink),
         }
     }
 
@@ -790,5 +811,161 @@ extension Stack {
         let ident = self.ident
         self.ident = if ident == 0xFFFF { 0 } else { ident + 1 }
         ident
+    }
+}
+
+// =============================================================================
+// TCP
+// =============================================================================
+
+extension Stack {
+    /// Gives TCP the key its initial sequence numbers are drawn with (RFC
+    /// 6528), which should be random and known to no other host. Until it has
+    /// one, nothing is listened on or connected (`OpenError.NoSecret`).
+    public func tcp_secret(&var self, key: &[UInt8; isn.KEY_BYTES]) {
+        self.tcp_isn.key(&key)
+    }
+
+    /// A TCP listener on `port` of this interface's address
+    /// (`tcpconn.Table.listen`).
+    public func tcp_listen(&var self,
+                           port: UInt16) -> Result<ConnId, OpenError> {
+        if not self.tcp_isn.is_keyed() {
+            return OpenError.NoSecret
+        }
+        self.tcp.listen(port)
+    }
+
+    /// A connection listener `id` took in, whose handshake is done
+    /// (`tcpconn.Table.accept`): `WouldBlock` while there is none.
+    public func tcp_accept(&var self, id: ConnId) -> Result<ConnId, CallError> {
+        self.tcp.accept(id)
+    }
+
+    /// A TCP connection at `now` from an ephemeral port of this interface's
+    /// address to `to`, whose SYN goes out before this returns.
+    public func tcp_connect<S: Sink>(
+            &var self, to: SocketAddr, now: UInt64,
+            sink: &var S) -> Result<ConnId, OpenError> {
+        if not self.tcp_isn.is_keyed() {
+            return OpenError.NoSecret
+        }
+        guard let cfg = self.settings else { return OpenError.NotConfigured }
+        if not cfg.sends_to(to.addr) || cfg.is_broadcast(to.addr) {
+            return OpenError.BadAddress
+        }
+        let port = self.tcp.ephemeral_port()
+        let local = SocketAddr(addr: cfg.addr(), port: port)
+        self.tcp_isn.at(now)
+        let id = try self.tcp.connect(local, to, now, &var self.tcp_isn,
+                                      &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+        return id
+    }
+
+    /// Writes `data` at `now` to connection `id`, as much as its send buffer
+    /// takes, and answers how much (`tcpconn.Table.write`).
+    public func tcp_write<S: Sink>(&var self, id: ConnId, data: &[UInt8],
+                                   now: UInt64,
+                                   sink: &var S) -> Result<Int, CallError> {
+        let written = self.tcp.write(id, &data, now, &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+        written
+    }
+
+    /// Reads into `into` at `now` what connection `id` received, and answers
+    /// how much: 0 once the peer has closed and nothing is left
+    /// (`tcpconn.Table.read`).
+    public func tcp_read<S: Sink>(&var self, id: ConnId, into: &var [UInt8],
+                                  now: UInt64,
+                                  sink: &var S) -> Result<Int, CallError> {
+        let got = self.tcp.read(id, &var into, now, &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+        got
+    }
+
+    /// Closes connection or listener `id` at `now`: a connection's FIN
+    /// follows its data (`tcpconn.Table.close`).
+    public func tcp_close<S: Sink>(&var self, id: ConnId, now: UInt64,
+                                   sink: &var S) -> Result<Void, CallError> {
+        let closed = self.tcp.close(id, now, &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+        closed
+    }
+
+    /// Ends connection or listener `id` at once, resetting a connection the
+    /// peer knows of (`tcpconn.Table.abort`).
+    public func tcp_abort<S: Sink>(&var self, id: ConnId, now: UInt64,
+                                   sink: &var S) -> Result<Void, CallError> {
+        let aborted = self.tcp.abort(id, &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+        aborted
+    }
+
+    /// The state of connection or listener `id`: CLOSED once it has ended.
+    public func tcp_state(&self, id: ConnId) -> tcpconn.State {
+        self.tcp.state(id)
+    }
+
+    /// Connection or listener `id`'s state, sequence numbers and timers.
+    public func tcp_status(&self,
+                           id: ConnId) -> Result<tcpconn.Status, CallError> {
+        self.tcp.status(id)
+    }
+
+    /// The TCP segments counted for `reason`.
+    public func tcp_drops(&self, reason: TcpDrop) -> UInt32 {
+        self.tcp_tally.drops(reason)
+    }
+
+    /// A TCP segment in `datagram` at `now`, to the table. One sent to a
+    /// broadcast, or from no address, is refused.
+    func receive_tcp<S: Sink>(&var self, datagram: &[UInt8], ip: ipv4.Header,
+                              broadcast: Bool, now: UInt64, sink: &var S) {
+        if broadcast || ip.src.is_unspecified() {
+            self.tcp_tally.add(TcpDrop.NotUnicast)
+            return
+        }
+        self.tcp_isn.at(now)
+        try self.tcp.receive(ip.src, ip.dst, &datagram[ip.header_bytes()..],
+                             now, &var self.tcp_isn,
+                             &var self.tcp_out) catch {
+            self.tcp_tally.add(error)
+        }
+        self.flush_tcp(now, &var sink)
+    }
+
+    /// Runs TCP's timers at `now`.
+    func tcp_poll<S: Sink>(&var self, now: UInt64, sink: &var S) {
+        self.tcp.poll(now, &var self.tcp_out)
+        self.flush_tcp(now, &var sink)
+    }
+
+    /// Carries what the table sent down through IPv4, and asks it for what
+    /// the outbox refused, until nothing is refused.
+    func flush_tcp<S: Sink>(&var self, now: UInt64, sink: &var S) {
+        while self.send_tcp(now, &var sink) {
+            let _ = self.tcp.output(now, &var self.tcp_out)
+        }
+    }
+
+    /// Sends each segment in the outbox as an IPv4 datagram and empties it.
+    /// Answers whether the outbox refused a segment since it was last
+    /// emptied. A segment that cannot go was counted by its reason, and the
+    /// connection's timer sends it again. A reset and a SYN,ACK are replies
+    /// (`Outbox.is_reply`): each answers a source that may be forged, so they
+    /// may hold only the replies' share of the frames waiting on an address
+    /// (`arp.REPLY_FRAMES`).
+    func send_tcp<S: Sink>(&var self, now: UInt64, sink: &var S) -> Bool {
+        var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        var i = 0
+        while i < self.tcp_out.len() {
+            let n = self.tcp_out.copy_out(i, &var frame, PAYLOAD_AT)
+            let reply = self.tcp_out.is_reply(i)
+            let _ = self.send_ipv4(&var frame, self.tcp_out.dst(i),
+                                   ipv4.Protocol.Tcp, n, reply, now, &var sink)
+            i = i + 1
+        }
+        self.tcp_out.empty_out()
     }
 }

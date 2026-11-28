@@ -27,7 +27,7 @@
 
 import netstack.addr.{Ipv4Addr}
 import netstack.bytes.{
-    be16, be32, checksum, put16, put32, sum16, sum_word, verifies,
+    be16, be32, checksum, count_up, put16, put32, sum16, sum_word, verifies,
 }
 import netstack.ether.{MTU}
 import netstack.ipv4
@@ -106,7 +106,13 @@ public enum TcpDrop: UInt8 {
     case OutOfOrder = 15,
     /// A reset that was accepted: it ended its connection.
     case Reset = 16,
+    /// A segment to a broadcast address, or from 0.0.0.0: TCP is between two
+    /// hosts (RFC 1122 §4.2.3.10).
+    case NotUnicast = 17,
 }
+
+/// How many reasons there are: one past the last's value.
+public static TCP_DROP_KINDS: Int = 18
 
 @synthesize
 extension TcpDrop: Equatable {}
@@ -132,6 +138,7 @@ extension TcpDrop {
             case UnexpectedSyn -> "tcp unexpected syn",
             case OutOfOrder -> "tcp out of order",
             case Reset -> "tcp reset",
+            case NotUnicast -> "tcp not unicast",
         }
     }
 }
@@ -139,6 +146,29 @@ extension TcpDrop {
 extension TcpDrop: Printable {
     public func format(&self, into: &var StringBuilder) {
         try! into.append(self.describe())
+    }
+}
+
+/// The segments counted by each reason, each count held at its top.
+public struct TcpCounts {
+    private dropped: [UInt32; TCP_DROP_KINDS],
+}
+
+extension TcpCounts {
+    /// Nothing counted.
+    public static func zero() -> TcpCounts {
+        TcpCounts(dropped: [0; TCP_DROP_KINDS])
+    }
+
+    /// Counts one segment for `reason`.
+    public func add(&var self, reason: TcpDrop) {
+        let i = (reason as UInt8) as Int
+        self.dropped[i] = count_up(self.dropped[i])
+    }
+
+    /// The segments counted for `reason`.
+    public func drops(&self, reason: TcpDrop) -> UInt32 {
+        self.dropped[(reason as UInt8) as Int]
     }
 }
 

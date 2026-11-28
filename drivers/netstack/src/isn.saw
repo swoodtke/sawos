@@ -1,0 +1,145 @@
+//! Initial sequence numbers for a stack's TCP connections (RFC 6528): a
+//! counter that advances every four microseconds of the caller's clock, plus
+//! a keyed hash of the connection's four addresses, so a host that does not
+//! know the key cannot guess the number a connection starts at.
+//!
+//! The hash is SipHash-2-4, a keyed function meant for short inputs. The key
+//! is the caller's: the stack has no randomness of its own.
+
+import netstack.addr.{SocketAddr}
+import netstack.tcpconn.{IsnSource}
+
+/// The bytes of a key.
+public static KEY_BYTES: Int = 16
+
+/// The bytes the hash is taken over: the local address and port, then the
+/// remote's.
+static TUPLE_BYTES: Int = 12
+
+/// `x` rotated left by `n` bits.
+func rotl(x: UInt64, n: UInt64) -> UInt64 {
+    (x << n) | (x >> (64 - n))
+}
+
+/// The eight bytes of `bytes` from `at`, least significant first.
+func le64(bytes: &[UInt8], at: Int) -> UInt64 {
+    var v: UInt64 = 0
+    var i = 7
+    while i >= 0 {
+        v = (v << 8) | (bytes[at + i] as UInt64)
+        i = i - 1
+    }
+    v
+}
+
+/// SipHash's four words of state.
+struct Sip {
+    v0: UInt64,
+    v1: UInt64,
+    v2: UInt64,
+    v3: UInt64,
+}
+
+extension Sip {
+    func round(&var self) {
+        self.v0 = self.v0 &+ self.v1
+        self.v1 = rotl(self.v1, 13) ^ self.v0
+        self.v0 = rotl(self.v0, 32)
+        self.v2 = self.v2 &+ self.v3
+        self.v3 = rotl(self.v3, 16) ^ self.v2
+        self.v0 = self.v0 &+ self.v3
+        self.v3 = rotl(self.v3, 21) ^ self.v0
+        self.v2 = self.v2 &+ self.v1
+        self.v1 = rotl(self.v1, 17) ^ self.v2
+        self.v2 = rotl(self.v2, 32)
+    }
+
+    /// Takes in one word of the message: two rounds.
+    func absorb(&var self, m: UInt64) {
+        self.v3 = self.v3 ^ m
+        self.round()
+        self.round()
+        self.v0 = self.v0 ^ m
+    }
+}
+
+/// SipHash-2-4 of `message` under the key `k0`, `k1` (the key's first eight
+/// bytes and its last, each least significant first).
+public func siphash(k0: UInt64, k1: UInt64, message: &[UInt8]) -> UInt64 {
+    var s = Sip(v0: k0 ^ 0x736F_6D65_7073_6575, v1: k1 ^ 0x646F_7261_6E64_6F6D,
+                v2: k0 ^ 0x6C79_6765_6E65_7261, v3: k1 ^ 0x7465_6462_7974_6573)
+    let n = message.len()
+    var at = 0
+    while at + 8 <= n {
+        s.absorb(le64(&message, at))
+        at = at + 8
+    }
+    // The last word: the bytes left over, and the message's length in its
+    // top byte.
+    var last: UInt64 = ((n & 0xFF) as UInt64) << 56
+    var i = 0
+    while at + i < n {
+        last = last | ((message[at + i] as UInt64) << ((8 * i) as UInt64))
+        i = i + 1
+    }
+    s.absorb(last)
+    s.v2 = s.v2 ^ 0xFF
+    s.round()
+    s.round()
+    s.round()
+    s.round()
+    s.v0 ^ s.v1 ^ s.v2 ^ s.v3
+}
+
+/// A stack's source of initial sequence numbers: its key, once it has one,
+/// and the time of the call that may open a connection.
+public struct KeyedIsn {
+    private k0: UInt64,
+    private k1: UInt64,
+    private keyed: Bool,
+    private now: UInt64,
+}
+
+extension KeyedIsn {
+    /// A source with no key yet, which may not answer.
+    public static func unkeyed() -> KeyedIsn {
+        KeyedIsn(k0: 0, k1: 0, keyed: false, now: 0)
+    }
+
+    /// Gives the source its key.
+    public func key(&var self, key: &[UInt8; KEY_BYTES]) {
+        self.k0 = le64(&key, 0)
+        self.k1 = le64(&key, 8)
+        self.keyed = true
+    }
+
+    /// Whether the source has its key.
+    public func is_keyed(&self) -> Bool {
+        self.keyed
+    }
+
+    /// Sets the time, in milliseconds on the caller's clock, the next numbers
+    /// are drawn at.
+    public func at(&var self, now: UInt64) {
+        self.now = now
+    }
+}
+
+extension KeyedIsn: IsnSource {
+    /// RFC 6528's `M + F(localip, localport, remoteip, remoteport, key)`,
+    /// with M the four-microsecond count of the time set and F the hash's low
+    /// 32 bits.
+    public func isn(&var self, local: SocketAddr,
+                    remote: SocketAddr) -> UInt32 {
+        var tuple: [UInt8; TUPLE_BYTES] = [0; TUPLE_BYTES]
+        local.addr.write(&var tuple, 0)
+        tuple[4] = (local.port >> 8) as UInt8
+        tuple[5] = (local.port & 0xFF) as UInt8
+        remote.addr.write(&var tuple, 6)
+        tuple[10] = (remote.port >> 8) as UInt8
+        tuple[11] = (remote.port & 0xFF) as UInt8
+        let f = siphash(self.k0, self.k1, &tuple)
+        let ticks = self.now &* 250
+        UInt32.from(truncating: ticks) &+ UInt32.from(truncating: f)
+    }
+}

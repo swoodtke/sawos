@@ -1,0 +1,1207 @@
+// TCP's data and timers, one table driven segment by segment: a write cut to
+// the peer's segment size and sent inside its window; the receive window
+// shrinking as data waits and reopening as it is read; the retransmission
+// timer firing, backing off and giving up, with Karn's rule on what is
+// measured; the SYN, the SYN,ACK and the FIN sent again; a connection in
+// SYN-RECEIVED reclaimed; the silly window rules on both sides; what a sink
+// refuses staying owed; and the calls' refusals.
+//
+// A is the table under test at 10.0.0.1, port 80, initial sequence number
+// 1000. B is the peer at 10.0.0.2, port 5000, initial sequence number 9000.
+// Each expected segment of A's is its fields and its checksum (`w`), the
+// checksum written from the fields by a script of its own; the data A sends
+// is `pattern` of its offset in the stream, and B's is `b_pattern`.
+
+import netstack.addr.{Ipv4Addr, SocketAddr}
+import netstack.tcp
+import netstack.tcp.{ACK, FIN, Header, PSH, RST, SYN, TcpDrop}
+import netstack.tcpconn.{
+    CallError, ConnId, DATA_RETRIES, HANDSHAKE_RTO_MS, IsnSource, MAX_RTO_MS,
+    MIN_RTO_MS, MIN_SEND_MSS, RECEIVE_BUFFER, SEND_BUFFER, SWS_OVERRIDE_MS,
+    SYN_ACK_RETRIES, SYN_RETRIES, SegmentError, SegmentSink, State, Status, Table,
+}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func end_a() -> SocketAddr { SocketAddr(addr: ip_a(), port: 80) }
+func end_b() -> SocketAddr { SocketAddr(addr: ip_b(), port: 5000) }
+
+/// A's byte at offset `k` of what it writes.
+func pattern(k: Int) -> UInt8 { ((k * 7 + 1) % 256) as UInt8 }
+
+/// B's byte at offset `k` of what it sends.
+func b_pattern(k: Int) -> UInt8 { ((k * 5 + 2) % 256) as UInt8 }
+
+func be16_at(b: &[UInt8], at: Int) -> UInt16 {
+    ((b[at] as UInt16) << 8) | (b[at + 1] as UInt16)
+}
+
+func be32_at(b: &[UInt8], at: Int) -> UInt32 {
+    ((be16_at(&b, at) as UInt32) << 16) | (be16_at(&b, at + 2) as UInt32)
+}
+
+// -----------------------------------------------------------------------------
+// What A sends, and what it should
+// -----------------------------------------------------------------------------
+
+/// A segment of A's as expected: its fields, its data as `n` bytes of
+/// `pattern` from `from`, and its checksum.
+struct Want {
+    seq: UInt32,
+    ack: UInt32,
+    flags: UInt8,
+    window: UInt16,
+    from: Int,
+    n: Int,
+    sum: UInt16,
+}
+
+/// A's segment from port 80 to 5000 with no options.
+func w(seq: UInt32, ack: UInt32, flags: UInt8, window: UInt16, from: Int,
+       n: Int, sum: UInt16) -> Want {
+    Want(seq: seq, ack: ack, flags: flags, window: window, from: from, n: n,
+         sum: sum)
+}
+
+static SEG_BYTES: Int = 1500
+static KEPT: Int = 8
+
+struct Sent {
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    len: Int,
+    bytes: [UInt8; SEG_BYTES],
+}
+
+/// Whether `s` is exactly the segment `w` describes, from A to B.
+func is(s: &Sent, w: &Want) -> Bool {
+    if s.src != ip_a() || s.dst != ip_b() || s.len != tcp.HEADER_BYTES + w.n {
+        return false
+    }
+    if be16_at(&s.bytes, 0) != 80 || be16_at(&s.bytes, 2) != 5000 ||
+       be32_at(&s.bytes, 4) != w.seq || be32_at(&s.bytes, 8) != w.ack ||
+       s.bytes[12] != 0x50 || s.bytes[13] != w.flags ||
+       be16_at(&s.bytes, 14) != w.window || be16_at(&s.bytes, 16) != w.sum ||
+       be16_at(&s.bytes, 18) != 0 {
+        return false
+    }
+    var i = 0
+    while i < w.n {
+        if s.bytes[tcp.HEADER_BYTES + i] != pattern(w.from + i) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Records what the table sends, and refuses once `room` is spent.
+struct Recorder {
+    count: Int,
+    sent: [Sent; KEPT],
+    room: Int,
+}
+
+extension Recorder {
+    static func fresh() -> Recorder {
+        Recorder(count: 0,
+                 sent: [Sent(src: ip_a(), dst: ip_a(), len: 0,
+                             bytes: [0; SEG_BYTES]); KEPT],
+                 room: 1_000_000)
+    }
+
+    /// Whether exactly the segments `wants` went out since the last look, in
+    /// order. Forgets them.
+    func got(&var self, wants: &[Want]) -> Bool {
+        var ok = self.count == wants.len()
+        var i = 0
+        while ok && i < wants.len() {
+            ok = is(&self.sent[i], &wants[i])
+            i = i + 1
+        }
+        if not ok {
+            self.show()
+        }
+        self.count = 0
+        ok
+    }
+
+    /// Whether exactly one segment went out since the last look, and it is
+    /// `golden`. Forgets it.
+    func got_bytes(&var self, golden: &[UInt8]) -> Bool {
+        var ok = self.count == 1 && self.sent[0].len == golden.len()
+        var i = 0
+        while ok && i < golden.len() {
+            ok = self.sent[0].bytes[i] == golden[i]
+            i = i + 1
+        }
+        if not ok {
+            self.show()
+        }
+        self.count = 0
+        ok
+    }
+
+    /// Whether nothing went out since the last look.
+    func silent(&var self) -> Bool {
+        let ok = self.count == 0
+        if not ok {
+            self.show()
+        }
+        self.count = 0
+        ok
+    }
+
+    func forget(&var self) {
+        self.count = 0
+    }
+
+    func show(&self) {
+        print("sent {} segments", self.count)
+        var i = 0
+        while i < self.count && i < KEPT {
+            print("  seq {} ack {} flags {} window {} sum {} data {}",
+                  be32_at(&self.sent[i].bytes, 4), be32_at(&self.sent[i].bytes, 8),
+                  self.sent[i].bytes[13], be16_at(&self.sent[i].bytes, 14),
+                  be16_at(&self.sent[i].bytes, 16),
+                  self.sent[i].len - tcp.HEADER_BYTES)
+            i = i + 1
+        }
+    }
+}
+
+extension Recorder: SegmentSink {
+    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr,
+              segment: &[UInt8]) -> Result<Void, SegmentError> {
+        if self.room == 0 {
+            return SegmentError.Full
+        }
+        self.room = self.room - 1
+        if self.count < KEPT {
+            let i = self.count
+            self.sent[i].src = src
+            self.sent[i].dst = dst
+            self.sent[i].len = segment.len()
+            var j = 0
+            while j < segment.len() {
+                self.sent[i].bytes[j] = segment[j]
+                j = j + 1
+            }
+        }
+        self.count = self.count + 1
+        return
+    }
+}
+
+/// Answers `value` for every connection.
+struct FixedIsn {
+    value: UInt32,
+}
+
+extension FixedIsn: IsnSource {
+    func isn(&var self, local: SocketAddr, remote: SocketAddr) -> UInt32 {
+        self.value
+    }
+}
+
+// -----------------------------------------------------------------------------
+// B's segments
+// -----------------------------------------------------------------------------
+
+struct Seg {
+    len: Int,
+    bytes: [UInt8; SEG_BYTES],
+}
+
+/// B's segment of `flags` at `seq` acknowledging `ack`, offering `window`,
+/// with `data` bytes of `b_pattern` from `from`, from B's port `port`.
+func from_b(seq: UInt32, ack: UInt32, flags: UInt8, data: Int = 0,
+            window: UInt16 = 8192, from: Int = 0, port: UInt16 = 5000,
+            mss: UInt16? = None) -> Seg {
+    var s = Seg(len: 0, bytes: [0; SEG_BYTES])
+    let at = if mss != None { tcp.HEADER_BYTES + 4 } else { tcp.HEADER_BYTES }
+    var i = 0
+    while i < data {
+        s.bytes[at + i] = b_pattern(from + i)
+        i = i + 1
+    }
+    let h = Header(src_port: port, dst_port: 80, seq: seq, ack: ack,
+                   flags: flags, window: window, mss: mss)
+    s.len = tcp.write_segment(&var s.bytes, ip_b(), ip_a(), &h, data)
+    s
+}
+
+// -----------------------------------------------------------------------------
+// Golden bytes: A's handshake segments, with the MSS option
+// -----------------------------------------------------------------------------
+
+/// A's SYN: seq 1000, window 4096, MSS 1460. Checksum 0x5C64.
+static A_SYN: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x02, 0x10, 0x00, 0x5C, 0x64, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+/// A's SYN,ACK: seq 1000, ack 9001, window 4096, MSS 1460. Checksum 0x392B.
+static A_SYN_ACK: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x23, 0x29,
+    0x60, 0x12, 0x10, 0x00, 0x39, 0x2B, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+// -----------------------------------------------------------------------------
+// The rig
+// -----------------------------------------------------------------------------
+
+/// A table, the connection under test, and what drives it: how much A has
+/// written and read so far.
+struct Rig {
+    table: Table,
+    id: ConnId,
+    out: Recorder,
+    isn: FixedIsn,
+    written: Int,
+    read_so_far: Int,
+}
+
+extension Rig {
+    /// An empty table with least timeout `min_rto`, its id a listener's that
+    /// was opened and closed again.
+    static func fresh(min_rto: UInt64) -> Rig {
+        var table = Table(min_rto_ms: min_rto)
+        var out = Recorder.fresh()
+        let gone = try! table.listen(1)
+        let _ = table.close(gone, 0, &var out)
+        Rig(table: table, id: gone, out: out, isn: FixedIsn(value: 1000),
+            written: 0, read_so_far: 0)
+    }
+
+    func feed_at(&var self, s: &Seg, now: UInt64) -> Result<Void, TcpDrop> {
+        self.table.receive(ip_b(), ip_a(), &s.bytes[..s.len], now,
+                           &var self.isn, &var self.out)
+    }
+
+    func feed(&var self, s: &Seg) -> Result<Void, TcpDrop> {
+        self.feed_at(&s, 0)
+    }
+
+    /// Writes the next `n` bytes of A's stream at `now`, and answers how many
+    /// were taken.
+    func write_at(&var self, n: Int, now: UInt64) -> Result<Int, CallError> {
+        var data: [UInt8; 3000] = [0; 3000]
+        var i = 0
+        while i < n {
+            data[i] = pattern(self.written + i)
+            i = i + 1
+        }
+        let taken = try self.table.write(self.id, &data[..n], now, &var self.out)
+        self.written = self.written + taken
+        return taken
+    }
+
+    func write(&var self, n: Int) -> Int {
+        try! self.write_at(n, 0)
+    }
+
+    /// Reads up to `n` bytes at `now`, and answers how many, or 0 and false
+    /// when they are not the next of B's stream.
+    func read_at(&var self, n: Int, now: UInt64) -> Result<Int, CallError> {
+        var into: [UInt8; 3000] = [0; 3000]
+        let got = try self.table.read(self.id, &var into[..n], now, &var self.out)
+        var i = 0
+        while i < got {
+            check(into[i] == b_pattern(self.read_so_far + i),
+                  "the bytes read are B's, in order")
+            i = i + 1
+        }
+        self.read_so_far = self.read_so_far + got
+        return got
+    }
+
+    func poll(&var self, now: UInt64) {
+        self.table.poll(now, &var self.out)
+    }
+
+    func state(&self) -> State {
+        self.table.state(self.id)
+    }
+
+    func status(&self) -> Status {
+        try! self.table.status(self.id)
+    }
+}
+
+/// An active open at time 0 from A to B, whose SYN,ACK arrives at `rtt`
+/// offering `mss` and `window`, on a table whose least timeout is `min_rto`.
+/// What A sent is forgotten.
+func connected(mss: UInt16?, window: UInt16, min_rto: UInt64,
+               rtt: UInt64) -> Rig {
+    var r = Rig.fresh(min_rto)
+    r.id = try! r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out)
+    let _ = r.feed_at(&from_b(9000, 1001, SYN | ACK, 0, window, 0, 5000, mss),
+                      rtt)
+    check(r.state() == State.Established, "the active open")
+    r.out.forget()
+    r
+}
+
+/// A listener on port 80, its id the rig's.
+func listening() -> Rig {
+    var r = Rig.fresh(MIN_RTO_MS)
+    r.id = try! r.table.listen(80)
+    r
+}
+
+/// Whether `r` failed with `reason`.
+func refused<T>(r: Result<T, CallError>, reason: CallError) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+/// Whether `r` succeeded with `value`.
+func is_ok<T: Equatable, E>(r: Result<T, E>, value: T) -> Bool {
+    match r {
+        case Ok(v) -> v == value,
+        case Err(_) -> false,
+    }
+}
+
+/// The timeout after `rto`'s expiry: doubled, to `MAX_RTO_MS`.
+func backed_off(rto: UInt64) -> UInt64 {
+    if 2 * rto > MAX_RTO_MS { MAX_RTO_MS } else { 2 * rto }
+}
+
+/// Whether `r` answered an id.
+func taken_id(r: Result<ConnId, CallError>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+/// Whether `r` succeeded.
+func taken<E>(r: Result<Void, E>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+/// Whether `r` failed with `reason`.
+func failed_with<T, E: Equatable>(r: Result<T, E>, reason: E) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sending
+// -----------------------------------------------------------------------------
+
+func segmenting() {
+    // A write of 250 to a peer whose segments hold 100: two full segments
+    // go, and the short last one waits for them (Nagle).
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    check(r.write(250) == 250, "the write is taken whole")
+    let first: [Want; 2] = [
+        w(1001, 9001, ACK, 4096, 0, 100, 0x09DF),
+        w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1),
+    ]
+    check(r.out.got(&first), "two segments of the peer's size")
+    let s = r.status()
+    check(s.snd_una == 1001 && s.snd_nxt == 1201 && s.queued == 250,
+          "SND.UNA, SND.NXT and the buffer after the first two")
+    check(taken(r.feed_at(&from_b(9001, 1101, ACK), 20)) && r.out.silent() &&
+          r.status().queued == 150 && r.status().snd_una == 1101,
+          "an acknowledgment frees what it covers; the tail still waits")
+    r.poll(1019)
+    check(r.out.silent(), "the acknowledgment restarted the timer")
+    let last: [Want; 1] = [w(1201, 9001, ACK | PSH, 4096, 200, 50, 0x08F1)]
+    check(taken(r.feed_at(&from_b(9001, 1201, ACK), 1019)) && r.out.got(&last),
+          "with nothing in flight the tail goes, pushed")
+    check(taken(r.feed_at(&from_b(9001, 1251, ACK), 1020)) && r.out.silent() &&
+          r.status().queued == 0 && r.status().snd_una == 1251,
+          "all of it acknowledged")
+    r.poll(100_000)
+    check(r.out.silent() && r.status().retries == 0 &&
+          r.status().rto_ms == MIN_RTO_MS, "and the timer is off")
+
+    // A write that fits one segment goes at once, pushed.
+    var one = connected(1460, 8192, MIN_RTO_MS, 0)
+    check(one.write(250) == 250, "one write")
+    let single: [Want; 1] = [w(1001, 9001, ACK | PSH, 4096, 0, 250, 0xC1EC)]
+    check(one.out.got(&single), "one segment, pushed")
+
+    // A peer offering a tiny segment is sent the floor.
+    var tiny = connected(1, 8192, MIN_RTO_MS, 0)
+    check(tiny.status().send_mss == MIN_SEND_MSS, "the size has a floor")
+    check(tiny.write(100) == 100, "a write to the tiny peer")
+    let floor: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 64, 0x027A)]
+    check(tiny.out.got(&floor), "a segment of the floor's size")
+}
+
+func send_window() {
+    // The peer offers 150: one full segment fits, and the next waits for
+    // room.
+    var r = connected(100, 150, MIN_RTO_MS, 0)
+    check(r.write(250) == 250, "the write")
+    let a: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(r.out.got(&a), "what the window holds")
+    let b: [Want; 1] = [w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1)]
+    check(taken(r.feed(&from_b(9001, 1101, ACK, 0, 150))) && r.out.got(&b),
+          "the window slides with the acknowledgment")
+    let c: [Want; 1] = [w(1201, 9001, ACK | PSH, 4096, 200, 50, 0x08F1)]
+    check(taken(r.feed(&from_b(9001, 1201, ACK, 0, 150))) && r.out.got(&c),
+          "and again")
+
+    // The window closes: a write waits, and goes when it reopens.
+    check(taken(r.feed(&from_b(9001, 1251, ACK, 0, 0))) && r.out.silent() &&
+          r.status().snd_wnd == 0, "the peer closes its window")
+    check(r.write(10) == 10 && r.out.silent(), "nothing goes into a closed window")
+    let d: [Want; 1] = [w(1251, 9001, ACK | PSH, 4096, 250, 10, 0x8DF7)]
+    check(taken(r.feed(&from_b(9001, 1251, ACK, 0, 100))) && r.out.got(&d),
+          "the window reopens and the write goes")
+}
+
+func sender_sws() {
+    // The peer's largest window is 1000, and it offers 100: 100 of a 300-byte
+    // write is less than a segment and less than half the largest window, so
+    // it waits, until the override timer sends it.
+    var r = connected(None, 1000, MIN_RTO_MS, 0)
+    check(taken(r.feed(&from_b(9001, 1001, ACK, 0, 100))) && r.out.silent(),
+          "the window shrinks to 100")
+    check(r.write(300) == 300 && r.out.silent(), "a silly window is not filled")
+    check(taken(r.feed_at(&from_b(9001, 1001, ACK, 0, 100), 100)) && r.out.silent(),
+          "a repeated window holds it still")
+    r.poll(SWS_OVERRIDE_MS - 1)
+    check(r.out.silent(), "not before the override timeout")
+    r.poll(SWS_OVERRIDE_MS)
+    let a: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(r.out.got(&a), "the override sends what fits")
+    check(taken(r.feed_at(&from_b(9001, 1101, ACK, 0, 100), 300)) &&
+          r.out.silent(), "the window is still silly")
+    r.poll(300 + SWS_OVERRIDE_MS - 1)
+    check(r.out.silent(), "held again")
+    let b: [Want; 1] = [w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1)]
+    r.poll(300 + SWS_OVERRIDE_MS)
+    check(r.out.got(&b), "and overridden again")
+    let c: [Want; 1] = [w(1201, 9001, ACK | PSH, 4096, 200, 100, 0x959C)]
+    check(taken(r.feed_at(&from_b(9001, 1201, ACK, 0, 1000), 600)) &&
+          r.out.got(&c), "a window that holds the rest takes it at once")
+
+    // The largest window is the largest offered, not the first.
+    var grown = connected(None, 100, MIN_RTO_MS, 0)
+    let _ = grown.feed(&from_b(9001, 1001, ACK, 0, 1000))
+    let _ = grown.feed(&from_b(9001, 1001, ACK, 0, 100))
+    check(grown.write(300) == 300 && grown.out.silent(),
+          "a window small beside the largest offered is silly")
+
+    // A hold ends when the window opens: the short tail left then waits for
+    // what is in flight, not for the override.
+    var opened = connected(100, 1000, MIN_RTO_MS, 0)
+    let _ = opened.feed(&from_b(9001, 1001, ACK, 0, 50))
+    check(opened.write(250) == 250 && opened.out.silent(), "held")
+    let two: [Want; 2] = [
+        w(1001, 9001, ACK, 4096, 0, 100, 0x09DF),
+        w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1),
+    ]
+    check(taken(opened.feed_at(&from_b(9001, 1001, ACK, 0, 1000), 10)) &&
+          opened.out.got(&two), "the window opens")
+    opened.poll(SWS_OVERRIDE_MS)
+    check(opened.out.silent(), "the tail waits on the segments in flight")
+
+    // Half the largest window, with nothing in flight, is worth sending.
+    var h = connected(None, 1000, MIN_RTO_MS, 0)
+    let _ = h.feed(&from_b(9001, 1001, ACK, 0, 500))
+    check(h.write(800) == 800, "a write past the window")
+    let half: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 500, 0xB482)]
+    check(h.out.got(&half), "half the largest window goes")
+}
+
+// -----------------------------------------------------------------------------
+// Receiving
+// -----------------------------------------------------------------------------
+
+func receive_window() {
+    var r = connected(1460, 8192, MIN_RTO_MS, 0)
+    let a: [Want; 1] = [w(1001, 10001, ACK, 3096, 0, 0, 0x50E8)]
+    check(taken(r.feed(&from_b(9001, 1001, ACK, 1000, 8192, 0))) &&
+          r.out.got(&a), "the window shrinks by what waits")
+    let b: [Want; 1] = [w(1001, 11001, ACK, 2096, 0, 0, 0x50E8)]
+    check(taken(r.feed(&from_b(10001, 1001, ACK, 1000, 8192, 1000))) &&
+          r.out.got(&b), "and again")
+    let c: [Want; 1] = [w(1001, 12001, ACK, 1096, 0, 0, 0x50E8)]
+    check(taken(r.feed(&from_b(11001, 1001, ACK, 1000, 8192, 2000))) &&
+          r.out.got(&c), "and again")
+    let d: [Want; 1] = [w(1001, 13001, ACK, 96, 0, 0, 0x50E8)]
+    check(taken(r.feed(&from_b(12001, 1001, ACK, 1000, 8192, 3000))) &&
+          r.out.got(&d), "and again")
+    // 200 bytes into a window of 96: the 96 are taken, the rest trimmed.
+    let closed: [Want; 1] = [w(1001, 13097, ACK, 0, 0, 0, 0x50E8)]
+    check(taken(r.feed(&from_b(13001, 1001, ACK, 200, 8192, 4000))) &&
+          r.out.got(&closed) && r.status().received == 4096 &&
+          r.status().rcv_wnd == 0, "the window closes, the excess trimmed")
+    // A probe at RCV.NXT is acknowledged with the closed window, and not
+    // taken; one past it is outside the window.
+    check(taken(r.feed(&from_b(13097, 1001, ACK, 1, 8192, 4096))) &&
+          r.out.got(&closed) && r.status().received == 4096,
+          "a probe of the closed window is answered")
+    check(failed_with(r.feed(&from_b(13098, 1001, ACK, 1, 8192, 4097)),
+                      TcpDrop.OutOfWindow) && r.out.got(&closed),
+          "a byte past RCV.NXT is outside a closed window")
+    // Reading 1000 would open less than a segment: the edge stays.
+    check(is_ok(r.read_at(1000, 0), 1000) && r.out.silent() &&
+          r.status().rcv_wnd == 0 && r.status().readable == 3096,
+          "a read that opens less than a segment is not announced")
+    let opened: [Want; 1] = [w(1001, 13097, ACK, 1500, 0, 0, 0x4B0C)]
+    check(is_ok(r.read_at(500, 0), 500) && r.out.got(&opened) &&
+          r.status().rcv_wnd == 1500,
+          "a read that opens a segment's worth announces the window")
+    let more: [Want; 1] = [w(1001, 14557, ACK, 40, 0, 0, 0x4B0C)]
+    check(taken(r.feed(&from_b(13097, 1001, ACK, 1460, 8192, 4096))) &&
+          r.out.got(&more), "the reopened window is used")
+    check(is_ok(r.read_at(3000, 0), 3000) && is_ok(r.read_at(3000, 0), 1056),
+          "everything waiting is read, in order")
+    check(refused(r.read_at(10, 0), CallError.WouldBlock),
+          "then there is nothing to read")
+
+    // Data and a FIN: the data is read, then the end. The FIN takes no room.
+    var f = connected(1460, 8192, MIN_RTO_MS, 0)
+    let fin_ack: [Want; 1] = [w(1001, 9012, ACK, 4086, 0, 0, 0x50E7)]
+    check(taken(f.feed(&from_b(9001, 1001, FIN | ACK, 10))) && f.out.got(&fin_ack),
+          "data and a FIN acknowledged")
+    check(f.state() == State.CloseWait && is_ok(f.read_at(100, 0), 10) &&
+          is_ok(f.read_at(100, 0), 0), "data before a FIN, then the end")
+
+    // Once the peer is done, reading opens no window.
+    var done = connected(1460, 8192, MIN_RTO_MS, 0)
+    let _ = done.feed(&from_b(9001, 1001, FIN | ACK, 1460))
+    done.out.forget()
+    check(is_ok(done.read_at(1460, 0), 1460) && done.out.silent(),
+          "no window is announced to a peer that has sent its FIN")
+
+    // A FIN behind data the window cuts off is not taken.
+    var cut = connected(1460, 8192, MIN_RTO_MS, 0)
+    let _ = cut.feed(&from_b(9001, 1001, ACK, 1000, 8192, 0))
+    let _ = cut.feed(&from_b(10001, 1001, ACK, 1000, 8192, 1000))
+    let _ = cut.feed(&from_b(11001, 1001, ACK, 1000, 8192, 2000))
+    let _ = cut.feed(&from_b(12001, 1001, ACK, 1000, 8192, 3000))
+    cut.out.forget()
+    let trimmed: [Want; 1] = [w(1001, 13097, ACK, 0, 0, 0, 0x50E8)]
+    check(taken(cut.feed(&from_b(13001, 1001, FIN | ACK, 200, 8192, 4000))) &&
+          cut.out.got(&trimmed) && cut.state() == State.Established,
+          "a FIN past the window is not taken")
+}
+
+// -----------------------------------------------------------------------------
+// Retransmission
+// -----------------------------------------------------------------------------
+
+/// The timeouts a backed-off timer goes through from 293 ms, to the cap.
+static BACKOFF: [UInt64; 8] = [586, 1172, 2344, 4688, 9376, 18752, 37504, 60000]
+
+func timeouts() {
+    // The handshake's round trip of 100 is the first measurement: SRTT 100,
+    // RTTVAR 50, RTO 100 + 4 * 50.
+    var r = connected(1460, 8192, 10, 100)
+    var s = r.status()
+    check(s.srtt_ms == 100 && s.rttvar_ms == 50 && s.rto_ms == 300,
+          "the first measurement")
+    check(is_ok(r.write_at(100, 1000), 100), "a write at 1000")
+    let s1: [Want; 1] = [w(1001, 9001, ACK | PSH, 4096, 0, 100, 0x09D7)]
+    check(r.out.got(&s1), "it goes")
+    r.poll(1299)
+    check(r.out.silent(), "not before the timeout")
+    r.poll(1300)
+    check(r.out.got(&s1) && r.status().rto_ms == 600 && r.status().retries == 1,
+          "the timeout sends it again and doubles")
+    r.poll(1899)
+    check(r.out.silent(), "not before the doubled timeout")
+    r.poll(1900)
+    check(r.out.got(&s1) && r.status().rto_ms == 1200 && r.status().retries == 2,
+          "and doubles again")
+    // Its acknowledgment measures nothing: it may be of either copy (Karn).
+    check(taken(r.feed_at(&from_b(9001, 1101, ACK), 2000)) && r.out.silent(),
+          "the retransmission is acknowledged")
+    s = r.status()
+    check(s.srtt_ms == 100 && s.rttvar_ms == 50 && s.rto_ms == 1200 &&
+          s.retries == 0, "no measurement, and the backed-off timeout stays")
+    check(is_ok(r.write_at(100, 2000), 100), "new data")
+    let s2: [Want; 1] = [w(1101, 9001, ACK | PSH, 4096, 100, 100, 0x4FB9)]
+    check(r.out.got(&s2), "it goes")
+    check(taken(r.feed_at(&from_b(9001, 1201, ACK), 2050)), "acknowledged at 50")
+    s = r.status()
+    check(s.srtt_ms == 93 && s.rttvar_ms == 50 && s.rto_ms == 293,
+          "a new measurement folds in, and the timeout comes back down")
+
+    // Backed off to the cap, and given up after the retries.
+    check(is_ok(r.write_at(100, 3000), 100), "data that is never acknowledged")
+    let s3: [Want; 1] = [w(1201, 9001, ACK | PSH, 4096, 200, 100, 0x959C)]
+    check(r.out.got(&s3), "it goes")
+    var at: UInt64 = 3000
+    var rto: UInt64 = 293
+    var k = 0
+    while k < 8 {
+        r.poll(at + rto - 1)
+        check(r.out.silent(), "each timeout is waited out")
+        at = at + rto
+        r.poll(at)
+        rto = BACKOFF[k]
+        check(r.out.got(&s3) && r.status().rto_ms == rto &&
+              r.status().retries == ((k + 1) as UInt32),
+              "each timeout resends and backs off, to the cap")
+        k = k + 1
+    }
+    check(rto == MAX_RTO_MS && DATA_RETRIES == 8, "the cap, after the retries")
+    r.poll(at + rto - 1)
+    check(r.out.silent() && r.state() == State.Established,
+          "the last timeout is waited out")
+    r.poll(at + rto)
+    check(r.out.silent() && r.state() == State.Closed &&
+          refused(r.table.status(r.id), CallError.TimedOut) &&
+          refused(r.write_at(1, at + rto), CallError.TimedOut),
+          "the connection is given up")
+
+    // With no least timeout, the clock's granularity is the floor.
+    var fine = connected(1460, 8192, 0, 0)
+    check(fine.status().rto_ms == 1, "a millisecond at the least")
+
+    // An acknowledgment up to the timed segment, not into it, measures
+    // nothing.
+    var t = connected(100, 8192, 10, 0)
+    let _ = t.write_at(200, 0)
+    let _ = t.feed_at(&from_b(9001, 1101, ACK), 50)
+    let _ = t.write_at(100, 60)
+    t.out.forget()
+    check(t.status().srtt_ms == 6, "the measurement of the first segment")
+    let _ = t.feed_at(&from_b(9001, 1201, ACK), 500)
+    check(t.status().srtt_ms == 6, "an acknowledgment short of the timed one")
+    let _ = t.feed_at(&from_b(9001, 1301, ACK), 600)
+    check(t.status().srtt_ms == 72, "the timed segment's own")
+
+    // A round trip shorter than the least timeout is held at it, and one
+    // whose timeout would pass the greatest is held at that.
+    var d = connected(1460, 8192, MIN_RTO_MS, 100)
+    check(d.status().rto_ms == MIN_RTO_MS, "the timeout's floor")
+    var slow = connected(1460, 8192, MIN_RTO_MS, 40_000)
+    check(slow.status().rto_ms == MAX_RTO_MS && slow.status().srtt_ms == 40_000,
+          "the timeout's cap")
+    var wild = connected(1460, 8192, MIN_RTO_MS, 0xFFFF_FFFF_FFFF_FF00)
+    check(wild.status().rto_ms == MAX_RTO_MS &&
+          wild.status().srtt_ms == MAX_RTO_MS,
+          "a measurement past the cap counts as the cap")
+}
+
+func go_back() {
+    // Three segments, the first lost: the timeout sends the first alone, and
+    // its acknowledgment sends the rest again.
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    check(r.write(300) == 300, "three segments' worth")
+    let all: [Want; 3] = [
+        w(1001, 9001, ACK, 4096, 0, 100, 0x09DF),
+        w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1),
+        w(1201, 9001, ACK | PSH, 4096, 200, 100, 0x959C),
+    ]
+    check(r.out.got(&all), "three segments")
+    r.poll(1000)
+    let first: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(r.out.got(&first) && r.status().snd_nxt == 1101,
+          "the earliest alone is sent again")
+    let rest: [Want; 2] = [
+        w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1),
+        w(1201, 9001, ACK | PSH, 4096, 200, 100, 0x959C),
+    ]
+    check(taken(r.feed_at(&from_b(9001, 1101, ACK), 1100)) && r.out.got(&rest),
+          "its acknowledgment sends the rest again")
+    check(taken(r.feed_at(&from_b(9001, 1301, ACK), 1200)) && r.out.silent() &&
+          r.status().queued == 0, "all acknowledged")
+
+    // The peer had everything: its acknowledgment is past SND.NXT and within
+    // what was sent.
+    var p = connected(100, 8192, MIN_RTO_MS, 0)
+    let _ = p.write(300)
+    p.out.forget()
+    p.poll(1000)
+    check(p.out.got(&first), "the earliest again")
+    check(taken(p.feed_at(&from_b(9001, 1301, ACK), 1100)) && p.out.silent() &&
+          p.status().snd_nxt == 1301 && p.status().queued == 0,
+          "an acknowledgment of everything ever sent is taken")
+    check(failed_with(p.feed_at(&from_b(9001, 1302, ACK), 1100),
+                      TcpDrop.AckUnsent),
+          "one past it is not")
+    p.out.forget()
+}
+
+func handshake_retransmitted() {
+    // The SYN, sent again on each timeout, doubling.
+    var r = Rig.fresh(MIN_RTO_MS)
+    r.id = try! r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out)
+    check(r.out.got_bytes(&A_SYN), "the SYN")
+    r.poll(999)
+    check(r.out.silent(), "not before the timeout")
+    r.poll(1000)
+    check(r.out.got_bytes(&A_SYN) && r.status().rto_ms == 2000, "the SYN again")
+    r.poll(2999)
+    check(r.out.silent(), "not before the doubled timeout")
+    r.poll(3000)
+    check(r.out.got_bytes(&A_SYN) && r.status().rto_ms == 4000, "and again")
+    let ack: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 0, 0x50E8)]
+    let synack = from_b(9000, 1001, SYN | ACK, 0, 8192, 0, 5000, 1460)
+    check(taken(r.feed_at(&synack, 3500)) && r.out.got(&ack) &&
+          r.state() == State.Established,
+          "the SYN,ACK at last")
+    let s = r.status()
+    check(s.srtt_ms == 0 && s.rto_ms == HANDSHAKE_RTO_MS,
+          "no measurement of a resent SYN, and data starts at three seconds")
+
+    // A SYN never answered: given up after its retries.
+    var g = Rig.fresh(MIN_RTO_MS)
+    g.id = try! g.table.connect(end_a(), end_b(), 0, &var g.isn, &var g.out)
+    g.out.forget()
+    var at: UInt64 = 0
+    var rto: UInt64 = 1000
+    var k: UInt32 = 0
+    while k < SYN_RETRIES {
+        at = at + rto
+        g.poll(at)
+        check(g.out.got_bytes(&A_SYN) && g.state() == State.SynSent,
+              "each retry of the SYN")
+        rto = backed_off(rto)
+        k = k + 1
+    }
+    g.poll(at + rto - 1)
+    check(g.out.silent() && g.state() == State.SynSent, "the last wait")
+    g.poll(at + rto)
+    check(g.out.silent() && g.state() == State.Closed &&
+          refused(g.table.status(g.id), CallError.TimedOut),
+          "an unanswered SYN is given up")
+    check(at + rto >= 180_000, "after three minutes at the least")
+
+    // The FIN, sent again.
+    var f = connected(1460, 8192, MIN_RTO_MS, 0)
+    let fin: [Want; 1] = [w(1001, 9001, FIN | ACK, 4096, 0, 0, 0x50E7)]
+    check(taken(f.table.close(f.id, 0, &var f.out)) && f.out.got(&fin),
+          "the FIN")
+    f.poll(999)
+    check(f.out.silent(), "not before the timeout")
+    f.poll(1000)
+    check(f.out.got(&fin) && f.state() == State.FinWait1 &&
+          f.status().rto_ms == 2000, "the FIN again")
+    check(taken(f.feed_at(&from_b(9001, 1002, ACK), 1500)) &&
+          f.state() == State.FinWait2, "acknowledged")
+    f.poll(100_000)
+    check(f.out.silent(), "and nothing more")
+
+    // Data written before the handshake ends waits for it, and so does the
+    // FIN behind it.
+    var early = listening()
+    let _ = early.feed(&from_b(9000, 0, SYN))
+    early.id = early.table.find(end_a(), end_b())!
+    early.out.forget()
+    check(early.write(600) == 600 && early.out.silent(), "data in SYN-RECEIVED")
+    check(taken(early.table.close(early.id, 0, &var early.out)) &&
+          early.out.silent() && early.state() == State.FinWait1,
+          "and a close behind it, a full segment's worth waiting too")
+    let head536: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 536, 0x2350)]
+    check(taken(early.feed(&from_b(9001, 1001, ACK))) && early.out.got(&head536),
+          "the handshake's ACK lets them go")
+    let rest64: [Want; 1] = [w(1537, 9001, ACK | PSH | FIN, 4096, 536, 64, 0xFF56)]
+    check(taken(early.feed(&from_b(9001, 1537, ACK))) && early.out.got(&rest64),
+          "the rest, and the FIN")
+
+    // A handshake timed out while a FIN waits: the SYN,ACK alone goes again.
+    var sf = listening()
+    let _ = sf.feed(&from_b(9000, 0, SYN))
+    sf.id = sf.table.find(end_a(), end_b())!
+    let _ = sf.table.close(sf.id, 0, &var sf.out)
+    sf.out.forget()
+    sf.poll(1000)
+    check(sf.out.got_bytes(&A_SYN_ACK), "the SYN,ACK alone, not the FIN with it")
+
+    // A FIN behind data rides on its last segment.
+    var d = connected(100, 8192, MIN_RTO_MS, 0)
+    check(d.write(150) == 150, "data")
+    let head: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(d.out.got(&head), "its first segment")
+    check(taken(d.table.close(d.id, 0, &var d.out)) && d.out.silent() &&
+          d.state() == State.FinWait1, "the FIN waits behind the data")
+    let tail: [Want; 1] = [w(1101, 9001, ACK | PSH | FIN, 4096, 100, 50, 0x65AF)]
+    check(taken(d.feed(&from_b(9001, 1101, ACK))) && d.out.got(&tail),
+          "and goes with the last of it")
+    check(taken(d.feed(&from_b(9001, 1151, ACK))) &&
+          d.state() == State.FinWait1, "the data acknowledged, not the FIN")
+    check(taken(d.feed(&from_b(9001, 1152, ACK))) &&
+          d.state() == State.FinWait2, "then the FIN")
+}
+
+func syn_received_reclaimed() {
+    // A SYN,ACK sent again on each timeout; never answered, the connection is
+    // freed and the listener goes on.
+    var r = listening()
+    let listener = r.id
+    check(taken(r.feed(&from_b(9000, 0, SYN))) && r.out.got_bytes(&A_SYN_ACK),
+          "the SYN,ACK")
+    let spawned = r.table.find(end_a(), end_b())!
+    var at: UInt64 = 0
+    var rto: UInt64 = 1000
+    var k: UInt32 = 0
+    while k < SYN_ACK_RETRIES {
+        at = at + rto
+        r.poll(at)
+        check(r.out.got_bytes(&A_SYN_ACK) &&
+              r.table.state(spawned) == State.SynReceived,
+              "each retry of the SYN,ACK")
+        rto = backed_off(rto)
+        k = k + 1
+    }
+    r.poll(at + rto - 1)
+    check(r.out.silent() && r.table.state(spawned) == State.SynReceived,
+          "the last wait")
+    r.poll(at + rto)
+    check(r.out.silent() && r.table.find(end_a(), end_b()) == None &&
+          r.table.state(listener) == State.Listen &&
+          refused(r.table.status(spawned), CallError.TimedOut),
+          "an unanswered SYN,ACK frees its slot")
+
+    // SYNs that are never completed fill the table only until reclaimed.
+    var f = listening()
+    var port: UInt16 = 6001
+    while port <= 6007 {
+        check(taken(f.feed(&from_b(9000, 0, SYN, 0, 8192, 0, port))),
+              "a SYN that will not be completed")
+        port = port + 1
+    }
+    f.out.forget()
+    check(failed_with(f.feed(&from_b(9000, 0, SYN, 0, 8192, 0, 6008)),
+                      TcpDrop.TableFull), "the table is full")
+    at = 0
+    rto = 1000
+    k = 0
+    while k <= SYN_ACK_RETRIES {
+        at = at + rto
+        f.poll(at)
+        rto = backed_off(rto)
+        k = k + 1
+    }
+    f.out.forget()
+    check(taken(f.feed_at(&from_b(9000, 0, SYN, 0, 8192, 0, 6008), at)) &&
+          f.out.count == 1, "the reclaimed slots take new SYNs")
+}
+
+// -----------------------------------------------------------------------------
+// Output the sink refuses
+// -----------------------------------------------------------------------------
+
+func owed() {
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    r.out.room = 1
+    check(r.write(250) == 250, "the write")
+    let a: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(r.out.got(&a) && r.status().snd_nxt == 1101,
+          "the sink took one segment, and the next is not counted sent")
+    r.out.room = 1_000_000
+    let b: [Want; 1] = [w(1101, 9001, ACK, 4096, 100, 100, 0x4FC1)]
+    check(taken(r.table.output(0, &var r.out)) && r.out.got(&b),
+          "output sends what was refused")
+    // An acknowledgment refused is owed too, and rides on the data that goes
+    // with it.
+    r.out.room = 0
+    check(taken(r.feed(&from_b(9001, 1201, ACK, 10))) && r.out.silent(),
+          "the sink refuses the answer")
+    check(failed_with(r.table.output(0, &var r.out), SegmentError.Full),
+          "output says it was refused")
+    r.out.room = 1_000_000
+    let c: [Want; 1] = [w(1201, 9011, ACK | PSH, 4086, 200, 50, 0x08F1)]
+    check(taken(r.table.output(0, &var r.out)) && r.out.got(&c),
+          "the owed acknowledgment rides on the data")
+    var p = connected(100, 8192, MIN_RTO_MS, 0)
+    p.out.room = 0
+    let _ = p.feed(&from_b(9001, 1001, ACK, 10))
+    p.out.room = 1_000_000
+    let pure: [Want; 1] = [w(1001, 9011, ACK, 4086, 0, 0, 0x50E8)]
+    check(taken(p.table.output(0, &var p.out)) && p.out.got(&pure),
+          "an owed acknowledgment goes alone when nothing else does")
+    check(taken(p.table.output(0, &var p.out)) && p.out.silent(),
+          "and is owed no more")
+}
+
+// -----------------------------------------------------------------------------
+// The calls
+// -----------------------------------------------------------------------------
+
+func calls() {
+    var l = listening()
+    let listener = l.id
+    check(refused(l.write_at(1, 0), CallError.Listening) &&
+          refused(l.read_at(1, 0), CallError.Listening),
+          "a listener carries no data")
+    check(refused(l.table.accept(listener), CallError.WouldBlock),
+          "nothing to accept yet")
+    let _ = l.feed(&from_b(9000, 0, SYN))
+    check(refused(l.table.accept(listener), CallError.WouldBlock),
+          "a connection in SYN-RECEIVED is not accepted")
+    let _ = l.feed(&from_b(9001, 1001, ACK))
+    let id = try! l.table.accept(listener)
+    check(id == l.table.find(end_a(), end_b())! &&
+          refused(l.table.accept(listener), CallError.WouldBlock),
+          "an established connection is accepted, once")
+    check(refused(l.table.accept(id), CallError.NotListening),
+          "a connection accepts nothing")
+    l.id = id
+    check(refused(l.read_at(10, 0), CallError.WouldBlock), "nothing to read")
+    check(l.write(5) == 5 && l.status().queued == 5, "a write")
+    l.out.forget()
+    check(taken(l.feed(&from_b(9001, 1006, FIN | ACK))) &&
+          l.state() == State.CloseWait && is_ok(l.read_at(10, 0), 0),
+          "once the peer is done, a read answers the end")
+    check(l.write(5) == 5, "CLOSE-WAIT still writes")
+    let _ = l.table.close(l.id, 0, &var l.out)
+    check(refused(l.write_at(5, 0), CallError.Closing), "a closed connection does not")
+
+    // A write is taken as far as the buffer goes.
+    var full = connected(1460, 0, MIN_RTO_MS, 0)
+    check(full.write(3000) == SEND_BUFFER && full.out.silent(),
+          "a write past the buffer is taken in part")
+    check(refused(full.write_at(1, 0), CallError.WouldBlock) &&
+          full.status().queued == SEND_BUFFER, "a full buffer takes nothing")
+
+    // A connection the peer resets answers the reset; one aborted answers
+    // that it is gone.
+    var reset = connected(1460, 8192, MIN_RTO_MS, 0)
+    check(failed_with(reset.feed(&from_b(9001, 0, RST)), TcpDrop.Reset) &&
+          reset.state() == State.Closed, "the peer resets it")
+    check(refused(reset.write_at(1, 0), CallError.Reset) &&
+          refused(reset.read_at(1, 0), CallError.Reset) &&
+          refused(reset.table.status(reset.id), CallError.Reset),
+          "every call answers the reset")
+    var aborted = connected(1460, 8192, MIN_RTO_MS, 0)
+    let _ = aborted.table.abort(aborted.id, &var aborted.out)
+    check(refused(aborted.write_at(1, 0), CallError.NoConnection),
+          "an aborted connection is gone")
+
+    // Closing a listener aborts what it spawned and nobody accepted.
+    var c = listening()
+    let _ = c.feed(&from_b(9000, 0, SYN))
+    let _ = c.feed(&from_b(9001, 1001, ACK))
+    let orphan = c.table.find(end_a(), end_b())!
+    c.out.forget()
+    let rst: [Want; 1] = [w(1001, 0, RST, 0, 0, 0, 0x841D)]
+    check(taken(c.table.close(c.id, 0, &var c.out)) && c.out.got(&rst) &&
+          c.table.state(orphan) == State.Closed,
+          "an unaccepted connection is reset with its listener")
+    var turned = listening()
+    let _ = turned.feed(&from_b(9000, 0, SYN))
+    let _ = turned.feed(&from_b(9001, 1001, ACK))
+    let child = turned.table.find(end_a(), end_b())!
+    turned.out.forget()
+    let other = SocketAddr(addr: ip_b(), port: 5001)
+    let sent = turned.table.connect_listener(turned.id, ip_a(), other, 0,
+                                             &var turned.isn, &var turned.out)
+    check(taken(sent) && turned.out.count == 2 &&
+          is(&turned.out.sent[0], &rst[0]) &&
+          turned.table.state(child) == State.Closed,
+          "a listener turned into a connection resets what it spawned")
+    // A listener accepts only what it spawned.
+    var two = listening()
+    let eighty = two.id
+    let other_l = try! two.table.listen(81)
+    let _ = two.feed(&from_b(9000, 0, SYN))
+    let _ = two.feed(&from_b(9001, 1001, ACK))
+    check(refused(two.table.accept(other_l), CallError.WouldBlock) &&
+          taken_id(two.table.accept(eighty)), "each listener its own")
+
+    // An ephemeral port is one nothing uses, a closed listener's again.
+    var ports = Table.empty()
+    var po = Recorder.fresh()
+    let held = try! ports.listen(49152)
+    check(ports.ephemeral_port() == 49153, "a port in use is skipped")
+    var again = Table.empty()
+    let gone = try! again.listen(49152)
+    let _ = again.close(gone, 0, &var po)
+    check(again.ephemeral_port() == 49152, "a closed one's port is free")
+
+    var kept = listening()
+    let _ = kept.feed(&from_b(9000, 0, SYN))
+    let _ = kept.feed(&from_b(9001, 1001, ACK))
+    let mine = try! kept.table.accept(kept.id)
+    kept.out.forget()
+    check(taken(kept.table.close(kept.id, 0, &var kept.out)) &&
+          kept.out.silent() && kept.table.state(mine) == State.Established,
+          "an accepted one outlives its listener")
+}
+
+// -----------------------------------------------------------------------------
+// Edges of the send path
+// -----------------------------------------------------------------------------
+
+/// A simultaneous close with data still unsent: CLOSING sends it, with the
+/// FIN, once what was in flight is acknowledged.
+func closing_sends() {
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    check(r.write(250) == 250, "the write")
+    r.out.forget()
+    check(taken(r.table.close(r.id, 0, &var r.out)) && r.out.silent(),
+          "the FIN waits behind the tail")
+    let ack_fin: [Want; 1] = [w(1201, 9002, ACK, 4096, 0, 0, 0x501F)]
+    check(taken(r.feed_at(&from_b(9001, 1001, FIN | ACK), 10)) &&
+          r.state() == State.Closing && r.out.got(&ack_fin),
+          "the peer's FIN crosses ours")
+    let tail: [Want; 1] = [w(1201, 9002, ACK | PSH | FIN, 4096, 200, 50, 0x08EF)]
+    check(taken(r.feed_at(&from_b(9002, 1201, ACK), 20)) && r.out.got(&tail),
+          "CLOSING sends the tail and the FIN")
+    check(taken(r.feed_at(&from_b(9002, 1252, ACK), 30)) &&
+          r.state() == State.TimeWait, "and they are acknowledged")
+}
+
+/// SND.UNA back at ISS after the sequence space has gone round: data goes as
+/// data, and a timeout sends it again as data.
+func round_to_iss() {
+    var r = connected(1460, 8192, MIN_RTO_MS, 0)
+    check(taken(r.table.skip_sequence(r.id, 0xFFFF_FFFF)) &&
+          r.status().snd_una == 1000, "SND.UNA at ISS")
+    check(r.write(1) == 1, "a byte")
+    let byte: [Want; 1] = [w(1000, 9001, ACK | PSH, 4096, 0, 1, 0x4FE0)]
+    check(r.out.got(&byte), "it goes as data, not as a SYN,ACK")
+    r.poll(1000)
+    check(r.out.got(&byte) && r.state() == State.Established,
+          "and is sent again as data")
+    check(taken(r.feed_at(&from_b(9001, 1001, ACK), 1100)) &&
+          r.status().queued == 0, "acknowledged")
+    let _ = r.write(1)
+    check(refused(r.table.skip_sequence(r.id, 1), CallError.WouldBlock),
+          "only a connection with nothing in flight skips")
+
+    // Data across 2^32.
+    var z = Rig.fresh(MIN_RTO_MS)
+    z.isn = FixedIsn(value: 0xFFFF_FF9B)
+    z.id = try! z.table.connect(end_a(), end_b(), 0, &var z.isn, &var z.out)
+    let _ = z.feed(&from_b(9000, 0xFFFF_FF9C, SYN | ACK, 0, 8192, 0, 5000, 1460))
+    z.out.forget()
+    check(z.write(200) == 200, "a write across zero")
+    let across: [Want; 1] = [w(4294967196, 9001, ACK | PSH, 4096, 0, 200, 0x0D60)]
+    check(z.out.got(&across), "one segment across 2^32")
+    check(taken(z.feed(&from_b(9001, 0x64, ACK))) && z.status().queued == 0 &&
+          z.status().snd_una == 0x64, "acknowledged past zero")
+}
+
+/// A timeout's resend stays inside the peer's window.
+func resend_in_window() {
+    var r = connected(1460, 100, MIN_RTO_MS, 0)
+    check(r.write(300) == 300, "the write")
+    let first: [Want; 1] = [w(1001, 9001, ACK, 4096, 0, 100, 0x09DF)]
+    check(r.out.got(&first), "what the window holds")
+    r.poll(1000)
+    check(r.out.got(&first), "the resend fits the same window")
+}
+
+/// After a timeout takes SND.NXT back, an acknowledgment with no data and a
+/// reset carry SND.MAX.
+func after_go_back() {
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    let _ = r.write(300)
+    r.out.forget()
+    r.poll(1000)
+    r.out.forget()
+    let ack: [Want; 1] = [w(1301, 9001, ACK, 4096, 0, 0, 0x4FBC)]
+    check(failed_with(r.feed_at(&from_b(8000, 1001, ACK, 1), 1100),
+                      TcpDrop.OutOfWindow) && r.out.got(&ack),
+          "an acknowledgment carries SND.MAX")
+    let rst: [Want; 1] = [w(1301, 0, RST, 0, 0, 0, 0x82F1)]
+    check(taken(r.table.abort(r.id, &var r.out)) && r.out.got(&rst),
+          "a reset carries SND.MAX")
+}
+
+/// An abort's reset the sink refuses is owed, and its slot is not taken
+/// again until the reset has gone.
+func reset_owed() {
+    var r = connected(1460, 8192, MIN_RTO_MS, 0)
+    r.out.room = 0
+    check(taken(r.table.abort(r.id, &var r.out)) && r.out.silent(),
+          "the sink refuses the reset")
+    let other = SocketAddr(addr: ip_b(), port: 5001)
+    let _ = try! r.table.connect(end_a(), other, 0, &var r.isn, &var r.out)
+    r.out.room = 1_000_000
+    let rst: [Want; 1] = [w(1001, 0, RST, 0, 0, 0, 0x841D)]
+    let flushed = r.table.output(0, &var r.out)
+    check(taken(flushed) && r.out.count == 2 && is(&r.out.sent[0], &rst[0]),
+          "the reset goes, ahead of the next connection's SYN")
+    r.out.forget()
+}
+
+/// An out-of-order segment whose acknowledgment empties the flight lets the
+/// held tail go, carrying the acknowledgment of what is expected.
+func out_of_order_acks() {
+    var r = connected(100, 8192, MIN_RTO_MS, 0)
+    let _ = r.write(250)
+    r.out.forget()
+    let tail: [Want; 1] = [w(1201, 9001, ACK | PSH, 4096, 200, 50, 0x08F1)]
+    check(failed_with(r.feed(&from_b(9100, 1201, ACK, 10)), TcpDrop.OutOfOrder) &&
+          r.out.got(&tail), "the tail goes with the duplicate acknowledgment")
+}
+
+/// A write that runs past the send ring's end wraps to its start.
+func ring_wraps() {
+    var r = connected(1460, 8192, MIN_RTO_MS, 0)
+    check(r.write(2000) == 2000, "nearly the whole buffer")
+    let _ = r.feed(&from_b(9001, 2461, ACK))
+    let _ = r.feed(&from_b(9001, 3001, ACK))
+    r.out.forget()
+    check(r.write(200) == 200, "a write across the ring's end")
+    let wrapped: [Want; 1] = [w(3001, 9001, ACK | PSH, 4096, 2000, 200, 0x3D81)]
+    check(r.out.got(&wrapped), "its bytes in order")
+}
+
+/// The passive side's handshake, once retransmitted, starts its data at the
+/// handshake's timeout too.
+func passive_handshake_rto() {
+    var r = listening()
+    let _ = r.feed(&from_b(9000, 0, SYN))
+    r.id = r.table.find(end_a(), end_b())!
+    r.out.forget()
+    r.poll(1000)
+    check(r.out.got_bytes(&A_SYN_ACK), "the SYN,ACK again")
+    check(taken(r.feed_at(&from_b(9001, 1001, ACK), 1500)) &&
+          r.state() == State.Established &&
+          r.status().rto_ms == HANDSHAKE_RTO_MS, "data starts at three seconds")
+}
+
+/// A read into no bytes is refused, whether data waits or the stream ended.
+func read_no_room() {
+    var r = connected(1460, 8192, MIN_RTO_MS, 0)
+    let _ = r.feed(&from_b(9001, 1001, ACK, 10))
+    check(refused(r.read_at(0, 0), CallError.NoRoom), "data waits")
+    let _ = r.feed(&from_b(9011, 1001, FIN | ACK))
+    check(is_ok(r.read_at(100, 0), 10) && refused(r.read_at(0, 0), CallError.NoRoom) &&
+          is_ok(r.read_at(1, 0), 0), "the end is 0 only with room for data")
+}
+
+func main() {
+    closing_sends()
+    round_to_iss()
+    resend_in_window()
+    after_go_back()
+    out_of_order_acks()
+    reset_owed()
+    ring_wraps()
+    passive_handshake_rto()
+    read_no_room()
+    segmenting()
+    send_window()
+    sender_sws()
+    receive_window()
+    timeouts()
+    go_back()
+    handshake_retransmitted()
+    syn_received_reclaimed()
+    owed()
+    calls()
+}

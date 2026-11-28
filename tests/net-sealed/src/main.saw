@@ -6,7 +6,9 @@
 // by field. It reads and writes every field the TCP/IP stack's state rests on
 // (its ARP table and pending queue, its port table, its rate limit, its
 // counts, its configuration, a parsed header's lengths, the stack's own
-// state) and builds each of those it can name field by field. None of these
+// state, and TCP's: its connection table and ids, a parsed segment's bounds,
+// its counts, its outbox and its sequence numbers' key) and builds each of
+// those it can name field by field. None of these
 // is reachable outside its package, so the compile refuses each and the
 // program is never linked (`net_fields_sealed`).
 
@@ -20,6 +22,10 @@ import netstack.arp
 import netstack.icmp
 import netstack.ipv4
 import netstack.udp
+import netstack.isn
+import netstack.tcp
+import netstack.tcpconn
+import netstack.tcpout
 import sosmain
 
 // A window over `mem`, made the one way a window is made.
@@ -75,6 +81,37 @@ func stack(x: &var Stack, y: &Stack) {
     x.unreachable = y.unreachable
     x.ident = y.ident
     x.tally = y.tally
+    x.tcp = y.tcp
+    x.tcp_tally = y.tcp_tally
+    x.tcp_out = y.tcp_out
+    x.tcp_isn = y.tcp_isn
+}
+
+func tcp_table(x: &var tcpconn.Table, y: &tcpconn.Table, i: &var tcpconn.ConnId,
+               j: &tcpconn.ConnId) {
+    x.slots = y.slots
+    x.generations = y.generations
+    x.min_rto = y.min_rto
+    x.next_port = y.next_port
+    i.slot = j.slot
+    i.generation = j.generation
+}
+
+func tcp_parts(r: &var tcp.Received, q: &tcp.Received, c: &var tcp.TcpCounts,
+               d: &tcp.TcpCounts, o: &var tcpout.Outbox, p: &tcpout.Outbox,
+               k: &var isn.KeyedIsn, l: &isn.KeyedIsn) {
+    r.data_from = q.data_from
+    r.data_to = q.data_to
+    c.dropped = d.dropped
+    o.bytes = p.bytes
+    o.lens = p.lens
+    o.dsts = p.dsts
+    o.count = p.count
+    o.refused = p.refused
+    k.k0 = l.k0
+    k.k1 = l.k1
+    k.keyed = l.keyed
+    k.now = l.now
 }
 
 // The stack's state built field by field, every check skipped.
@@ -93,6 +130,12 @@ func forged() {
                   ports: udp.PortTable.empty(),
                   unreachable: icmp.RateLimit.fresh(), ident: 0,
                   tally: Counters.zero())
+    let id = tcpconn.ConnId(slot: 0, generation: 0)
+    let table = tcpconn.Table(slots: 0, generations: 0, min_rto: 0, next_port: 0)
+    let seg = tcp.Received(header: 0, data_from: 0, data_to: 9999)
+    let counts = tcp.TcpCounts(dropped: [0; 18])
+    let out = tcpout.Outbox(bytes: 0, lens: 0, dsts: 0, count: 9, refused: false)
+    let key = isn.KeyedIsn(k0: 0, k1: 0, keyed: true, now: 0)
 }
 
 func layout() -> Layout {

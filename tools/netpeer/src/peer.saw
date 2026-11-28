@@ -19,6 +19,9 @@
 //!              `dhcp`, but the first DISCOVER it hears is not answered
 //!     dns      `ping`, and a DNS server (port 53 on the peer) with a table
 //!              of two names (`dns_answer`) and NXDOMAIN for any other
+//!     tcp_echo `ping`, and a TCP echo server on port 7 for one connection:
+//!              the guest opens it, each segment of data is sent back as it
+//!              comes, and the guest's FIN is answered with the peer's
 //!
 //! Anything else a script handles is logged as `peer: unexpected: ...`,
 //! naming what was wrong. Frames are written and checked with this file's
@@ -47,6 +50,7 @@ static ETHER_IPV4: UInt = 0x0800
 static ETHER_GREETING: UInt = 0x88B5
 
 static PROTO_ICMP: UInt = 1
+static PROTO_TCP: UInt = 6
 static PROTO_UDP: UInt = 17
 static ECHO_PORT: UInt = 7
 static DHCP_SERVER_PORT: UInt = 67
@@ -65,6 +69,21 @@ public static LEASE_SECS: UInt = 3600
 public static NAME_IP: UInt = 0x0A00_0207
 public static NAME_TTL: UInt = 300
 
+/// The TCP flags the echo server reads and sends.
+static TCP_FIN: UInt = 0x01
+static TCP_SYN: UInt = 0x02
+static TCP_RST: UInt = 0x04
+static TCP_PSH: UInt = 0x08
+static TCP_ACK: UInt = 0x10
+
+/// The echo server's initial sequence number, the window it offers and the
+/// segment size it states on its SYN,ACK.
+public static ECHO_ISS: UInt = 0x0100_0000
+static ECHO_WINDOW: UInt = 8192
+static ECHO_MSS: UInt = 1460
+
+static TCP_BYTES: Int = 20
+
 /// The most datagrams one `burst` may ask for.
 public static BURST_MAX: UInt = 64
 
@@ -76,7 +95,8 @@ public enum Script {
     case Greet,
     case Dhcp,
     case DhcpRetry,
-    case Dns
+    case Dns,
+    case TcpEcho
 }
 
 extension Script {
@@ -90,6 +110,7 @@ extension Script {
         if name.equals("dhcp") { return Script.Dhcp }
         if name.equals("dhcp_retry") { return Script.DhcpRetry }
         if name.equals("dns") { return Script.Dns }
+        if name.equals("tcp_echo") { return Script.TcpEcho }
         None
     }
 
@@ -147,6 +168,36 @@ extension Script {
             case _ -> false,
         }
     }
+
+    func echoes_tcp(&self) -> Bool {
+        match self {
+            case TcpEcho -> true,
+            case _ -> false,
+        }
+    }
+}
+
+/// Where the echo server's one connection is.
+enum EchoState {
+    /// No SYN yet.
+    case Listen,
+    /// The SYN answered with SYN,ACK.
+    case SynReceived,
+    /// The handshake done: data is echoed.
+    case Established,
+    /// The guest's FIN answered with the peer's.
+    case LastAck,
+    /// The peer's FIN acknowledged.
+    case Closed
+}
+
+/// The echo server's connection: the guest's port, and the next sequence
+/// number each way.
+struct Echo {
+    state: EchoState,
+    port: UInt,
+    rcv_nxt: UInt,
+    snd_nxt: UInt,
 }
 
 /// What one frame caused: the frames to send, and the lines to log.
@@ -180,11 +231,13 @@ public struct Peer {
     frames: Int,
     /// The DISCOVERs heard.
     discovers: Int,
+    echo: Echo,
 }
 
 extension Peer {
     public init(script: Script) -> Peer {
-        Peer(script: script, frames: 0, discovers: 0)
+        Peer(script: script, frames: 0, discovers: 0,
+             echo: Echo(state: EchoState.Listen, port: 0, rcv_nxt: 0, snd_nxt: 0))
     }
 
     /// The frames received so far.
@@ -336,6 +389,8 @@ extension Peer {
             self.icmp(&frame, src, body, &var out)
         } else if proto == PROTO_UDP {
             self.udp(&frame, src, dst, body, &var out)
+        } else if proto == PROTO_TCP && self.script.echoes_tcp() {
+            self.tcp(&frame, src, body, &var out)
         } else {
             out.unexpected("IPv4 protocol {proto}")
         }
@@ -669,6 +724,159 @@ func dhcp_frame(mac: UInt, xid: UInt, flags: UInt, ciaddr: UInt,
                             DHCP_CLIENT_PORT, &m)
     }
     udp_datagram(mac, ciaddr, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, &m)
+}
+
+extension Peer {
+    /// A TCP segment of `body` bytes from `src` to the echo server, which
+    /// takes one connection through its handshake, its data and its close,
+    /// and logs anything else as unexpected.
+    func tcp(&var self, frame: &Data, src: UInt, body: Int, out: &var Handled) {
+        let at = ETHER_BYTES + IPV4_BYTES
+        if body < TCP_BYTES {
+            out.unexpected("a TCP segment of {body} bytes")
+            return
+        }
+        let offset = ((byte_at(&frame, at + 12) >> 4) * 4) as Int
+        if offset < TCP_BYTES || offset > body {
+            out.unexpected("a TCP data offset of {offset} in {body} bytes")
+            return
+        }
+        if tcp_sum(&frame, at, body, src, PEER_IP) != 0xFFFF {
+            out.unexpected("a TCP checksum")
+            return
+        }
+        let sport = be16(&frame, at)
+        let dport = be16(&frame, at + 2)
+        if dport != ECHO_PORT {
+            out.unexpected("a TCP segment to port {dport}")
+            return
+        }
+        let seq = be32(&frame, at + 4)
+        let ack = be32(&frame, at + 8)
+        let flags = byte_at(&frame, at + 13)
+        let data = body - offset
+        let smac = mac_at(&frame, 6)
+        match self.echo.state {
+            case Listen -> {
+                if flags != TCP_SYN || data != 0 {
+                    out.unexpected("TCP flags {flags} with no connection")
+                    return
+                }
+                self.echo = Echo(state: EchoState.SynReceived, port: sport,
+                                 rcv_nxt: (seq + 1) & 0xFFFF_FFFF,
+                                 snd_nxt: ECHO_ISS + 1)
+                let segment = tcp_segment(src, sport, ECHO_ISS, self.echo.rcv_nxt,
+                                          TCP_SYN | TCP_ACK, true, &frame, 0, 0)
+                out.reply(ipv4_frame(smac, PROTO_TCP, src, &segment))
+                out.line("tcp syn from {ip_text(src)}:{sport} to port 7, answered")
+                return
+            },
+            case _ -> {},
+        }
+        if sport != self.echo.port {
+            out.unexpected("a TCP segment from port {sport}")
+            return
+        }
+        if (flags & TCP_RST) != 0 {
+            out.unexpected("a TCP reset")
+            return
+        }
+        if (flags & (TCP_SYN | TCP_ACK)) != TCP_ACK {
+            out.unexpected("TCP flags {flags} on the connection")
+            return
+        }
+        if seq != self.echo.rcv_nxt {
+            out.unexpected("a TCP segment at {seq}, not {self.echo.rcv_nxt}")
+            return
+        }
+        if ack != self.echo.snd_nxt {
+            out.unexpected("a TCP acknowledgment of {ack}, not {self.echo.snd_nxt}")
+            return
+        }
+        let fin = (flags & TCP_FIN) != 0
+        match self.echo.state {
+            case SynReceived -> {
+                if data != 0 || fin {
+                    out.unexpected("data on the handshake's ACK")
+                    return
+                }
+                self.echo.state = EchoState.Established
+                out.line("tcp established")
+            },
+            case Established -> {
+                if data != 0 {
+                    let next = self.echo.rcv_nxt + (data as UInt)
+                    self.echo.rcv_nxt = next & 0xFFFF_FFFF
+                    let segment = tcp_segment(src, sport, self.echo.snd_nxt,
+                                              self.echo.rcv_nxt, TCP_ACK | TCP_PSH,
+                                              false, &frame, at + offset, data)
+                    self.echo.snd_nxt = self.echo.snd_nxt + (data as UInt)
+                    out.reply(ipv4_frame(smac, PROTO_TCP, src, &segment))
+                    out.line("tcp {data} bytes, echoed")
+                }
+                if fin {
+                    self.echo.rcv_nxt = (self.echo.rcv_nxt + 1) & 0xFFFF_FFFF
+                    let segment = tcp_segment(src, sport, self.echo.snd_nxt,
+                                              self.echo.rcv_nxt, TCP_FIN | TCP_ACK,
+                                              false, &frame, 0, 0)
+                    self.echo.snd_nxt = self.echo.snd_nxt + 1
+                    self.echo.state = EchoState.LastAck
+                    out.reply(ipv4_frame(smac, PROTO_TCP, src, &segment))
+                    out.line("tcp fin, answered with fin")
+                }
+            },
+            case LastAck -> {
+                if data != 0 || fin {
+                    out.unexpected("data after the close")
+                    return
+                }
+                self.echo.state = EchoState.Closed
+                out.line("tcp closed")
+            },
+            case _ -> out.unexpected("a TCP segment after the close"),
+        }
+    }
+}
+
+/// The checksum sum of a TCP segment of `len` bytes at `at`, with its
+/// pseudo-header; 0xFFFF when the segment's checksum field is good.
+func tcp_sum(frame: &Data, at: Int, len: Int, src: UInt, dst: UInt) -> UInt {
+    var sum = sum16(&frame, at, len) + (src >> 16) + (src & 0xFFFF) +
+              (dst >> 16) + (dst & 0xFFFF) + PROTO_TCP + (len as UInt)
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    sum
+}
+
+/// A TCP segment from the echo port to `dst`:`dport` at `seq` acknowledging
+/// `ack`, with `flags` and the window, the segment size option when `mss`,
+/// and `len` bytes of `data` from `from`.
+func tcp_segment(dst: UInt, dport: UInt, seq: UInt, ack: UInt, flags: UInt,
+                 mss: Bool, data: &Data, from: Int, len: Int) -> Data {
+    let header = if mss { TCP_BYTES + 4 } else { TCP_BYTES }
+    var seg = Data()
+    put16(&var seg, ECHO_PORT)
+    put16(&var seg, dport)
+    put32(&var seg, seq)
+    put32(&var seg, ack)
+    put8(&var seg, ((header / 4) as UInt) << 4)
+    put8(&var seg, flags)
+    put16(&var seg, ECHO_WINDOW)
+    put16(&var seg, 0)
+    put16(&var seg, 0)
+    if mss {
+        put8(&var seg, 2)
+        put8(&var seg, 4)
+        put16(&var seg, ECHO_MSS)
+    }
+    put_from(&var seg, &data, from, len)
+    let sum = 0xFFFF - tcp_sum(&seg, 0, seg.len(), PEER_IP, dst)
+    var sealed = Data()
+    put_from(&var sealed, &seg, 0, 16)
+    put16(&var sealed, sum)
+    put_from(&var sealed, &seg, 18, seg.len() - 18)
+    sealed
 }
 
 /// The `N` of a payload `burst N`: decimal digits only, 1 to `BURST_MAX`.

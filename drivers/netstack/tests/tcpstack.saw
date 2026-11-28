@@ -1,0 +1,467 @@
+// TCP through two stacks wired back to back: every frame one sends, the
+// other receives, until neither has anything left to say. A connects to an
+// echo server on B, writes more than its send buffer holds and reads it all
+// back, and both close; segments lost on the wire come back on `poll`'s
+// timers, several in one call; and the refusals at the stack's edge.
+//
+// A is 02:00:00:00:00:0a at 10.0.0.1, B is 02:00:00:00:00:0b at 10.0.0.2, on
+// 10.0.0.0/24.
+
+import netstack.{CallError, Config, ConnId, Delivery, Drop, Ipv4Addr, MacAddr,
+                 OpenError, Sink, SinkError, SocketAddr, Stack, TcpDrop}
+import netstack.bytes.{put_bytes}
+import netstack.ipv4
+import netstack.tcp
+import netstack.tcp.{ACK, Header, SYN}
+import netstack.tcpconn.{
+    HANDSHAKE_RTO_MS, SEND_BUFFER, SegmentError, SegmentSink, State,
+}
+import netstack.tcpout.{OUTBOX_SEGMENTS, Outbox}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func mac_b() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0B]) }
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+
+func config(addr: Ipv4Addr) -> Config {
+    try! Config(addr: addr, netmask: Ipv4Addr(a: 255, b: 255, c: 255, d: 0),
+                gateway: Ipv4Addr.unspecified())
+}
+
+static FRAME_BYTES: Int = 1514
+
+struct Frame {
+    len: Int,
+    bytes: [UInt8; FRAME_BYTES],
+}
+
+extension Frame {
+    init(copying: &[UInt8]) -> Frame {
+        var f = Frame(len: copying.len(), bytes: [0; FRAME_BYTES])
+        put_bytes(&var f.bytes, 0, &copying)
+        f
+    }
+}
+
+/// One station's side of the wire: the frames it sent, not yet carried.
+struct Port {
+    frames: Vector<Frame>,
+}
+
+extension Port: NoCopy {}
+
+extension Port {
+    static func fresh() -> Port {
+        Port(frames: Vector<Frame>())
+    }
+}
+
+extension Port: Sink {
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError> {
+        try! self.frames.push(Frame(copying: &frame))
+        return
+    }
+
+    func deliver(&var self, delivery: Delivery,
+                 data: &[UInt8]) -> Result<Void, SinkError> {
+        return
+    }
+}
+
+/// The most turns a conversation may take before the wire calls it a loop.
+static MAX_TURNS: Int = 32
+
+/// Carries frames both ways at `now` until neither side sends; answers the
+/// frames carried.
+func pump(a: &var Stack, pa: &var Port, b: &var Stack, pb: &var Port,
+          now: UInt64) -> Int {
+    var carried = 0
+    var turns = 0
+    while pa.frames.len() + pb.frames.len() != 0 {
+        turns = turns + 1
+        check(turns <= MAX_TURNS, "the conversation ends")
+        let to_b = pa.frames.len()
+        var i = 0
+        while i < to_b {
+            let f = pa.frames[i]
+            b.receive(&f.bytes[..f.len], now, &var pb)
+            i = i + 1
+        }
+        pa.frames.clear()
+        let to_a = pb.frames.len()
+        i = 0
+        while i < to_a {
+            let f = pb.frames[i]
+            a.receive(&f.bytes[..f.len], now, &var pa)
+            i = i + 1
+        }
+        pb.frames.clear()
+        carried = carried + to_b + to_a
+    }
+    carried
+}
+
+/// The key both stacks draw their sequence numbers with.
+func key() -> [UInt8; 16] {
+    var k: [UInt8; 16] = [0; 16]
+    var i = 0
+    while i < 16 {
+        k[i] = (i * 3 + 1) as UInt8
+        i = i + 1
+    }
+    k
+}
+
+/// A's byte at offset `k` of what it writes.
+func pattern(k: Int) -> UInt8 { ((k * 7 + 1) % 256) as UInt8 }
+
+func refused_open(r: Result<ConnId, OpenError>, reason: OpenError) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func refused_call<T>(r: Result<T, CallError>, reason: CallError) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+/// Every TCP drop the stack counted, whatever its reason.
+func all_tcp_drops(s: &Stack) -> UInt32 {
+    var total: UInt32 = 0
+    var raw = 0
+    while raw < tcp.TCP_DROP_KINDS {
+        total = total + s.tcp_drops(TcpDrop.from(raw: raw as UInt8)!)
+        raw = raw + 1
+    }
+    total
+}
+
+/// Two stacks that know each other's addresses, keyed, B listening on 7.
+struct Pair {
+    a: Stack,
+    b: Stack,
+    pa: Port,
+    pb: Port,
+    listener: ConnId,
+}
+
+extension Pair: NoCopy {}
+
+extension Pair {
+    static func up() -> Pair {
+        var a = Stack(mac: mac_a())
+        var b = Stack(mac: mac_b())
+        var pa = Port.fresh()
+        var pb = Port.fresh()
+        let k = key()
+        a.tcp_secret(&k)
+        b.tcp_secret(&k)
+        a.configure(config(ip_a()), &var pa)
+        b.configure(config(ip_b()), &var pb)
+        let listener = try! b.tcp_listen(7)
+        let _ = pump(&var a, &var pa, &var b, &var pb, 0)
+        Pair(a: move a, b: move b, pa: move pa, pb: move pb, listener: listener)
+    }
+
+    func pump(&var self, now: UInt64) -> Int {
+        pump(&var self.a, &var self.pa, &var self.b, &var self.pb, now)
+    }
+}
+
+func edges() {
+    var a = Stack(mac: mac_a())
+    var pa = Port.fresh()
+    let b7 = SocketAddr(addr: ip_b(), port: 7)
+    check(refused_open(a.tcp_listen(7), OpenError.NoSecret) &&
+          refused_open(a.tcp_connect(b7, 0, &var pa), OpenError.NoSecret),
+          "no secret, no TCP")
+    let k = key()
+    a.tcp_secret(&k)
+    check(refused_open(a.tcp_connect(b7, 0, &var pa), OpenError.NotConfigured),
+          "no address, no connection")
+    a.configure(config(ip_a()), &var pa)
+    pa.frames.clear()
+    let port0 = a.tcp_connect(SocketAddr(addr: ip_b(), port: 0), 0, &var pa)
+    let everyone = a.tcp_connect(SocketAddr(addr: Ipv4Addr.broadcast(), port: 7),
+                                 0, &var pa)
+    let subnet = a.tcp_connect(SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 255),
+                                          port: 7), 0, &var pa)
+    let me = a.tcp_connect(SocketAddr(addr: ip_a(), port: 7), 0, &var pa)
+    check(refused_open(port0, OpenError.BadAddress) &&
+          refused_open(everyone, OpenError.BadAddress) &&
+          refused_open(subnet, OpenError.BadAddress) &&
+          refused_open(me, OpenError.BadAddress) && pa.frames.len() == 0,
+          "no connection to port 0, a broadcast or this host")
+    let listener = try! a.tcp_listen(80)
+    check(refused_open(a.tcp_listen(80), OpenError.InUse), "one listener a port")
+    check(refused_call(a.tcp_write(listener, &k, 0, &var pa), CallError.Listening),
+          "a listener's id carries no data")
+}
+
+func echo() {
+    var p = Pair.up()
+    let b7 = SocketAddr(addr: ip_b(), port: 7)
+    let a_id = try! p.a.tcp_connect(b7, 0, &var p.pa)
+    check(p.a.tcp_state(a_id) == State.SynSent, "the SYN waits on B's address")
+    let _ = p.pump(0)
+    check(p.a.tcp_state(a_id) == State.Established, "the handshake")
+    let b_id = try! p.b.tcp_accept(p.listener)
+    let st = try! p.a.tcp_status(a_id)
+    check(st.local.addr == ip_a() && st.local.port >= 49152 && st.remote == b7,
+          "from an ephemeral port of A's")
+
+    // 3000 bytes: more than A's buffer, written as room opens, echoed by B as
+    // it arrives, and read back by A.
+    var data: [UInt8; 3000] = [0; 3000]
+    var i = 0
+    while i < 3000 {
+        data[i] = pattern(i)
+        i = i + 1
+    }
+    var echoed: [UInt8; 3000] = [0; 3000]
+    var written = 0
+    var back = 0
+    var turns = 0
+    var buf: [UInt8; 3000] = [0; 3000]
+    while back < 3000 {
+        turns = turns + 1
+        check(turns <= 16, "the echo ends")
+        if written < 3000 {
+            let n = try p.a.tcp_write(a_id, &data[written..], 0, &var p.pa) catch {
+                0
+            }
+            if turns == 1 {
+                check(n == SEND_BUFFER, "the first write fills the buffer")
+            }
+            written = written + n
+        }
+        let _ = p.pump(0)
+        let got = try p.b.tcp_read(b_id, &var buf, 0, &var p.pb) catch { 0 }
+        if got > 0 {
+            let n = try! p.b.tcp_write(b_id, &buf[..got], 0, &var p.pb)
+            check(n == got, "B echoes all it read")
+        }
+        let _ = p.pump(0)
+        let r = try p.a.tcp_read(a_id, &var echoed[back..], 0, &var p.pa) catch { 0 }
+        back = back + r
+        let _ = p.pump(0)
+    }
+    i = 0
+    while i < 3000 {
+        check(echoed[i] == data[i], "the echo is the data")
+        i = i + 1
+    }
+
+    // A closes; B reads the end, closes in turn.
+    try! p.a.tcp_close(a_id, 0, &var p.pa)
+    let _ = p.pump(0)
+    check(p.a.tcp_state(a_id) == State.FinWait2 &&
+          p.b.tcp_state(b_id) == State.CloseWait, "A's FIN")
+    check(try! p.b.tcp_read(b_id, &var buf, 0, &var p.pb) == 0, "B reads the end")
+    try! p.b.tcp_close(b_id, 0, &var p.pb)
+    let _ = p.pump(0)
+    check(p.a.tcp_state(a_id) == State.TimeWait &&
+          p.b.tcp_state(b_id) == State.Closed, "B's FIN")
+    check(all_tcp_drops(&p.a) == 0 && all_tcp_drops(&p.b) == 0,
+          "nothing was dropped on the way")
+}
+
+func lost() {
+    // A's SYN is lost on the wire; the timer sends it again.
+    var p = Pair.up()
+    let b7 = SocketAddr(addr: ip_b(), port: 7)
+    let a_id = try! p.a.tcp_connect(b7, 0, &var p.pa)
+    check((try! p.a.tcp_status(a_id)).snd_una == 0xC792_AB23,
+          "the initial sequence number, of the four addresses at time 0")
+    let _ = p.pump(0)
+    let _ = try! p.b.tcp_accept(p.listener)
+    // Three connections whose SYNs are all lost: one poll sends all three
+    // again, more than the stack's outbox holds at once.
+    let c1 = try! p.a.tcp_connect(b7, 10, &var p.pa)
+    check((try! p.a.tcp_status(c1)).snd_una == 0xC313_0D68,
+          "the initial sequence number at time 10")
+    let c2 = try! p.a.tcp_connect(b7, 10, &var p.pa)
+    let c3 = try! p.a.tcp_connect(b7, 10, &var p.pa)
+    check(p.pa.frames.len() == 3, "three SYNs")
+    p.pa.frames.clear()
+    p.a.poll(1009, &var p.pa)
+    check(p.pa.frames.len() == 0, "not before the timeout")
+    p.a.poll(1010, &var p.pa)
+    check(p.pa.frames.len() == 3, "one poll sends the three again")
+    let _ = p.pump(1010)
+    check(p.a.tcp_state(c1) == State.Established &&
+          p.a.tcp_state(c2) == State.Established &&
+          p.a.tcp_state(c3) == State.Established &&
+          p.a.tcp_state(a_id) == State.Established, "and they are answered")
+    let b1 = try! p.b.tcp_accept(p.listener)
+    let bs = try! p.b.tcp_status(b1)
+    check(bs.remote.port == 49153 && bs.snd_una == 0x8640_1935,
+          "the passive side draws its number at the time the SYN arrives")
+
+    check((try! p.a.tcp_status(c1)).rto_ms == HANDSHAKE_RTO_MS,
+          "a handshake sent again starts its data at three seconds")
+
+    // Data lost on the way, and sent again.
+    var data: [UInt8; 10] = [0x41; 10]
+    let _ = try! p.a.tcp_write(a_id, &data, 2000, &var p.pa)
+    check(p.pa.frames.len() == 1, "the data")
+    p.pa.frames.clear()
+    p.a.poll(2000 + 999, &var p.pa)
+    check(p.pa.frames.len() == 0, "not before the timeout")
+    p.a.poll(3000, &var p.pa)
+    check(p.pa.frames.len() == 1, "sent again")
+    let _ = p.pump(3000)
+    let s = try! p.a.tcp_status(a_id)
+    check(s.queued == 0 && s.retries == 0, "and acknowledged")
+}
+
+/// A listener that ends with more connections nobody accepted than the
+/// outbox holds resets every one of them, closed or aborted.
+func listener_children() {
+    var k = 0
+    while k < 2 {
+        var p = Pair.up()
+        let b7 = SocketAddr(addr: ip_b(), port: 7)
+        let c1 = try! p.a.tcp_connect(b7, 0, &var p.pa)
+        let c2 = try! p.a.tcp_connect(b7, 0, &var p.pa)
+        let c3 = try! p.a.tcp_connect(b7, 0, &var p.pa)
+        let _ = p.pump(0)
+        check(p.a.tcp_state(c3) == State.Established, "three connections")
+        if k == 0 {
+            try! p.b.tcp_close(p.listener, 0, &var p.pb)
+        } else {
+            try! p.b.tcp_abort(p.listener, 0, &var p.pb)
+        }
+        let _ = p.pump(0)
+        check(p.a.tcp_state(c1) == State.Closed &&
+              p.a.tcp_state(c2) == State.Closed &&
+              p.a.tcp_state(c3) == State.Closed &&
+              p.a.tcp_drops(TcpDrop.Reset) == 3,
+              "each of the three is reset")
+        k = k + 1
+    }
+}
+
+func refused_segments() {
+    var p = Pair.up()
+    // A SYN,ACK to a host whose address is not resolved is a reply too: SYNs
+    // from forged sources do not take the station's own share of the queue.
+    var sport: UInt16 = 4100
+    while sport < 4104 {
+        var syn: [UInt8; 20] = [0; 20]
+        let sh = Header(src_port: sport, dst_port: 7, seq: 5, ack: 0, flags: SYN,
+                        window: 100, mss: None)
+        let sn = tcp.write_segment(&var syn, ip_a(), ip_b(), &sh, 0)
+        let sf = tcp_frame(ip_a(), ip_b(), mac_b(), &syn[..sn])
+        p.b.receive(&sf.bytes[..sf.len], 0, &var p.pb)
+        sport = sport + 1
+    }
+    check(p.b.drops(Drop.ArpQueueFull) == 1 && p.b.pending_frames() == 3,
+          "SYN,ACKs waiting on an address are held to the replies' share")
+    p = Pair.up()
+    // Resets to a host whose address is not resolved are replies: they may
+    // hold only part of the queue of frames waiting on an address.
+    var port: UInt16 = 4000
+    while port < 4004 {
+        var probe: [UInt8; 20] = [0; 20]
+        let ph = Header(src_port: port, dst_port: 9, seq: 5, ack: 0, flags: SYN,
+                        window: 100, mss: None)
+        let pn = tcp.write_segment(&var probe, ip_a(), ip_b(), &ph, 0)
+        let pf = tcp_frame(ip_a(), ip_b(), mac_b(), &probe[..pn])
+        p.b.receive(&pf.bytes[..pf.len], 0, &var p.pb)
+        port = port + 1
+    }
+    check(p.b.tcp_drops(TcpDrop.NoConnection) == 4 &&
+          p.b.drops(Drop.ArpQueueFull) == 1 && p.b.pending_frames() == 3,
+          "resets waiting on an address are held to the replies' share")
+    p = Pair.up()
+    // To a closed port: answered with a reset, and counted.
+    var seg: [UInt8; 20] = [0; 20]
+    let h = Header(src_port: 4000, dst_port: 9, seq: 5, ack: 0, flags: SYN,
+                   window: 100, mss: None)
+    let n = tcp.write_segment(&var seg, ip_a(), ip_b(), &h, 0)
+    let frame = tcp_frame(ip_a(), ip_b(), mac_b(), &seg[..n])
+    p.b.receive(&frame.bytes[..frame.len], 0, &var p.pb)
+    check(p.b.tcp_drops(TcpDrop.NoConnection) == 1 && p.pb.frames.len() == 1,
+          "a SYN to a closed port is reset")
+    p.pb.frames.clear()
+    // Truncated: counted by TCP's reason.
+    let short = tcp_frame(ip_a(), ip_b(), mac_b(), &seg[..10])
+    p.b.receive(&short.bytes[..short.len], 0, &var p.pb)
+    check(p.b.tcp_drops(TcpDrop.Truncated) == 1 && p.pb.frames.len() == 0,
+          "a truncated segment")
+    // To the subnet's broadcast, or from no address: not unicast.
+    let bcast = tcp_frame(ip_a(), Ipv4Addr(a: 10, b: 0, c: 0, d: 255),
+                          MacAddr.broadcast(), &seg[..n])
+    p.b.receive(&bcast.bytes[..bcast.len], 0, &var p.pb)
+    let nobody = tcp_frame(Ipv4Addr.unspecified(), ip_b(), mac_b(), &seg[..n])
+    p.b.receive(&nobody.bytes[..nobody.len], 0, &var p.pb)
+    check(p.b.tcp_drops(TcpDrop.NotUnicast) == 2 && p.pb.frames.len() == 0,
+          "a broadcast, and one from no address, are not answered")
+}
+
+/// An Ethernet frame to `mac` carrying `segment` from `src` to `dst`.
+func tcp_frame(src: Ipv4Addr, dst: Ipv4Addr, mac: MacAddr,
+               segment: &[UInt8]) -> Frame {
+    var f = Frame(len: 14 + ipv4.HEADER_BYTES + segment.len(),
+                  bytes: [0; FRAME_BYTES])
+    mac.write(&var f.bytes, 0)
+    mac_a().write(&var f.bytes, 6)
+    f.bytes[12] = 0x08
+    f.bytes[13] = 0x00
+    put_bytes(&var f.bytes, 14 + ipv4.HEADER_BYTES, &segment)
+    ipv4.write_header(&var f.bytes[14..], src, dst, ipv4.Protocol.Tcp, 1, 64,
+                      segment.len())
+    if f.len < 60 {
+        f.len = 60
+    }
+    f
+}
+
+/// Whether the outbox took a segment.
+func sent(r: Result<Void, SegmentError>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+/// The outbox holds `OUTBOX_SEGMENTS`, and no segment longer than an IPv4
+/// datagram at the MTU carries; it refuses past either, and says so when
+/// emptied.
+func outbox() {
+    var o = Outbox.empty()
+    let small: [UInt8; 20] = [0; 20]
+    let big: [UInt8; 1481] = [0; 1481]
+    check(not sent(o.send(ip_a(), ip_b(), &big)) && o.len() == 0,
+          "a segment past the MTU is refused")
+    check(o.empty_out(), "and the refusal is told")
+    var k = 0
+    while k < OUTBOX_SEGMENTS {
+        check(sent(o.send(ip_a(), ip_b(), &small)), "a segment taken")
+        k = k + 1
+    }
+    check(not sent(o.send(ip_a(), ip_b(), &small)), "a full outbox refuses")
+    check(o.len() == OUTBOX_SEGMENTS && o.empty_out() && not o.empty_out() &&
+          o.len() == 0, "emptied, it tells the refusal once")
+}
+
+func main() {
+    listener_children()
+    outbox()
+    edges()
+    echo()
+    lost()
+    refused_segments()
+}

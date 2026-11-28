@@ -13,7 +13,8 @@ import netstack.addr.{Ipv4Addr, SocketAddr}
 import netstack.tcp
 import netstack.tcp.{ACK, FIN, Header, RST, SYN, TcpDrop}
 import netstack.tcpconn.{
-    CONNECTIONS, CallError, ConnId, IsnSource, OpenError, RECEIVE_WINDOW, SegmentSink,
+    CONNECTIONS, CallError, ConnId, IsnSource, OpenError, RECEIVE_BUFFER, SegmentError,
+    SegmentSink,
     State, TIME_WAIT_MS, Table, seq_le, seq_lt,
 }
 
@@ -96,23 +97,23 @@ static A_ACK_1002_9001: [UInt8; 20] = [
     0x50, 0x10, 0x10, 0x00, 0x50, 0xE7, 0x00, 0x00,
 ]
 
-/// A's ACK of two bytes after an old SYN: seq 1001, ack 9003. Checksum
-/// 0x50E6.
+/// A's ACK of two bytes after an old SYN: seq 1001, ack 9003, window
+/// 4094. Checksum 0x50E8.
 static A_ACK_1001_9003: [UInt8; 20] = [
     0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x2B,
-    0x50, 0x10, 0x10, 0x00, 0x50, 0xE6, 0x00, 0x00,
+    0x50, 0x10, 0x0F, 0xFE, 0x50, 0xE8, 0x00, 0x00,
 ]
 
-/// A's ACK of ten bytes: seq 1001, ack 9011. Checksum 0x50DE.
+/// A's ACK of ten bytes: seq 1001, ack 9011, window 4086. Checksum 0x50E8.
 static A_ACK_1001_9011: [UInt8; 20] = [
     0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x33,
-    0x50, 0x10, 0x10, 0x00, 0x50, 0xDE, 0x00, 0x00,
+    0x50, 0x10, 0x0F, 0xF6, 0x50, 0xE8, 0x00, 0x00,
 ]
 
-/// A's ACK of five more: seq 1001, ack 9016. Checksum 0x50D9.
+/// A's ACK of five more: seq 1001, ack 9016, window 4081. Checksum 0x50E8.
 static A_ACK_1001_9016: [UInt8; 20] = [
     0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x38,
-    0x50, 0x10, 0x10, 0x00, 0x50, 0xD9, 0x00, 0x00,
+    0x50, 0x10, 0x0F, 0xF1, 0x50, 0xE8, 0x00, 0x00,
 ]
 
 /// A's reset on ABORT: seq 1001, no ACK, window 0. Checksum 0x841D.
@@ -170,10 +171,11 @@ static A_ACK_WRAP: [UInt8; 20] = [
     0x50, 0x10, 0x10, 0x00, 0x78, 0x00, 0x00, 0x00,
 ]
 
-/// A's ACK of sixteen bytes across zero: seq 0, ack 9. Checksum 0x77F1.
+/// A's ACK of sixteen bytes across zero: seq 0, ack 9, window 4080.
+/// Checksum 0x7801.
 static A_ACK_WRAP_DATA: [UInt8; 20] = [
     0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
-    0x50, 0x10, 0x10, 0x00, 0x77, 0xF1, 0x00, 0x00,
+    0x50, 0x10, 0x0F, 0xF0, 0x78, 0x01, 0x00, 0x00,
 ]
 
 // -----------------------------------------------------------------------------
@@ -237,7 +239,8 @@ extension Recorder {
 }
 
 extension Recorder: SegmentSink {
-    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr, segment: &[UInt8]) {
+    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr,
+              segment: &[UInt8]) -> Result<Void, SegmentError> {
         if self.count < RECORDED {
             let i = self.count
             self.src[i] = src
@@ -250,6 +253,7 @@ extension Recorder: SegmentSink {
             }
         }
         self.count = self.count + 1
+        return
     }
 }
 
@@ -324,7 +328,7 @@ extension Rig {
         var table = Table.empty()
         var out = Recorder.fresh()
         let gone = try! table.listen(1)
-        let _ = table.close(gone, &var out)
+        let _ = table.close(gone, 0, &var out)
         Rig(table: table, id: gone, listener: gone, out: out,
             isn: FixedIsn.of(1000))
     }
@@ -408,14 +412,14 @@ func established() -> Rig {
 /// An active open, SYN sent.
 func syn_sent() -> Rig {
     var r = Rig.fresh()
-    r.id = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
+    r.id = try! r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out)
     let _ = r.out.silent()
     r
 }
 
 func fin_wait_1() -> Rig {
     var r = established()
-    let _ = r.table.close(r.id, &var r.out)
+    let _ = r.table.close(r.id, 0, &var r.out)
     let _ = r.out.silent()
     r
 }
@@ -449,7 +453,7 @@ func close_wait() -> Rig {
 
 func last_ack() -> Rig {
     var r = close_wait()
-    let _ = r.table.close(r.id, &var r.out)
+    let _ = r.table.close(r.id, 0, &var r.out)
     let _ = r.out.silent()
     r
 }
@@ -463,12 +467,12 @@ func opening() {
     var l = Rig.fresh()
     l.id = try! l.table.listen(80)
     check(l.state() == State.Listen && l.out.silent(), "CLOSED -> LISTEN")
-    check(taken(l.table.close(l.id, &var l.out)), "a listener closes")
+    check(taken(l.table.close(l.id, 0, &var l.out)), "a listener closes")
     check(l.state() == State.Closed && l.out.silent(), "LISTEN -> CLOSED")
 
     // CLOSED -> SYN-SENT, active OPEN, with the ISN asked for its addresses.
     var a = Rig.fresh()
-    a.id = try! a.table.connect(end_a(), end_b(), &var a.isn, &var a.out)
+    a.id = try! a.table.connect(end_a(), end_b(), 0, &var a.isn, &var a.out)
     check(a.out.sent_only(&A_SYN) && a.state() == State.SynSent,
           "CLOSED -> SYN-SENT, sending SYN")
     check(a.isn.asked == 1 && a.isn.local == end_a() && a.isn.remote == end_b(),
@@ -476,7 +480,7 @@ func opening() {
 
     // SYN-SENT -> CLOSED, CLOSE.
     var c = syn_sent()
-    check(taken(c.table.close(c.id, &var c.out)) && c.out.silent() &&
+    check(taken(c.table.close(c.id, 0, &var c.out)) && c.out.silent() &&
           c.state() == State.Closed, "SYN-SENT -> CLOSED")
 
     // SYN-SENT -> ESTABLISHED, on SYN,ACK.
@@ -532,7 +536,7 @@ func opening() {
 
     // LISTEN -> SYN-SENT, SEND.
     var ls = listening()
-    check(taken(ls.table.connect_listener(ls.id, ip_a(), end_b(), &var ls.isn,
+    check(taken(ls.table.connect_listener(ls.id, ip_a(), end_b(), 0, &var ls.isn,
                                           &var ls.out)) &&
           ls.out.sent_only(&A_SYN) && ls.state() == State.SynSent,
           "LISTEN -> SYN-SENT, sending SYN")
@@ -546,12 +550,12 @@ func opening() {
 
 func closing_transitions() {
     var sr = syn_received()
-    check(taken(sr.table.close(sr.id, &var sr.out)) &&
+    check(taken(sr.table.close(sr.id, 0, &var sr.out)) &&
           sr.out.sent_only(&A_FIN_1001_9001) && sr.state() == State.FinWait1,
           "SYN-RECEIVED -> FIN-WAIT-1, sending FIN")
 
     var e = established()
-    check(taken(e.table.close(e.id, &var e.out)) &&
+    check(taken(e.table.close(e.id, 0, &var e.out)) &&
           e.out.sent_only(&A_FIN_1001_9001) && e.state() == State.FinWait1,
           "ESTABLISHED -> FIN-WAIT-1, sending FIN")
 
@@ -585,13 +589,13 @@ func closing_transitions() {
           "FIN-WAIT-1 -> TIME-WAIT on a FIN that acknowledges ours")
 
     var tw = time_wait()
-    tw.table.poll(500 + TIME_WAIT_MS - 1)
+    tw.table.poll(500 + TIME_WAIT_MS - 1, &var tw.out)
     check(tw.state() == State.TimeWait, "TIME-WAIT lasts 2MSL")
-    tw.table.poll(500 + TIME_WAIT_MS)
+    tw.table.poll(500 + TIME_WAIT_MS, &var tw.out)
     check(tw.state() == State.Closed && tw.out.silent(),
           "TIME-WAIT -> CLOSED after 2MSL")
     var tw_back = time_wait()
-    tw_back.table.poll(100)
+    tw_back.table.poll(100, &var tw_back.out)
     check(tw_back.state() == State.TimeWait, "a clock run backwards ends nothing")
     var tw_fin = time_wait()
     check(dropped(tw_fin.feed(&from_b(9001, 1002, FIN | ACK)), TcpDrop.OutOfWindow) &&
@@ -604,7 +608,7 @@ func closing_transitions() {
           "ESTABLISHED -> CLOSE-WAIT on the peer's FIN, sending ACK")
 
     var la = close_wait()
-    check(taken(la.table.close(la.id, &var la.out)) &&
+    check(taken(la.table.close(la.id, 0, &var la.out)) &&
           la.out.sent_only(&A_FIN_1001_9002) && la.state() == State.LastAck,
           "CLOSE-WAIT -> LAST-ACK, sending FIN")
     var done = last_ack()
@@ -642,7 +646,7 @@ func resets() {
         k = k + 1
     }
     var edge = established()
-    let last = 9001 + (RECEIVE_WINDOW as UInt32) - 1
+    let last = 9001 + (RECEIVE_BUFFER as UInt32) - 1
     check(dropped(edge.feed(&from_b(last, 0, RST)), TcpDrop.Reset) &&
           edge.state() == State.Closed,
           "a reset at the window's last number is in it")
@@ -826,7 +830,7 @@ func refused_segments() {
 
     // Out of the window: answered with an ACK of what is expected.
     var w = established()
-    let beyond = 9001 + (RECEIVE_WINDOW as UInt32)
+    let beyond = 9001 + (RECEIVE_BUFFER as UInt32)
     check(dropped(w.feed(&from_b(beyond, 1001, ACK)), TcpDrop.OutOfWindow) &&
           w.out.sent_only(&A_ACK_1001_9001) && w.state() == State.Established,
           "a segment just past the window")
@@ -998,59 +1002,59 @@ func refused_calls() {
     let _ = try! r.table.listen(80)
     check(open_refused(r.table.listen(80), OpenError.InUse), "a second listener")
     let nowhere = SocketAddr(addr: Ipv4Addr.unspecified(), port: 5000)
-    check(open_refused(r.table.connect(end_a(), nowhere, &var r.isn, &var r.out),
+    check(open_refused(r.table.connect(end_a(), nowhere, 0, &var r.isn, &var r.out),
                        OpenError.BadAddress), "connect to 0.0.0.0")
     let port0 = SocketAddr(addr: ip_b(), port: 0)
-    check(open_refused(r.table.connect(end_a(), port0, &var r.isn, &var r.out),
+    check(open_refused(r.table.connect(end_a(), port0, 0, &var r.isn, &var r.out),
                        OpenError.BadAddress), "connect to port 0")
     let from0 = SocketAddr(addr: ip_a(), port: 0)
-    check(open_refused(r.table.connect(from0, end_b(), &var r.isn, &var r.out),
+    check(open_refused(r.table.connect(from0, end_b(), 0, &var r.isn, &var r.out),
                        OpenError.BadAddress), "connect from port 0")
-    let _ = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
-    check(open_refused(r.table.connect(end_a(), end_b(), &var r.isn, &var r.out),
+    let _ = try! r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out)
+    check(open_refused(r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out),
                        OpenError.InUse), "a second connection on four addresses")
     check(r.out.sent_only(&A_SYN), "only the first SYN went out")
     var i = 2
     while i < CONNECTIONS {
         let other = SocketAddr(addr: ip_b(), port: (6000 + i) as UInt16)
-        let _ = try! r.table.connect(end_a(), other, &var r.isn, &var r.out)
+        let _ = try! r.table.connect(end_a(), other, 0, &var r.isn, &var r.out)
         i = i + 1
     }
     let one_more = SocketAddr(addr: ip_b(), port: 7000)
-    check(open_refused(r.table.connect(end_a(), one_more, &var r.isn, &var r.out),
+    check(open_refused(r.table.connect(end_a(), one_more, 0, &var r.isn, &var r.out),
                        OpenError.Full), "connect with every slot in use")
     check(open_refused(r.table.listen(81), OpenError.Full),
           "listen with every slot in use")
 
     var c = syn_sent()
-    let not_listener = c.table.connect_listener(c.id, ip_a(), end_b(), &var c.isn,
+    let not_listener = c.table.connect_listener(c.id, ip_a(), end_b(), 0, &var c.isn,
                                                 &var c.out)
     check(match not_listener {
               case Err(e) -> e == OpenError.NotListening, case Ok(_) -> false },
           "SEND to a connection that is not a listener")
     var gone = listening()
-    let _ = gone.table.close(gone.id, &var gone.out)
+    let _ = gone.table.close(gone.id, 0, &var gone.out)
     let _ = try! gone.table.listen(80)
     let stale = gone.table.connect_listener(gone.id, ip_a(), end_b(),
-                                            &var gone.isn, &var gone.out)
+                                             0, &var gone.isn, &var gone.out)
     check(match stale {
               case Err(e) -> e == OpenError.NotListening, case Ok(_) -> false } &&
           gone.out.silent(), "SEND to a listener that was closed")
     var dup = syn_received()
     let in_use = dup.table.connect_listener(dup.listener, ip_a(), end_b(),
-                                            &var dup.isn, &var dup.out)
+                                             0, &var dup.isn, &var dup.out)
     check(match in_use { case Err(e) -> e == OpenError.InUse, case Ok(_) -> false } &&
           dup.table.state(dup.listener) == State.Listen && dup.out.silent(),
           "SEND from a listener to addresses in use")
 
     var f = fin_wait_1()
-    check(call_refused(f.table.close(f.id, &var f.out), CallError.Closing) &&
+    check(call_refused(f.table.close(f.id, 0, &var f.out), CallError.Closing) &&
           f.out.silent(), "CLOSE while closing")
     var t = time_wait()
-    check(call_refused(t.table.close(t.id, &var t.out), CallError.Closing),
+    check(call_refused(t.table.close(t.id, 0, &var t.out), CallError.Closing),
           "CLOSE in TIME-WAIT")
     var free = Rig.fresh()
-    check(call_refused(free.table.close(free.id, &var free.out),
+    check(call_refused(free.table.close(free.id, 0, &var free.out),
                        CallError.NoConnection), "CLOSE of an ended listener")
     check(call_refused(free.table.abort(free.id, &var free.out),
                        CallError.NoConnection), "ABORT of an ended listener")
@@ -1064,11 +1068,11 @@ func refused_calls() {
     var reused = syn_sent()
     let old = reused.id
     let _ = reused.table.abort(old, &var reused.out)
-    let fresh = try! reused.table.connect(end_a(), end_b(), &var reused.isn,
+    let fresh = try! reused.table.connect(end_a(), end_b(), 0, &var reused.isn,
                                           &var reused.out)
     let _ = reused.out.silent()
     check(fresh != old, "a reused slot's id is new")
-    let closed = reused.table.close(old, &var reused.out)
+    let closed = reused.table.close(old, 0, &var reused.out)
     let aborted = reused.table.abort(old, &var reused.out)
     check(call_refused(closed, CallError.NoConnection) &&
           call_refused(aborted, CallError.NoConnection) &&
@@ -1091,7 +1095,7 @@ func wraparound() {
           "sequence order wraps")
     var r = Rig.fresh()
     r.isn = FixedIsn.of(0xFFFF_FFFF)
-    r.id = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
+    r.id = try! r.table.connect(end_a(), end_b(), 0, &var r.isn, &var r.out)
     check(r.out.sent_only(&A_SYN_WRAP), "a SYN at the last number")
     let synack = from_b(0xFFFF_FFF8, 0, SYN | ACK)
     check(taken(r.feed(&synack)) && r.out.sent_only(&A_ACK_WRAP) &&
@@ -1135,8 +1139,8 @@ func pair() {
     let b_end = SocketAddr(addr: ip_b(), port: 5000)
 
     // The simultaneous open: both SYNs cross, each answers with SYN,ACK.
-    let ia = try! a.table.connect(a_end, b_end, &var a.isn, &var a.out)
-    let ib = try! b.table.connect(b_end, a_end, &var b.isn, &var b.out)
+    let ia = try! a.table.connect(a_end, b_end, 0, &var a.isn, &var a.out)
+    let ib = try! b.table.connect(b_end, a_end, 0, &var b.isn, &var b.out)
     var a_syn = a.out
     var b_syn = b.out
     a.out.count = 0
@@ -1156,8 +1160,8 @@ func pair() {
           b.out.count == 0, "both ESTABLISHED, with nothing more to send")
 
     // The simultaneous close: both FINs cross, each acknowledges the other.
-    let _ = a.table.close(ia, &var a.out)
-    let _ = b.table.close(ib, &var b.out)
+    let _ = a.table.close(ia, 0, &var a.out)
+    let _ = b.table.close(ib, 0, &var b.out)
     var a_fin = a.out
     var b_fin = b.out
     a.out.count = 0
@@ -1170,14 +1174,14 @@ func pair() {
     deliver(&var b.out, &var a, 20)
     check(a.table.state(ia) == State.TimeWait &&
           b.table.state(ib) == State.TimeWait, "both TIME-WAIT")
-    a.table.poll(20 + TIME_WAIT_MS)
-    b.table.poll(20 + TIME_WAIT_MS)
+    a.table.poll(20 + TIME_WAIT_MS, &var a.out)
+    b.table.poll(20 + TIME_WAIT_MS, &var b.out)
     check(a.table.state(ia) == State.Closed && b.table.state(ib) == State.Closed,
           "both CLOSED")
 
     // The ordinary open and close, A listening and B connecting.
     let la = try! a.table.listen(80)
-    let ib2 = try! b.table.connect(b_end, a_end, &var b.isn, &var b.out)
+    let ib2 = try! b.table.connect(b_end, a_end, 0, &var b.isn, &var b.out)
     deliver(&var b.out, &var a, 30)
     deliver(&var a.out, &var b, 30)
     deliver(&var b.out, &var a, 30)
@@ -1185,12 +1189,12 @@ func pair() {
     check(a.table.state(ia2) == State.Established &&
           b.table.state(ib2) == State.Established &&
           a.table.state(la) == State.Listen, "the three-way handshake")
-    let _ = b.table.close(ib2, &var b.out)
+    let _ = b.table.close(ib2, 0, &var b.out)
     deliver(&var b.out, &var a, 40)
     deliver(&var a.out, &var b, 40)
     check(a.table.state(ia2) == State.CloseWait &&
           b.table.state(ib2) == State.FinWait2, "the first FIN")
-    let _ = a.table.close(ia2, &var a.out)
+    let _ = a.table.close(ia2, 0, &var a.out)
     deliver(&var a.out, &var b, 50)
     deliver(&var b.out, &var a, 50)
     check(a.table.state(ia2) == State.Closed &&

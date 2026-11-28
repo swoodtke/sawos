@@ -69,8 +69,9 @@ drivers/           # userspace device drivers and the protocol packages their
                    # packets) and sockproto/ (sockets) are the protocols
                    # that carry their bulk data in one, wlanproto/ the radio's
                    # join control; netstack/ is the TCP/IP stack's first
-                   # layer (Ethernet, ARP, IPv4, ICMP, UDP) over byte
-                   # buffers, with no device and no clock of its own;
+                   # layer (Ethernet, ARP, IPv4, ICMP, UDP, TCP, and a DHCP
+                   # client and a DNS stub over UDP) over byte buffers, with
+                   # no device and no clock of its own;
                    # virtio/ is the virtio-mmio transport and split queues
                    # behind `Registers` and `Dma` traits, with a fake device
                    # for its hosted tests, and svc-virtio-net/ the network

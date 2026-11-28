@@ -16072,8 +16072,9 @@ TEST_CASES = [
         # decoder's bounds rest on (a frame's, an SSID's, a key's and a name's
         # length and bytes), and building a layout, a window, an endpoint and
         # a frame field by field; and reading and writing every field the
-        # TCP/IP stack's state rests on, and building that state field by
-        # field. The compile refuses each, and each refusal is asserted.
+        # TCP/IP stack's state rests on, TCP's included, and building that
+        # state field by field. The compile refuses each, and each refusal is
+        # asserted.
         "name": "net_fields_sealed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": NET_SEALED_PKG,
@@ -16104,7 +16105,16 @@ TEST_CASES = [
                 ("netstack.ipv4.Config", ["address", "mask", "router"]),
                 ("netstack.Stack",
                  ["link_addr", "settings", "cache", "pending", "ports",
-                  "unreachable", "ident", "tally"])]
+                  "unreachable", "ident", "tally", "tcp", "tcp_tally",
+                  "tcp_out", "tcp_isn"]),
+                ("netstack.tcpconn.Table",
+                 ["slots", "generations", "min_rto", "next_port"]),
+                ("netstack.tcpconn.ConnId", ["slot", "generation"]),
+                ("netstack.tcp.Received", ["data_from", "data_to"]),
+                ("netstack.tcp.TcpCounts", ["dropped"]),
+                ("netstack.tcpout.Outbox",
+                 ["bytes", "lens", "dsts", "count", "refused"]),
+                ("netstack.isn.KeyedIsn", ["k0", "k1", "keyed", "now"])]
             for field in fields] + [
             "no parameter is labeled `slot_size` in Layout.init",
             "no candidate takes these arguments; the candidates are "
@@ -16126,7 +16136,17 @@ TEST_CASES = [
             "`PortTable` has no `init` this module can call, and its fields "
             "are not all visible here",
             "no parameter is labeled `address` in Config.init(addr:",
-            "no parameter is labeled `link_addr` in Stack.init(mac:"],
+            "no parameter is labeled `link_addr` in Stack.init(mac:",
+            "`ConnId` has no `init` this module can call, and its fields are "
+            "not all visible here",
+            "no parameter is labeled `slots` in Table.init(min_rto_ms:",
+            "no parameter is labeled `header` in Received.init(segment:",
+            "`TcpCounts` has no `init` this module can call, and its fields "
+            "are not all visible here",
+            "`Outbox` has no `init` this module can call, and its fields are "
+            "not all visible here",
+            "`KeyedIsn` has no `init` this module can call, and its fields "
+            "are not all visible here"],
         "expect_out": [],
         "expect_clean_exit": False,
     },
@@ -17682,6 +17702,58 @@ TEST_CASES = [
                        "SOS: process exit: code={zero} process={one}",
                        "root: net ended status=65536"],
         "expect_peer": ["peer: greeted with 60 bytes", "peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A TCP connection through the stack to the peer's echo server: the
+        # SYN waits on the peer's address, the handshake, a message written
+        # and read back, and the close, the client's FIN first and the peer's
+        # taking it to TIME-WAIT. Every step waits on a frame the peer sends
+        # for the one before it, and nothing waits on the clock, so nothing is
+        # retransmitted. The ping last orders the final acknowledgment ahead of
+        # the echo reply on the wire. The client sends the announcement, the
+        # ARP request, the SYN, the handshake's ACK, the data, the ACK of the
+        # echo, the FIN, the ACK of the peer's FIN and the echo request, and
+        # takes the ARP reply, the SYN,ACK, the echo, the peer's FIN and the
+        # echo reply.
+        "name": "net_tcp_echo",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_tcp_echo.toml",
+                       "riscv32-flat": "net_tcp_echo_flat.toml",
+                       "arm64": "net_tcp_echo_arm64.toml"},
+        "net": {"script": "tcp_echo"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: tcp connected to 10.0.2.2:7",
+                       "SOS netclient: tcp wrote 14 bytes",
+                       "SOS netclient: tcp read back: hello over tcp",
+                       "SOS netclient: tcp TIME-WAIT",
+                       "SOS netclient: reply 1 from 10.0.2.2, 56 bytes",
+                       "SOS netclient: driver rx=5 rx_dropped=0 tx=9 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS netclient: tcp drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=5 tx=9 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": [
+            "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+            "peer: arp request for 10.0.2.2 from 10.0.2.15 at "
+            "52:54:00:12:34:56, answered",
+            "peer: tcp syn from 10.0.2.15:49152 to port 7, answered",
+            "peer: tcp established",
+            "peer: tcp 14 bytes, echoed",
+            "peer: tcp fin, answered with fin",
+            "peer: tcp closed",
+            "peer: echo request 1 from 10.0.2.15, 56 bytes, answered",
+            "peer: closed after 9 frames",
+        ],
         "expect_clean_exit": True,
     },
     {

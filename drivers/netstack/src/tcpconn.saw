@@ -1,14 +1,16 @@
-//! TCP connections (RFC 9293): the state machine of setup and teardown, and
-//! the table that holds a fixed number of connections.
+//! TCP connections (RFC 9293): the state machine, data in both directions,
+//! retransmission (RFC 6298), and the table that holds a fixed number of
+//! connections.
 //!
 //! The table is a value with no clock, no randomness and no device. Whoever
 //! drives it hands it each segment received for this host, with its
 //! addresses and the time, a `SegmentSink` that takes the segments it sends,
 //! and an `IsnSource` that answers the initial sequence number of each new
 //! connection (RFC 9293 §3.4.1, RFC 6528), which needs a clock and a secret
-//! the table does not have.
+//! the table does not have. Timers run on the time the caller passes to
+//! `poll`, and nothing else ages.
 //!
-//! # What is here
+//! # The states
 //!
 //! The eleven states and every transition of RFC 9293's state diagram
 //! (§3.3.2): the active open, the passive open through a listener, the
@@ -16,11 +18,6 @@
 //! reset, and TIME-WAIT's end after `TIME_WAIT_MS`. A segment is taken through
 //! the steps of §3.10.7, and one that fails a step is dropped, answered as that
 //! step says and reported by its reason (`TcpDrop`).
-//!
-//! Data is acknowledged and counted, never delivered, and nothing is sent but
-//! control segments: SYN, FIN, ACK and RST. So nothing is retransmitted. A
-//! segment lost on the way out is recovered only when the peer repeats what
-//! provoked it, as a peer repeats a SYN or a FIN it sees no answer to.
 //!
 //! A reset is accepted when its own sequence number is in the receive window
 //! (RFC 9293 §3.5.3), wherever the rest of the segment lies, and a SYN whose
@@ -30,32 +27,117 @@
 //! exact sequence number for a reset and a challenge acknowledgment in reply
 //! to an in-window reset or SYN, are not made.
 //!
+//! A listener's connections are handed out by `accept` once their handshake
+//! is done, each once. A listener that closes, aborts or is turned into a
+//! connection aborts those it has not handed out.
+//!
+//! A connection that ends keeps its slot's id answering why until the slot
+//! is taken again: `CallError.Reset` after a reset, `CallError.TimedOut`
+//! after its retransmissions, and `CallError.NoConnection` after an orderly
+//! close or `abort`.
+//!
+//! # Sending
+//!
+//! `write` copies into the connection's send buffer (`SEND_BUFFER` bytes),
+//! which holds what is unacknowledged and what is not yet sent. Data goes in
+//! segments of at most the peer's maximum segment size, but never less than
+//! `MIN_SEND_MSS`, a floor below a tiny offer that is kept on purpose; inside
+//! the window the peer offers; and the segment that empties
+//! the buffer carries PSH: every write is pushed. RFC 9293 §3.8.6.2.1's sender
+//! rule avoids silly window syndrome, with the Nagle algorithm: a segment
+//! shorter than the maximum goes only when nothing is in flight and either it
+//! empties the buffer or it is half the largest window the peer has offered,
+//! and data held back that way with nothing in flight goes after
+//! `SWS_OVERRIDE_MS`. `close` queues a FIN behind the data. Data written
+//! before the handshake ends waits for the SYN's acknowledgment, and a FIN
+//! behind it waits too; a close in SYN-RECEIVED with nothing queued sends its
+//! FIN at once (RFC 9293 §3.10.4). There is no congestion control: the peer's
+//! window is the only limit on what is in flight.
+//!
+//! # Receiving
+//!
+//! Data received in order is kept in the receive buffer (`RECEIVE_BUFFER`
+//! bytes) until `read` takes it; `read` answers 0 only at the end of the
+//! stream, and so refuses a buffer of no bytes. The window offered is the
+//! room left behind the right edge last advertised, so it shrinks as data
+//! waits and the edge never moves left. Reading moves the edge right only
+//! once the room it would add is half the buffer or a maximum segment (RFC
+//! 9293 §3.8.6.2.2), and the move is announced with an acknowledgment. A
+//! segment's data past the window is trimmed off, and with the window closed
+//! only a segment at RCV.NXT is taken, for its acknowledgment and its
+//! controls.
+//!
 //! In-window data or a FIN past the next sequence number expected is not
 //! kept for later: it is acknowledged with what is expected, and the peer
 //! sends it again.
 //!
-//! Nothing ends SYN-RECEIVED but the peer: a connection a listener spawned
-//! stays until the handshake completes or is reset, so SYNs from forged
-//! sources that never complete it fill the table. Timing out the SYN,ACK is
-//! what reclaims it, with retransmission.
+//! # Retransmission
+//!
+//! Each connection has one retransmission timer, running while anything sent
+//! is unacknowledged (RFC 6298 §5). The timeout starts at `INITIAL_RTO_MS`,
+//! follows the smoothed round trip and its variation, measured on one segment
+//! at a time and never on a retransmitted one (Karn's algorithm), and lies
+//! between the table's minimum (`MIN_RTO_MS`, unless the table was made with
+//! another) and `MAX_RTO_MS`. When it expires the earliest unacknowledged
+//! segment is sent again, inside the peer's window, the SYN and the SYN,ACK
+//! and the FIN among them, the timeout doubles, and sending resumes from
+//! there. A connection whose handshake took a retransmission starts its data
+//! at `HANDSHAKE_RTO_MS`. Whether the SYN is owed or acknowledged is kept as
+//! its own state, never read off sequence numbers, which come round to ISS.
+//!
+//! The next expiry after the last retry gives a connection up: it is CLOSED,
+//! and calls on its id answer `CallError.TimedOut`. An active open's SYN has
+//! `SYN_RETRIES`, three minutes; a listener's SYN,ACK has `SYN_ACK_RETRIES`,
+//! about half a minute; anything later has `DATA_RETRIES`. A connection a
+//! listener spawned whose SYN,ACK is never answered is freed that way. That
+//! bounds how long a SYN that is never completed holds a slot, not how many
+//! slots such SYNs hold: a stream of them, one per slot in each half minute,
+//! still keeps every slot taken.
+//!
+//! Not here: congestion control, keeping out-of-order data, probing a
+//! window that stays closed, keepalives, and FIN-WAIT-2's and TIME-WAIT's
+//! fuller handling.
 //!
 //! # Output
 //!
-//! A segment the table sends goes to `SegmentSink.send`, built whole with its
-//! checksum. A segment the sink cannot carry is lost as the network may lose
-//! one, and the sink counts it.
+//! A segment goes to `SegmentSink.send`, built whole with its checksum. What a
+//! connection owes (its handshake, its data, its FIN, an acknowledgment) is
+//! kept as its state, so a segment the sink refuses is owed still, and the
+//! next `output` sends it. An abort's reset is owed the same way, and its
+//! slot is not taken again until it has gone. A reset answering a segment,
+//! and an acknowledgment answering one outside the window, are sent at once,
+//! and one the sink refuses is lost as the network may lose one. An
+//! acknowledgment with no data, and a reset, carry SND.MAX.
 
 import netstack.addr.{Ipv4Addr, SocketAddr}
 import netstack.bytes.{elapsed}
+import netstack.ether
+import netstack.ipv4
 import netstack.tcp
-import netstack.tcp.{ACK, FIN, Header, RST, SYN, TcpDrop}
+import netstack.tcp.{ACK, FIN, Header, PSH, RST, SYN, TcpDrop}
+import netstack.udp.{EPHEMERAL_FIRST, EPHEMERAL_LAST}
 
 /// How many connections, listeners included, the table holds.
 public static CONNECTIONS: Int = 8
 
-/// The receive window every segment offers. Data is counted, not kept, so
-/// the window never closes.
-public static RECEIVE_WINDOW: UInt16 = 4096
+/// The bytes a connection holds of what it was given to send: sent and
+/// unacknowledged, and not yet sent.
+public static SEND_BUFFER: Int = 2048
+
+/// The bytes a connection holds of what it received in order and was not
+/// read yet: the largest window it offers.
+public static RECEIVE_BUFFER: Int = 4096
+
+static_assert(RECEIVE_BUFFER <= 65535, "the window field is 16 bits")
+
+/// The smallest segment sent, whatever size the peer offers. This departs
+/// from the peer's offer on purpose, as common stacks do: a peer offering a
+/// tiny size would have the stack spend a segment, and its timers, on every
+/// few bytes.
+public static MIN_SEND_MSS: UInt16 = 64
+
+/// The largest segment sent: this stack's own size, with the fixed header.
+static SEGMENT_BYTES: Int = ether.MTU - ipv4.HEADER_BYTES
 
 /// The maximum segment lifetime (RFC 9293 §3.4.2).
 public static MSL_MS: UInt64 = 120_000
@@ -64,6 +146,41 @@ public static MSL_MS: UInt64 = 120_000
 /// lifetime, so the last ACK can be repeated for any FIN that can still
 /// arrive.
 public static TIME_WAIT_MS: UInt64 = 2 * MSL_MS
+
+/// The retransmission timeout before any round trip is measured (RFC 6298
+/// §2.1).
+public static INITIAL_RTO_MS: UInt64 = 1000
+
+/// The least retransmission timeout (RFC 6298 §2.4), for a table made with
+/// `Table.empty`.
+public static MIN_RTO_MS: UInt64 = 1000
+
+/// The greatest retransmission timeout, backed off or computed (RFC 6298
+/// §2.5).
+public static MAX_RTO_MS: UInt64 = 60_000
+
+/// The timeout data starts at when the handshake needed a retransmission
+/// (RFC 6298 §5.7).
+public static HANDSHAKE_RTO_MS: UInt64 = 3000
+
+/// The retransmissions of an active open's SYN before it is given up: with
+/// the backoff from `INITIAL_RTO_MS` to `MAX_RTO_MS`, the last expiry is
+/// three minutes after the first SYN (RFC 9293 §3.8.3's R2 for a SYN).
+public static SYN_RETRIES: UInt32 = 7
+
+/// The retransmissions of a listener's SYN,ACK before its connection is
+/// freed: 31 seconds from the first at `INITIAL_RTO_MS`, which bounds how
+/// long a SYN that is never completed holds a slot.
+public static SYN_ACK_RETRIES: UInt32 = 4
+
+/// The retransmissions of the same data or FIN before the connection is
+/// given up.
+public static DATA_RETRIES: UInt32 = 8
+
+/// How long data the silly window rule held back waits, with nothing in
+/// flight, before what fits in the window goes anyway (RFC 9293 §3.8.6.2.1's
+/// override timeout).
+public static SWS_OVERRIDE_MS: UInt64 = 200
 
 /// A connection's state (RFC 9293 §3.3.2). A slot that holds no connection
 /// is CLOSED.
@@ -109,10 +226,17 @@ extension State: Printable {
     }
 }
 
+/// A refusal from a `SegmentSink`: it has no room for the segment.
+public enum SegmentError {
+    case Full,
+}
+
 /// Where the table's segments go: one call per segment, from `src` to `dst`,
-/// the whole TCP segment lent for the call.
+/// the whole TCP segment lent for the call. A sink that answers `Full` has
+/// not taken the segment.
 public trait SegmentSink {
-    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr, segment: &[UInt8])
+    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr,
+              segment: &[UInt8]) -> Result<Void, SegmentError>
 }
 
 /// The initial sequence number of a connection between `local` and `remote`.
@@ -124,7 +248,8 @@ public trait IsnSource {
 
 /// Why a listener or a connection cannot be opened.
 public enum OpenError {
-    /// A port of zero, or an address of 0.0.0.0.
+    /// A port of zero, or an address of 0.0.0.0 or one that cannot be sent
+    /// to.
     case BadAddress,
     /// A listener on the port, or a connection between the two addresses,
     /// exists already.
@@ -133,24 +258,89 @@ public enum OpenError {
     case Full,
     /// The id is not a listener's.
     case NotListening,
+    /// The interface has no address yet. Only a stack answers this.
+    case NotConfigured,
+    /// No secret was given for the initial sequence numbers. Only a stack
+    /// answers this.
+    case NoSecret,
 }
 
 @synthesize
 extension OpenError: Equatable {}
 
+extension OpenError {
+    /// What a transcript should call this refusal.
+    public func describe(&self) -> String {
+        match self {
+            case BadAddress -> "an address it cannot open",
+            case InUse -> "in use",
+            case Full -> "no free connection",
+            case NotListening -> "not a listener",
+            case NotConfigured -> "no address",
+            case NoSecret -> "no secret for the sequence numbers",
+        }
+    }
+}
+
+extension OpenError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
 /// Why a call on a connection is refused.
 public enum CallError {
-    /// No connection has the id.
+    /// No connection has the id: it was never opened, it ended in an orderly
+    /// way or by `abort`, or its slot holds another connection now.
     case NoConnection,
-    /// The connection is closing already (RFC 9293 §3.10.4).
+    /// The connection is closing already (RFC 9293 §3.10.4): no more is
+    /// written.
     case Closing,
+    /// Nothing can be done yet: no data to read, no room to write into, or
+    /// no connection to accept. A later call may succeed.
+    case WouldBlock,
+    /// The id is a listener's, which carries no data.
+    case Listening,
+    /// The id is not a listener's: only a listener accepts.
+    case NotListening,
+    /// The connection ended with a reset: one the peer sent, or a SYN in its
+    /// window.
+    case Reset,
+    /// The connection was given up after its retransmissions went
+    /// unanswered.
+    case TimedOut,
+    /// A read into no bytes, which could not tell data waiting from the end
+    /// of the stream.
+    case NoRoom,
 }
 
 @synthesize
 extension CallError: Equatable {}
 
-/// What a connection's state and sequence numbers are, for whoever drives
-/// the table.
+extension CallError {
+    /// What a transcript should call this refusal.
+    public func describe(&self) -> String {
+        match self {
+            case NoConnection -> "no such connection",
+            case Closing -> "closing",
+            case WouldBlock -> "would block",
+            case Listening -> "a listener",
+            case NotListening -> "not a listener",
+            case Reset -> "reset",
+            case TimedOut -> "timed out",
+            case NoRoom -> "no room to read into",
+        }
+    }
+}
+
+extension CallError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+/// What a connection's state, sequence numbers and timers are, for whoever
+/// drives the table.
 public struct Status {
     public state: State,
     public local: SocketAddr,
@@ -163,10 +353,25 @@ public struct Status {
     public snd_wnd: UInt16,
     /// The next sequence number expected.
     public rcv_nxt: UInt32,
-    /// The largest segment the peer accepts, no larger than this stack's.
+    /// The window offered: the room left up to the right edge advertised.
+    public rcv_wnd: UInt16,
+    /// The largest segment the peer accepts, no larger than this stack's and
+    /// no smaller than `MIN_SEND_MSS`.
     public send_mss: UInt16,
     /// The data bytes received in order.
     public received: UInt64,
+    /// The bytes waiting to be read.
+    public readable: Int,
+    /// The bytes in the send buffer: unacknowledged, and not yet sent.
+    public queued: Int,
+    /// The retransmission timeout.
+    public rto_ms: UInt64,
+    /// The smoothed round trip, and its variation; both 0 before the first
+    /// measurement.
+    public srtt_ms: UInt64,
+    public rttvar_ms: UInt64,
+    /// The retransmissions since anything new was acknowledged.
+    public retries: UInt32,
 }
 
 /// Whether `a` comes before `b` in sequence space, which wraps: within half
@@ -196,12 +401,23 @@ func occupies(header: &Header, data: Int) -> UInt32 {
 /// The largest segment to send a peer that offered `offered`, or nothing.
 func send_mss(offered: UInt16?) -> UInt16 {
     let peer = offered ?? tcp.DEFAULT_MSS
-    if peer < tcp.OFFERED_MSS { peer } else { tcp.OFFERED_MSS }
+    if peer < MIN_SEND_MSS {
+        MIN_SEND_MSS
+    } else if peer < tcp.OFFERED_MSS {
+        peer
+    } else {
+        tcp.OFFERED_MSS
+    }
+}
+
+/// The ephemeral port after `port`, wrapping from the last to the first.
+func after(port: UInt16) -> UInt16 {
+    if port == EPHEMERAL_LAST { EPHEMERAL_FIRST } else { port + 1 }
 }
 
 /// Builds the segment `header` with no data from `src` to `dst` and sends it.
 func emit<S: SegmentSink>(src: Ipv4Addr, dst: Ipv4Addr, header: &Header,
-                          sink: &var S) {
+                          sink: &var S) -> Result<Void, SegmentError> {
     var bytes: [UInt8; tcp.MAX_HEADER_BYTES] = [0; tcp.MAX_HEADER_BYTES]
     let n = tcp.write_segment(&var bytes, src, dst, &header, 0)
     sink.send(src, dst, &bytes[..n])
@@ -221,14 +437,29 @@ func reset_reply<S: SegmentSink>(local: SocketAddr, remote: SocketAddr,
                ack: header.seq &+ occupies(&header, data), flags: RST | ACK,
                window: 0, mss: None)
     }
-    emit(local.addr, remote.addr, &reply, &var sink)
+    let _ = emit(local.addr, remote.addr, &reply, &var sink)
 }
 
 // =============================================================================
 // A connection
 // =============================================================================
 
-/// One slot's connection: RFC 9293's transmission control block (§3.3.1).
+/// How much `output` may send.
+enum Push {
+    /// What the window and the silly window rule allow.
+    case Normal,
+    /// One segment from SND.NXT, whatever the window and the rule say: the
+    /// retransmission a timeout calls for.
+    case Resend,
+    /// What the window allows, the silly window rule overridden.
+    case Override,
+}
+
+@synthesize
+extension Push: Equatable {}
+
+/// One slot's connection: RFC 9293's transmission control block (§3.3.1),
+/// with its buffers and its timer.
 struct Connection {
     state: State,
     /// Spawned by a listener: a reset or a SYN in SYN-RECEIVED frees it, and
@@ -240,15 +471,78 @@ struct Connection {
     iss: UInt32,
     snd_una: UInt32,
     snd_nxt: UInt32,
+    /// The sequence number past the last one ever sent: SND.NXT goes back to
+    /// SND.UNA on a timeout, and this does not.
+    snd_max: UInt32,
     snd_wnd: UInt16,
+    /// The largest window the peer has offered.
+    max_wnd: UInt16,
     /// The sequence number of the segment that last set the send window.
     snd_wl1: UInt32,
     irs: UInt32,
     rcv_nxt: UInt32,
+    /// The receive window's right edge, as last advertised.
+    rcv_adv: UInt32,
     send_mss: UInt16,
     received: UInt64,
     /// When TIME-WAIT began.
     time_wait_at: UInt64,
+    /// Why the connection ended, once it is CLOSED: what calls on its id
+    /// answer.
+    ended: CallError,
+
+    /// The send buffer, a ring: `send_len` bytes from `send_head`, the first
+    /// at sequence number `data_seq`.
+    send_buf: [UInt8; SEND_BUFFER],
+    send_head: Int,
+    send_len: Int,
+    data_seq: UInt32,
+    /// CLOSE was called: a FIN follows the data, at `data_seq + send_len`.
+    fin_queued: Bool,
+    /// The receive buffer, a ring: `recv_len` bytes from `recv_head`.
+    recv_buf: [UInt8; RECEIVE_BUFFER],
+    recv_head: Int,
+    recv_len: Int,
+    /// An acknowledgment is owed: the next segment carries it, or one goes
+    /// alone.
+    ack_due: Bool,
+
+    /// The table's least timeout, and the timeout.
+    min_rto: UInt64,
+    rto: UInt64,
+    srtt: UInt64,
+    rttvar: UInt64,
+    /// A round trip has been measured.
+    sampled: Bool,
+    /// The retransmission timer: running, and since when.
+    timer_on: Bool,
+    timer_from: UInt64,
+    /// Timeouts since anything new was acknowledged.
+    retries: UInt32,
+    /// The segment being timed: its first sequence number, and when it went.
+    timing: Bool,
+    timed_seq: UInt32,
+    timed_at: UInt64,
+    /// Data the silly window rule held back with nothing in flight, since
+    /// when.
+    held: Bool,
+    held_at: UInt64,
+    /// The SYN or the SYN,ACK was sent again.
+    handshake_resent: Bool,
+    /// The SYN, or SYN,ACK, is to be sent: it has not been, or a timeout
+    /// calls for it again.
+    syn_owed: Bool,
+    /// The peer has acknowledged the SYN.
+    syn_acked: Bool,
+    /// The connection was aborted and its reset has not gone yet.
+    reset_owed: Bool,
+
+    /// For a connection a listener spawned, the listener's slot, and whether
+    /// `accept` has handed it out. A listener that ends aborts what it
+    /// spawned and did not hand out, so no slot names a listener that is
+    /// gone.
+    listener: Int,
+    accepted: Bool,
 }
 
 extension Connection {
@@ -256,69 +550,91 @@ extension Connection {
     static func free() -> Connection {
         let nowhere = SocketAddr(addr: Ipv4Addr.unspecified(), port: 0)
         Connection(state: State.Closed, passive: false, local: nowhere,
-                   remote: nowhere, iss: 0, snd_una: 0, snd_nxt: 0, snd_wnd: 0,
-                   snd_wl1: 0, irs: 0, rcv_nxt: 0,
-                   send_mss: tcp.DEFAULT_MSS, received: 0, time_wait_at: 0)
+                   remote: nowhere, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0,
+                   snd_wnd: 0, max_wnd: 0, snd_wl1: 0, irs: 0, rcv_nxt: 0,
+                   rcv_adv: 0, send_mss: tcp.DEFAULT_MSS, received: 0,
+                   time_wait_at: 0, ended: CallError.NoConnection,
+                   send_buf: [0; SEND_BUFFER], send_head: 0, send_len: 0,
+                   data_seq: 0, fin_queued: false,
+                   recv_buf: [0; RECEIVE_BUFFER], recv_head: 0, recv_len: 0,
+                   ack_due: false, min_rto: MIN_RTO_MS, rto: INITIAL_RTO_MS,
+                   srtt: 0, rttvar: 0, sampled: false, timer_on: false,
+                   timer_from: 0, retries: 0, timing: false, timed_seq: 0,
+                   timed_at: 0, held: false, held_at: 0,
+                   handshake_resent: false, syn_owed: false,
+                   syn_acked: false, reset_owed: false, listener: -1,
+                   accepted: false)
     }
 
-    /// An active open from `local` to `remote` with initial sequence number
-    /// `iss`: the SYN goes out, and the connection is in SYN-SENT.
-    static func opened<S: SegmentSink>(
-            local: SocketAddr, remote: SocketAddr, iss: UInt32,
-            sink: &var S) -> Connection {
+    /// A connection in `state` from `local` to `remote` whose SYN is at
+    /// `iss` and not sent yet, with the table's least timeout `min_rto`.
+    static func begin(state: State, local: SocketAddr, remote: SocketAddr,
+                      iss: UInt32, min_rto: UInt64) -> Connection {
         var c = Connection.free()
-        c.state = State.SynSent
+        c.state = state
         c.local = local
         c.remote = remote
         c.iss = iss
         c.snd_una = iss
-        c.snd_nxt = iss &+ 1
-        c.send(iss, 0, SYN, &var sink)
+        c.snd_nxt = iss
+        c.snd_max = iss
+        c.data_seq = iss &+ 1
+        c.syn_owed = true
+        c.min_rto = min_rto
+        c.rto = if INITIAL_RTO_MS < min_rto { min_rto } else { INITIAL_RTO_MS }
         c
     }
 
     /// Sends a segment of `flags` with no data. A SYN carries this stack's
     /// segment size, and a reset offers no window.
     func send<S: SegmentSink>(&self, seq: UInt32, ack: UInt32, flags: UInt8,
-                              sink: &var S) {
+                              sink: &var S) -> Result<Void, SegmentError> {
         let header = Header(
             src_port: self.local.port, dst_port: self.remote.port, seq: seq,
             ack: ack, flags: flags,
-            window: if (flags & RST) != 0 { 0 } else { RECEIVE_WINDOW },
+            window: if (flags & RST) != 0 { 0 } else { self.window() },
             mss: if (flags & SYN) != 0 { tcp.OFFERED_MSS } else { None })
         emit(self.local.addr, self.remote.addr, &header, &var sink)
     }
 
-    /// `<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>`.
+    /// `<SEQ=SND.MAX><ACK=RCV.NXT><CTL=ACK>`, at once: the answer to a
+    /// segment that is not taken. An acknowledgment with no data carries
+    /// SND.MAX, where the peer's RCV.NXT is, even while a timeout has taken
+    /// SND.NXT back.
     func send_ack<S: SegmentSink>(&self, sink: &var S) {
-        self.send(self.snd_nxt, self.rcv_nxt, ACK, &var sink)
+        let _ = self.send(self.snd_max, self.rcv_nxt, ACK, &var sink)
     }
 
-    /// `<SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>`.
+    /// `<SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>`, at once: the answer to the
+    /// peer's SYN repeated.
     func send_syn_ack<S: SegmentSink>(&self, sink: &var S) {
-        self.send(self.iss, self.rcv_nxt, SYN | ACK, &var sink)
+        let _ = self.send(self.iss, self.rcv_nxt, SYN | ACK, &var sink)
     }
 
-    /// Sends a FIN with what it acknowledges, and counts it sent.
-    func send_fin<S: SegmentSink>(&var self, sink: &var S) {
-        self.send(self.snd_nxt, self.rcv_nxt, FIN | ACK, &var sink)
-        self.snd_nxt = self.snd_nxt &+ 1
+    /// The window to offer: the room up to the right edge advertised, or,
+    /// before the peer's SYN is known, the room in the buffer.
+    func window(&self) -> UInt16 {
+        if self.state == State.SynSent {
+            (RECEIVE_BUFFER - self.recv_len) as UInt16
+        } else {
+            (self.rcv_adv &- self.rcv_nxt) as UInt16
+        }
     }
 
-    /// Whether everything sent is acknowledged. Nothing is sent after a FIN,
-    /// so in FIN-WAIT-1, CLOSING and LAST-ACK this says the FIN is.
-    func all_acked(&self) -> Bool {
-        self.snd_una == self.snd_nxt
-    }
-
-    /// Whether `seq` is in the receive window.
+    /// Whether `seq` is in the receive window. A closed window holds only
+    /// RCV.NXT, so a segment there can still carry an acknowledgment or a
+    /// reset (RFC 9293 §3.10.7.4).
     func in_window(&self, seq: UInt32) -> Bool {
-        (seq &- self.rcv_nxt) < (RECEIVE_WINDOW as UInt32)
+        let wnd = self.rcv_adv &- self.rcv_nxt
+        if wnd == 0 {
+            seq == self.rcv_nxt
+        } else {
+            (seq &- self.rcv_nxt) < wnd
+        }
     }
 
     /// RFC 9293 §3.10.7.4's acceptability test, for a segment at `seq` that
-    /// occupies `length` of sequence space and a window that is never zero:
-    /// it begins or ends in the window.
+    /// occupies `length` of sequence space: it begins or ends in the window.
     func acceptable(&self, seq: UInt32, length: UInt32) -> Bool {
         if length == 0 {
             self.in_window(seq)
@@ -331,20 +647,33 @@ extension Connection {
     func take_syn(&var self, header: &Header) {
         self.irs = header.seq
         self.rcv_nxt = header.seq &+ 1
+        let room = (RECEIVE_BUFFER - self.recv_len) as UInt32
+        self.rcv_adv = self.rcv_nxt &+ room
         self.send_mss = send_mss(header.mss)
         self.snd_wnd = header.window
+        self.max_wnd = header.window
         self.snd_wl1 = header.seq
+    }
+
+    /// The handshake is done: data starts at `HANDSHAKE_RTO_MS` when it took
+    /// a retransmission (RFC 6298 §5.7).
+    func established(&var self) {
+        self.state = State.Established
+        if self.handshake_resent && not self.sampled {
+            self.rto = self.clamp_rto(HANDSHAKE_RTO_MS)
+        }
     }
 
     /// RFC 9293 §3.10.7.3: a segment for a connection in SYN-SENT.
     func arrive_syn_sent<S: SegmentSink>(
-            &var self, header: &Header, data: Int, now: UInt64,
+            &var self, header: &Header, data: &[UInt8], now: UInt64,
             sink: &var S) -> Result<Void, TcpDrop> {
         let ack = header.has(ACK)
         if ack && (seq_le(header.ack, self.iss) ||
-                   seq_lt(self.snd_nxt, header.ack)) {
+                   seq_lt(self.snd_max, header.ack)) {
             if not header.has(RST) {
-                reset_reply(self.local, self.remote, &header, data, &var sink)
+                reset_reply(self.local, self.remote, &header, data.len(),
+                            &var sink)
             }
             return TcpDrop.AckUnsent
         }
@@ -352,7 +681,7 @@ extension Connection {
             if not ack {
                 return TcpDrop.ResetIgnored
             }
-            self.state = State.Closed
+            self.end(CallError.Reset)
             return TcpDrop.Reset
         }
         if not header.has(SYN) {
@@ -360,12 +689,13 @@ extension Connection {
         }
         self.take_syn(&header)
         if ack {
-            self.snd_una = header.ack
+            self.take_ack(header.ack, now)
         }
-        if seq_lt(self.iss, self.snd_una) {
-            self.state = State.Established
-            self.take_text(header.seq &+ 1, header.has(FIN), data, now)
-            self.send_ack(&var sink)
+        if self.syn_acked {
+            self.established()
+            let _ = self.take_text(header.seq &+ 1, header.has(FIN), &data, now)
+            self.ack_due = true
+            let _ = self.output(now, &var sink, Push.Normal)
         } else {
             // Both ends sent a SYN: each answers the other's with SYN,ACK.
             // Text and FIN on the SYN are not kept; the peer sends them again.
@@ -377,12 +707,13 @@ extension Connection {
 
     /// RFC 9293 §3.10.7.4: a segment for a connection in SYN-RECEIVED or a
     /// later state, taken through the steps in order.
-    func arrive<S: SegmentSink>(&var self, header: &Header, data: Int,
+    func arrive<S: SegmentSink>(&var self, header: &Header, data: &[UInt8],
                                 now: UInt64,
                                 sink: &var S) -> Result<Void, TcpDrop> {
         if self.state == State.SynSent {
-            return self.arrive_syn_sent(&header, data, now, &var sink)
+            return self.arrive_syn_sent(&header, &data, now, &var sink)
         }
+        let bytes = data.len()
         var seq = header.seq
         var syn = header.has(SYN)
         let rst = header.has(RST)
@@ -401,7 +732,7 @@ extension Connection {
             seq = seq &+ 1
             syn = false
         }
-        var length = data as UInt32
+        var length = bytes as UInt32
         if syn {
             length = length + 1
         }
@@ -428,7 +759,7 @@ extension Connection {
         // Second, the RST bit. A connection a listener spawned is freed, and
         // the listener goes on.
         if rst {
-            self.state = State.Closed
+            self.end(CallError.Reset)
             return TcpDrop.Reset
         }
 
@@ -437,9 +768,9 @@ extension Connection {
         // returns to LISTEN; any other is reset.
         if syn {
             if not (self.state == State.SynReceived && self.passive) {
-                reset_reply(self.local, self.remote, &header, data, &var sink)
+                reset_reply(self.local, self.remote, &header, bytes, &var sink)
             }
-            self.state = State.Closed
+            self.end(CallError.Reset)
             return TcpDrop.UnexpectedSyn
         }
 
@@ -449,20 +780,20 @@ extension Connection {
         }
         if self.state == State.SynReceived {
             if not (seq_lt(self.snd_una, header.ack) &&
-                    seq_le(header.ack, self.snd_nxt)) {
-                reset_reply(self.local, self.remote, &header, data, &var sink)
+                    seq_le(header.ack, self.snd_max)) {
+                reset_reply(self.local, self.remote, &header, bytes, &var sink)
                 return TcpDrop.AckUnsent
             }
-            self.state = State.Established
+            self.established()
             self.snd_wnd = header.window
             self.snd_wl1 = seq
         }
-        if seq_lt(self.snd_nxt, header.ack) {
+        if seq_lt(self.snd_max, header.ack) {
             self.send_ack(&var sink)
             return TcpDrop.AckUnsent
         }
         if seq_lt(self.snd_una, header.ack) {
-            self.snd_una = header.ack
+            self.take_ack(header.ack, now)
         }
         // The window moves with a segment no older than the one that last
         // moved it, unless its acknowledgment is a duplicate, below SND.UNA.
@@ -471,23 +802,30 @@ extension Connection {
         if seq_le(self.snd_una, header.ack) && seq_le(self.snd_wl1, seq) {
             self.snd_wnd = header.window
             self.snd_wl1 = seq
+            if header.window > self.max_wnd {
+                self.max_wnd = header.window
+            }
         }
         match self.state {
             case FinWait1 -> {
-                if self.all_acked() {
+                if self.fin_acked() {
                     self.state = State.FinWait2
                 }
             },
             case Closing -> {
-                if not self.all_acked() {
+                if not self.fin_acked() {
+                    // The FIN is not acknowledged: what is unsent before it,
+                    // and the FIN itself, may still be owed.
+                    let _ = self.output(now, &var sink, Push.Normal)
                     return
                 }
                 self.state = State.TimeWait
                 self.time_wait_at = now
+                self.timer_on = false
             },
             case LastAck -> {
-                if self.all_acked() {
-                    self.state = State.Closed
+                if self.fin_acked() {
+                    self.end(CallError.NoConnection)
                     return
                 }
             },
@@ -495,15 +833,92 @@ extension Connection {
         }
 
         // Seventh and eighth, the text and the FIN, kept only in order.
-        if (data != 0 || fin) && self.takes_text() &&
+        if (bytes != 0 || fin) && self.takes_text() &&
            seq_lt(self.rcv_nxt, seq) {
-            self.send_ack(&var sink)
+            // Answered with what is expected, on whatever data its
+            // acknowledgment let go.
+            self.ack_due = true
+            let _ = self.output(now, &var sink, Push.Normal)
             return TcpDrop.OutOfOrder
         }
-        if self.take_text(seq, fin, data, now) {
-            self.send_ack(&var sink)
+        if self.take_text(seq, fin, &data, now) {
+            self.ack_due = true
         }
+        let _ = self.output(now, &var sink, Push.Normal)
         return
+    }
+
+    /// Ends the connection for `why`, which calls on its id answer.
+    func end(&var self, why: CallError) {
+        self.state = State.Closed
+        self.ended = why
+        self.timer_on = false
+    }
+
+    /// Takes in an acknowledgment of `ack`, past SND.UNA and at most
+    /// SND.MAX: frees the data it covers, measures the round trip when it
+    /// covers the segment being timed, and restarts the timer for what is
+    /// still unacknowledged, or stops it (RFC 6298 §5.2, §5.3).
+    func take_ack(&var self, ack: UInt32, now: UInt64) {
+        if seq_lt(self.data_seq, ack) {
+            let covered = (ack &- self.data_seq) as Int
+            let n = covered.min(self.send_len)
+            self.send_head = (self.send_head + n) % SEND_BUFFER
+            self.send_len = self.send_len - n
+            self.data_seq = self.data_seq &+ (n as UInt32)
+        }
+        self.snd_una = ack
+        self.syn_acked = true
+        if seq_lt(self.snd_nxt, ack) {
+            self.snd_nxt = ack
+        }
+        if self.timing && seq_lt(self.timed_seq, ack) {
+            self.timing = false
+            self.sample(elapsed(now, self.timed_at))
+        }
+        self.retries = 0
+        if self.snd_una == self.snd_max {
+            self.timer_on = false
+        } else {
+            self.timer_from = now
+        }
+    }
+
+    /// Takes a round-trip measurement of `measured` milliseconds into the
+    /// smoothed round trip and its variation, and recomputes the timeout
+    /// (RFC 6298 §2, with a clock granularity of a millisecond). A
+    /// measurement past `MAX_RTO_MS` counts as that, so the caller's clock
+    /// cannot overflow the sums.
+    func sample(&var self, measured: UInt64) {
+        let r = if measured > MAX_RTO_MS { MAX_RTO_MS } else { measured }
+        if self.sampled {
+            let diff = if self.srtt > r { self.srtt - r } else { r - self.srtt }
+            self.rttvar = (3 * self.rttvar + diff) / 4
+            self.srtt = (7 * self.srtt + r) / 8
+        } else {
+            self.srtt = r
+            self.rttvar = r / 2
+            self.sampled = true
+        }
+        let spread = if self.rttvar == 0 { 1 } else { 4 * self.rttvar }
+        self.rto = self.clamp_rto(self.srtt + spread)
+    }
+
+    /// `rto` held between the table's least timeout and `MAX_RTO_MS`.
+    func clamp_rto(&self, rto: UInt64) -> UInt64 {
+        if rto < self.min_rto {
+            self.min_rto
+        } else if rto > MAX_RTO_MS {
+            MAX_RTO_MS
+        } else {
+            rto
+        }
+    }
+
+    /// Whether the FIN is sent and acknowledged.
+    func fin_acked(&self) -> Bool {
+        self.fin_queued && self.send_len == 0 &&
+            self.snd_una == (self.data_seq &+ 1)
     }
 
     /// Whether the state takes data and a FIN: the peer has not sent its FIN.
@@ -512,68 +927,382 @@ extension Connection {
             self.state == State.FinWait2
     }
 
-    /// Takes in `data` bytes and a FIN from `seq`, which is at or before
-    /// RCV.NXT, the part before it already taken. Answers whether there was
-    /// anything new to acknowledge.
-    func take_text(&var self, seq: UInt32, fin: Bool, data: Int,
+    /// Whether the peer's FIN has been taken in: what is buffered is all
+    /// there will be.
+    func peer_finished(&self) -> Bool {
+        self.state == State.CloseWait || self.state == State.LastAck ||
+            self.state == State.Closing || self.state == State.TimeWait
+    }
+
+    /// Takes in `data` and a FIN from `seq`, which is at or before RCV.NXT,
+    /// the part before it already taken: as much as the window holds, the FIN
+    /// only if all of it fits. Answers whether the segment is to be
+    /// acknowledged.
+    func take_text(&var self, seq: UInt32, fin: Bool, data: &[UInt8],
                    now: UInt64) -> Bool {
-        if not self.takes_text() || (data == 0 && not fin) {
+        if not self.takes_text() || (data.len() == 0 && not fin) {
             return false
         }
-        let fresh = data - ((self.rcv_nxt &- seq) as Int)
-        self.received = self.received + (fresh as UInt64)
-        self.rcv_nxt = self.rcv_nxt &+ (fresh as UInt32)
-        if fin {
+        // The segment was acceptable, so it reaches RCV.NXT: `skip` is at
+        // most its data.
+        let skip = (self.rcv_nxt &- seq) as Int
+        let fresh = data.len() - skip
+        let room = (self.rcv_adv &- self.rcv_nxt) as Int
+        let take = fresh.min(room)
+        var i = 0
+        while i < take {
+            let at = (self.recv_head + self.recv_len + i) % RECEIVE_BUFFER
+            self.recv_buf[at] = data[skip + i]
+            i = i + 1
+        }
+        self.recv_len = self.recv_len + take
+        self.received = self.received + (take as UInt64)
+        self.rcv_nxt = self.rcv_nxt &+ (take as UInt32)
+        if fin && take == fresh {
             self.rcv_nxt = self.rcv_nxt &+ 1
+            self.rcv_adv = self.rcv_adv &+ 1
             match self.state {
                 case Established -> self.state = State.CloseWait,
                 case FinWait1 -> self.state = State.Closing,
                 case _ -> {
                     self.state = State.TimeWait
                     self.time_wait_at = now
+                    self.timer_on = false
                 },
             }
         }
         true
     }
 
-    /// RFC 9293 §3.10.4: CLOSE.
-    func close<S: SegmentSink>(&var self,
-                               sink: &var S) -> Result<Void, CallError> {
-        match self.state {
-            case Closed -> return CallError.NoConnection,
-            case Listen -> self.state = State.Closed,
-            case SynSent -> self.state = State.Closed,
-            case SynReceived -> {
-                self.send_fin(&var sink)
-                self.state = State.FinWait1
-            },
-            case Established -> {
-                self.send_fin(&var sink)
-                self.state = State.FinWait1
-            },
-            case CloseWait -> {
-                self.send_fin(&var sink)
-                self.state = State.LastAck
-            },
-            case _ -> return CallError.Closing,
+    /// How much of the peer's window is not in flight.
+    func usable(&self) -> Int {
+        let edge = self.snd_una &+ (self.snd_wnd as UInt32)
+        if seq_lt(self.snd_nxt, edge) {
+            (edge &- self.snd_nxt) as Int
+        } else {
+            0
+        }
+    }
+
+    /// Notes a segment from `seq` occupying `occupied` of sequence space
+    /// sent at `now`: SND.NXT moves past it, the timer starts unless it runs
+    /// (RFC 6298 §5.1), and a segment with new data is timed unless one is
+    /// timed already. A segment sent before is never timed (Karn).
+    func sent(&var self, seq: UInt32, occupied: UInt32, now: UInt64) {
+        if not self.timing && seq == self.snd_max {
+            self.timing = true
+            self.timed_seq = seq
+            self.timed_at = now
+        }
+        self.snd_nxt = seq &+ occupied
+        if seq_lt(self.snd_max, self.snd_nxt) {
+            self.snd_max = self.snd_nxt
+        }
+        if not self.timer_on {
+            self.timer_on = true
+            self.timer_from = now
+        }
+    }
+
+    /// Sends the SYN, or the SYN,ACK, from ISS.
+    func send_syn<S: SegmentSink>(&var self, now: UInt64,
+                                  sink: &var S) -> Result<Void, SegmentError> {
+        if self.state == State.SynSent {
+            try self.send(self.iss, 0, SYN, &var sink)
+        } else {
+            try self.send(self.iss, self.rcv_nxt, SYN | ACK, &var sink)
+        }
+        self.syn_owed = false
+        self.sent(self.iss, 1, now)
+        return
+    }
+
+    /// Sends `n` bytes of the send buffer from `off` at SND.NXT, with
+    /// `flags`.
+    func send_data<S: SegmentSink>(&var self, off: Int, n: Int, flags: UInt8,
+                                   now: UInt64,
+                                   sink: &var S) -> Result<Void, SegmentError> {
+        var bytes: [UInt8; SEGMENT_BYTES] = [0; SEGMENT_BYTES]
+        var i = 0
+        while i < n {
+            let at = (self.send_head + off + i) % SEND_BUFFER
+            bytes[tcp.HEADER_BYTES + i] = self.send_buf[at]
+            i = i + 1
+        }
+        let header = Header(src_port: self.local.port,
+                            dst_port: self.remote.port, seq: self.snd_nxt,
+                            ack: self.rcv_nxt, flags: flags,
+                            window: self.window(), mss: None)
+        let len = tcp.write_segment(&var bytes, self.local.addr,
+                                    self.remote.addr, &header, n)
+        try sink.send(self.local.addr, self.remote.addr, &bytes[..len])
+        var occupied = n as UInt32
+        if (flags & FIN) != 0 {
+            occupied = occupied + 1
+        }
+        self.ack_due = false
+        self.held = false
+        self.sent(self.snd_nxt, occupied, now)
+        return
+    }
+
+    /// Sends what the connection owes, as `push` allows: the SYN or SYN,ACK
+    /// while it is owed; then data, once the SYN is acknowledged;
+    /// then the FIN, once all the data is sent; and an acknowledgment alone
+    /// when one is owed and nothing else carried it. Stops at the first
+    /// segment the sink refuses, which stays owed.
+    func output<S: SegmentSink>(&var self, now: UInt64, sink: &var S,
+                                push: Push) -> Result<Void, SegmentError> {
+        if self.state == State.Closed {
+            if self.reset_owed {
+                try self.send(self.snd_max, 0, RST, &var sink)
+                self.reset_owed = false
+            }
+            return
+        }
+        if self.state == State.Listen {
+            return
+        }
+        if self.state == State.TimeWait {
+            if self.ack_due {
+                try self.send(self.snd_max, self.rcv_nxt, ACK, &var sink)
+                self.ack_due = false
+            }
+            return
+        }
+        if self.syn_owed {
+            try self.send_syn(now, &var sink)
+            if push == Push.Resend {
+                return
+            }
+        }
+        if self.state == State.SynSent || self.state == State.SynReceived {
+            return
+        }
+        while {
+            let off = (self.snd_nxt &- self.data_seq) as Int
+            let fin_sent = off > self.send_len
+            let unsent = if fin_sent { 0 } else { self.send_len - off }
+            if unsent > 0 && self.syn_acked {
+                let usable = self.usable()
+                let mss = self.send_mss as Int
+                let n = unsent.min(mss).min(usable)
+                let idle = self.snd_nxt == self.snd_una
+                let fits = n == mss || (idle && unsent <= usable) ||
+                    (idle && 2 * n >= (self.max_wnd as Int))
+                if n > 0 && (fits || push != Push.Normal) {
+                    let last = off + n == self.send_len
+                    var flags = ACK
+                    if last {
+                        flags = flags | PSH
+                        if self.fin_queued {
+                            flags = flags | FIN
+                        }
+                    }
+                    try self.send_data(off, n, flags, now, &var sink)
+                    if push == Push.Resend {
+                        return
+                    }
+                    continue
+                }
+                if idle && n > 0 && not self.held {
+                    self.held = true
+                    self.held_at = now
+                }
+                break
+            }
+            if self.fin_queued && not fin_sent && unsent == 0 {
+                try self.send_data(off, 0, FIN | ACK, now, &var sink)
+                if push == Push.Resend {
+                    return
+                }
+                continue
+            }
+            break
+        }
+        if self.ack_due {
+            try self.send(self.snd_max, self.rcv_nxt, ACK, &var sink)
+            self.ack_due = false
         }
         return
     }
 
-    /// RFC 9293 §3.10.5: ABORT. A connection the peer knows of is reset.
-    func abort<S: SegmentSink>(&var self,
+    /// Ages the connection at `now`: TIME-WAIT's end, the retransmission
+    /// timer, and data the silly window rule has held back too long.
+    func tick<S: SegmentSink>(&var self, now: UInt64, sink: &var S) {
+        if self.state == State.TimeWait {
+            if elapsed(now, self.time_wait_at) >= TIME_WAIT_MS {
+                self.end(CallError.NoConnection)
+            }
+            return
+        }
+        if self.timer_on && elapsed(now, self.timer_from) >= self.rto {
+            self.expire(now, &var sink)
+            return
+        }
+        if self.held && elapsed(now, self.held_at) >= SWS_OVERRIDE_MS {
+            let _ = self.output(now, &var sink, Push.Override)
+        }
+    }
+
+    /// The retransmission timer expired at `now` (RFC 6298 §5.4–5.6): the
+    /// connection is given up once it has had its retries; otherwise the
+    /// timeout doubles, the measurement in progress is dropped, and the
+    /// earliest unacknowledged segment goes again.
+    func expire<S: SegmentSink>(&var self, now: UInt64, sink: &var S) {
+        let handshake = not self.syn_acked
+        let limit = if not handshake {
+            DATA_RETRIES
+        } else if self.passive {
+            SYN_ACK_RETRIES
+        } else {
+            SYN_RETRIES
+        }
+        self.retries = self.retries + 1
+        if self.retries > limit {
+            self.end(CallError.TimedOut)
+            return
+        }
+        self.rto = if self.rto >= MAX_RTO_MS / 2 {
+            MAX_RTO_MS
+        } else {
+            2 * self.rto
+        }
+        self.timing = false
+        if handshake {
+            self.handshake_resent = true
+            self.syn_owed = true
+        }
+        self.snd_nxt = self.snd_una
+        self.timer_from = now
+        let _ = self.output(now, &var sink, Push.Resend)
+    }
+
+    /// RFC 9293 §3.10.2: SEND. Copies as much of `data` as the send buffer
+    /// has room for and answers how much; before the handshake ends it waits
+    /// there.
+    func write<S: SegmentSink>(&var self, data: &[UInt8], now: UInt64,
+                               sink: &var S) -> Result<Int, CallError> {
+        match self.state {
+            case Listen -> return CallError.Listening,
+            case SynSent -> {},
+            case SynReceived -> {},
+            case Established -> {},
+            case CloseWait -> {},
+            case _ -> return CallError.Closing,
+        }
+        let n = data.len().min(SEND_BUFFER - self.send_len)
+        if n == 0 && data.len() != 0 {
+            return CallError.WouldBlock
+        }
+        var i = 0
+        while i < n {
+            let at = (self.send_head + self.send_len + i) % SEND_BUFFER
+            self.send_buf[at] = data[i]
+            i = i + 1
+        }
+        self.send_len = self.send_len + n
+        let _ = self.output(now, &var sink, Push.Normal)
+        return n
+    }
+
+    /// RFC 9293 §3.10.3: RECEIVE. Copies the data waiting into `into`, as
+    /// much as fits, and answers how much: 0 once the peer's FIN is taken and
+    /// nothing is left, which is why an `into` of no bytes is refused
+    /// (`NoRoom`). Opening the window this way is announced when it moves the
+    /// right edge (RFC 9293 §3.8.6.2.2).
+    func read<S: SegmentSink>(&var self, into: &var [UInt8], now: UInt64,
+                              sink: &var S) -> Result<Int, CallError> {
+        if self.state == State.Listen {
+            return CallError.Listening
+        }
+        if into.len() == 0 {
+            return CallError.NoRoom
+        }
+        if self.recv_len == 0 {
+            if self.peer_finished() {
+                return 0
+            }
+            return CallError.WouldBlock
+        }
+        let n = self.recv_len.min(into.len())
+        var i = 0
+        while i < n {
+            into[i] = self.recv_buf[(self.recv_head + i) % RECEIVE_BUFFER]
+            i = i + 1
+        }
+        self.recv_head = (self.recv_head + n) % RECEIVE_BUFFER
+        self.recv_len = self.recv_len - n
+        if self.takes_text() {
+            let room = RECEIVE_BUFFER - self.recv_len
+            let offered = (self.rcv_adv &- self.rcv_nxt) as Int
+            let worth = (RECEIVE_BUFFER / 2).min(self.send_mss as Int)
+            if room - offered >= worth {
+                self.rcv_adv = self.rcv_nxt &+ (room as UInt32)
+                self.ack_due = true
+                let _ = self.output(now, &var sink, Push.Normal)
+            }
+        }
+        return n
+    }
+
+    /// RFC 9293 §3.10.4: CLOSE. A synchronized connection queues its FIN
+    /// behind its data.
+    func close<S: SegmentSink>(&var self, now: UInt64,
                                sink: &var S) -> Result<Void, CallError> {
         match self.state {
             case Closed -> return CallError.NoConnection,
-            case SynReceived -> self.send(self.snd_nxt, 0, RST, &var sink),
-            case Established -> self.send(self.snd_nxt, 0, RST, &var sink),
-            case FinWait1 -> self.send(self.snd_nxt, 0, RST, &var sink),
-            case FinWait2 -> self.send(self.snd_nxt, 0, RST, &var sink),
-            case CloseWait -> self.send(self.snd_nxt, 0, RST, &var sink),
-            case _ -> {},
+            case Listen -> self.end(CallError.NoConnection),
+            case SynSent -> self.end(CallError.NoConnection),
+            case SynReceived -> {
+                self.fin_queued = true
+                self.state = State.FinWait1
+            },
+            case Established -> {
+                self.fin_queued = true
+                self.state = State.FinWait1
+            },
+            case CloseWait -> {
+                self.fin_queued = true
+                self.state = State.LastAck
+            },
+            case _ -> return CallError.Closing,
         }
-        self.state = State.Closed
+        let _ = self.output(now, &var sink, Push.Normal)
+        return
+    }
+
+    /// RFC 9293 §3.10.5: ABORT. A connection the peer knows of owes it a
+    /// reset, `<SEQ=SND.MAX><CTL=RST>`, which goes now if the sink takes it
+    /// and with the next `output` if not; the slot is not reused until it
+    /// has gone.
+    func abort<S: SegmentSink>(&var self,
+                               sink: &var S) -> Result<Void, CallError> {
+        let known = match self.state {
+            case Closed -> { return CallError.NoConnection },
+            case SynReceived -> true,
+            case Established -> true,
+            case FinWait1 -> true,
+            case FinWait2 -> true,
+            case CloseWait -> true,
+            case _ -> false,
+        }
+        self.end(CallError.NoConnection)
+        self.reset_owed = known
+        let _ = self.output(0, &var sink, Push.Normal)
+        return
+    }
+
+    /// `Table.skip_sequence`.
+    func skip_sequence(&var self, by: UInt32) -> Result<Void, CallError> {
+        if self.state != State.Established || self.send_len != 0 ||
+           self.snd_una != self.snd_max {
+            return CallError.WouldBlock
+        }
+        self.snd_una = self.snd_una &+ by
+        self.snd_nxt = self.snd_una
+        self.snd_max = self.snd_una
+        self.data_seq = self.snd_una
         return
     }
 
@@ -581,7 +1310,10 @@ extension Connection {
         Status(state: self.state, local: self.local, remote: self.remote,
                snd_una: self.snd_una, snd_nxt: self.snd_nxt,
                snd_wnd: self.snd_wnd, rcv_nxt: self.rcv_nxt,
-               send_mss: self.send_mss, received: self.received)
+               rcv_wnd: self.window(), send_mss: self.send_mss,
+               received: self.received, readable: self.recv_len,
+               queued: self.send_len, rto_ms: self.rto, srtt_ms: self.srtt,
+               rttvar_ms: self.rttvar, retries: self.retries)
     }
 }
 
@@ -605,13 +1337,24 @@ public struct Table {
     private slots: [Connection; CONNECTIONS],
     /// Each slot's occupant: counted up each time the slot is taken.
     private generations: [UInt32; CONNECTIONS],
+    /// The least retransmission timeout of every connection.
+    private min_rto: UInt64,
+    /// Where the search for an ephemeral port starts.
+    private next_port: UInt16,
 }
 
 extension Table {
-    /// No connections.
-    public static func empty() -> Table {
+    /// No connections, with retransmission timeouts of at least
+    /// `min_rto_ms`.
+    public init(min_rto_ms: UInt64) -> Table {
         Table(slots: [Connection.free(); CONNECTIONS],
-              generations: [0; CONNECTIONS])
+              generations: [0; CONNECTIONS], min_rto: min_rto_ms,
+              next_port: EPHEMERAL_FIRST)
+    }
+
+    /// No connections, with RFC 6298's least timeout, `MIN_RTO_MS`.
+    public static func empty() -> Table {
+        Table(min_rto_ms: MIN_RTO_MS)
     }
 
     /// RFC 9293 §3.10.1's passive OPEN: a listener on `port`, which spawns a
@@ -632,47 +1375,102 @@ extension Table {
         return self.occupy(i, c)
     }
 
-    /// RFC 9293 §3.10.1's active OPEN from `local` to `remote`: sends the SYN
-    /// and answers the connection's id.
+    /// A connection listener `id` spawned whose handshake is done and that
+    /// was not handed out before; `WouldBlock` while there is none.
+    public func accept(&var self, id: ConnId) -> Result<ConnId, CallError> {
+        let l = try self.used(id)
+        if self.slots[l].state != State.Listen {
+            return CallError.NotListening
+        }
+        var i = 0
+        while i < CONNECTIONS {
+            if self.spawned_by(i, l) && not self.slots[i].accepted &&
+               self.slots[i].state != State.SynReceived {
+                self.slots[i].accepted = true
+                return ConnId(slot: i as UInt8, generation: self.generations[i])
+            }
+            i = i + 1
+        }
+        return CallError.WouldBlock
+    }
+
+    /// RFC 9293 §3.10.1's active OPEN from `local` to `remote` at `now`:
+    /// sends the SYN and answers the connection's id.
     public func connect<S: SegmentSink, I: IsnSource>(
-            &var self, local: SocketAddr, remote: SocketAddr, isn: &var I,
-            sink: &var S) -> Result<ConnId, OpenError> {
+            &var self, local: SocketAddr, remote: SocketAddr, now: UInt64,
+            isn: &var I, sink: &var S) -> Result<ConnId, OpenError> {
         try self.check_open(local, remote)
         guard let i = self.free_slot() else { return OpenError.Full }
         let iss = isn.isn(local, remote)
-        return self.occupy(i, Connection.opened(local, remote, iss, &var sink))
+        let id = self.occupy(i, Connection.begin(State.SynSent, local, remote,
+                                                 iss, self.min_rto))
+        let _ = self.slots[i].output(now, &var sink, Push.Normal)
+        return id
     }
 
     /// RFC 9293 §3.10.2's SEND to listener `id`, which turns it into an
     /// active open from `addr` at its port to `remote`: the SYN goes out and
-    /// the listener is the connection, in SYN-SENT.
+    /// the listener is the connection, in SYN-SENT. What it spawned and did
+    /// not hand out is aborted, as when it closes.
     public func connect_listener<S: SegmentSink, I: IsnSource>(
             &var self, id: ConnId, addr: Ipv4Addr, remote: SocketAddr,
-            isn: &var I, sink: &var S) -> Result<Void, OpenError> {
+            now: UInt64, isn: &var I, sink: &var S) -> Result<Void, OpenError> {
         let i = try self.used(id) catch { return OpenError.NotListening }
         if self.slots[i].state != State.Listen {
             return OpenError.NotListening
         }
         let local = SocketAddr(addr: addr, port: self.slots[i].local.port)
         try self.check_open(local, remote)
+        self.abort_spawned(i, &var sink)
         let iss = isn.isn(local, remote)
-        self.slots[i] = Connection.opened(local, remote, iss, &var sink)
+        self.slots[i] = Connection.begin(State.SynSent, local, remote, iss,
+                                         self.min_rto)
+        let _ = self.slots[i].output(now, &var sink, Push.Normal)
         return
     }
 
-    /// RFC 9293 §3.10.4's CLOSE of connection or listener `id`.
-    public func close<S: SegmentSink>(&var self, id: ConnId,
+    /// RFC 9293 §3.10.2's SEND on connection `id` at `now`: copies as much
+    /// of `data` as its send buffer has room for, sends what may go, and
+    /// answers how much it took.
+    public func write<S: SegmentSink>(&var self, id: ConnId, data: &[UInt8],
+                                      now: UInt64,
+                                      sink: &var S) -> Result<Int, CallError> {
+        let i = try self.used(id)
+        self.slots[i].write(&data, now, &var sink)
+    }
+
+    /// RFC 9293 §3.10.3's RECEIVE on connection `id` at `now`: copies what
+    /// was received in order into `into`, as much as fits, and answers how
+    /// much; 0 once the peer has closed and nothing is left, and `WouldBlock`
+    /// while nothing waits.
+    public func read<S: SegmentSink>(&var self, id: ConnId,
+                                     into: &var [UInt8], now: UInt64,
+                                     sink: &var S) -> Result<Int, CallError> {
+        let i = try self.used(id)
+        self.slots[i].read(&var into, now, &var sink)
+    }
+
+    /// RFC 9293 §3.10.4's CLOSE of connection or listener `id` at `now`. A
+    /// listener's connections not yet accepted are aborted with it.
+    public func close<S: SegmentSink>(&var self, id: ConnId, now: UInt64,
                                       sink: &var S) -> Result<Void, CallError> {
         let i = try self.used(id)
-        self.slots[i].close(&var sink)
+        if self.slots[i].state == State.Listen {
+            self.abort_spawned(i, &var sink)
+        }
+        self.slots[i].close(now, &var sink)
     }
 
     /// RFC 9293 §3.10.5's ABORT of connection or listener `id`: it is
     /// CLOSED at once, and the peer, if it knows of the connection, is sent
-    /// a reset.
+    /// a reset. A listener's connections not yet accepted are aborted with
+    /// it.
     public func abort<S: SegmentSink>(&var self, id: ConnId,
                                       sink: &var S) -> Result<Void, CallError> {
         let i = try self.used(id)
+        if self.slots[i].state == State.Listen {
+            self.abort_spawned(i, &var sink)
+        }
         self.slots[i].abort(&var sink)
     }
 
@@ -693,11 +1491,12 @@ extension Table {
         let local = SocketAddr(addr: dst, port: header.dst_port)
         let remote = SocketAddr(addr: src, port: header.src_port)
         if let i = self.find_slot(local, remote) {
-            return self.slots[i].arrive(&header, data, now, &var sink)
+            return self.slots[i].arrive(&header, &segment[parsed.data_at()..],
+                                        now, &var sink)
         }
-        if self.listener(header.dst_port) != None {
-            return self.arrive_listen(local, remote, &header, data, &var isn,
-                                      &var sink)
+        if let l = self.listener(header.dst_port) {
+            return self.arrive_listen(l, local, remote, &header, data, now,
+                                      &var isn, &var sink)
         }
         // RFC 9293 §3.10.7.1: no connection.
         if header.has(RST) {
@@ -707,14 +1506,28 @@ extension Table {
         return TcpDrop.NoConnection
     }
 
-    /// Ends each TIME-WAIT that has lasted `TIME_WAIT_MS` at `now`.
-    public func poll(&var self, now: UInt64) {
+    /// Sends at `now` whatever each connection owes and may send. Answers
+    /// `Full` when the sink refused a segment: what is left is owed still, and
+    /// the next call sends it.
+    public func output<S: SegmentSink>(
+            &var self, now: UInt64,
+            sink: &var S) -> Result<Void, SegmentError> {
         var i = 0
         while i < CONNECTIONS {
-            if self.slots[i].state == State.TimeWait &&
-               elapsed(now, self.slots[i].time_wait_at) >= TIME_WAIT_MS {
-                self.slots[i].state = State.Closed
-            }
+            try self.slots[i].output(now, &var sink, Push.Normal)
+            i = i + 1
+        }
+        return
+    }
+
+    /// Ages every connection at `now`: ends each TIME-WAIT that has lasted
+    /// `TIME_WAIT_MS`, retransmits for each timer that expired or gives the
+    /// connection up, and sends data the silly window rule has held back for
+    /// `SWS_OVERRIDE_MS`.
+    public func poll<S: SegmentSink>(&var self, now: UInt64, sink: &var S) {
+        var i = 0
+        while i < CONNECTIONS {
+            self.slots[i].tick(now, &var sink)
             i = i + 1
         }
     }
@@ -725,7 +1538,7 @@ extension Table {
         self.slots[i].state
     }
 
-    /// Connection or listener `id`'s state and sequence numbers.
+    /// Connection or listener `id`'s state, sequence numbers and timers.
     public func status(&self, id: ConnId) -> Result<Status, CallError> {
         let i = try self.used(id)
         return self.slots[i].status()
@@ -739,12 +1552,49 @@ extension Table {
         None
     }
 
-    /// RFC 9293 §3.10.7.2: a segment to a listener. A SYN spawns a
+    /// A port of the dynamic range no connection or listener uses, searched
+    /// from where the last search stopped. One is found within
+    /// `CONNECTIONS + 1` tries: at most `CONNECTIONS` are used.
+    public func ephemeral_port(&var self) -> UInt16 {
+        var candidate = self.next_port
+        while self.uses_port(candidate) {
+            candidate = after(candidate)
+        }
+        self.next_port = after(candidate)
+        candidate
+    }
+
+    /// Moves connection `id`'s send sequence on by `by`, as if that much had
+    /// been sent and acknowledged: for a test that reaches the far end of the
+    /// sequence space without sending gigabytes. Only an established
+    /// connection with nothing queued or in flight moves; any other answers
+    /// `WouldBlock`.
+    public func skip_sequence(&var self, id: ConnId,
+                              by: UInt32) -> Result<Void, CallError> {
+        let i = try self.used(id)
+        self.slots[i].skip_sequence(by)
+    }
+
+    /// Whether a connection or listener uses `port` as its own.
+    public func uses_port(&self, port: UInt16) -> Bool {
+        var i = 0
+        while i < CONNECTIONS {
+            if self.slots[i].state != State.Closed &&
+               self.slots[i].local.port == port {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    /// RFC 9293 §3.10.7.2: a segment to listener `l`. A SYN spawns a
     /// connection in SYN-RECEIVED that answers with SYN,ACK. Text and FIN on
     /// the SYN are not kept; the peer sends them again.
     func arrive_listen<S: SegmentSink, I: IsnSource>(
-            &var self, local: SocketAddr, remote: SocketAddr, header: &Header,
-            data: Int, isn: &var I, sink: &var S) -> Result<Void, TcpDrop> {
+            &var self, l: Int, local: SocketAddr, remote: SocketAddr,
+            header: &Header, data: Int, now: UInt64, isn: &var I,
+            sink: &var S) -> Result<Void, TcpDrop> {
         if header.has(RST) {
             return TcpDrop.ResetIgnored
         }
@@ -757,18 +1607,32 @@ extension Table {
         }
         guard let i = self.free_slot() else { return TcpDrop.TableFull }
         let iss = isn.isn(local, remote)
-        var c = Connection.free()
-        c.state = State.SynReceived
+        var c = Connection.begin(State.SynReceived, local, remote, iss,
+                                 self.min_rto)
         c.passive = true
-        c.local = local
-        c.remote = remote
-        c.iss = iss
-        c.snd_una = iss
-        c.snd_nxt = iss &+ 1
+        c.listener = l
         c.take_syn(&header)
-        c.send_syn_ack(&var sink)
         let _ = self.occupy(i, c)
+        let _ = self.slots[i].output(now, &var sink, Push.Normal)
         return
+    }
+
+    /// Whether slot `i` holds a connection the listener in slot `l` spawned.
+    func spawned_by(&self, i: Int, l: Int) -> Bool {
+        self.slots[i].state != State.Closed && self.slots[i].passive &&
+            self.slots[i].listener == l
+    }
+
+    /// Aborts every connection the listener in slot `l` spawned that was not
+    /// handed out.
+    func abort_spawned<S: SegmentSink>(&var self, l: Int, sink: &var S) {
+        var i = 0
+        while i < CONNECTIONS {
+            if self.spawned_by(i, l) && not self.slots[i].accepted {
+                let _ = self.slots[i].abort(&var sink)
+            }
+            i = i + 1
+        }
     }
 
     /// Refuses an open between `local` and `remote` that cannot be one.
@@ -791,12 +1655,15 @@ extension Table {
         ConnId(slot: i as UInt8, generation: self.generations[i])
     }
 
-    /// The slot of `id` while it holds the connection or listener `id` names.
+    /// The slot of `id` while it holds the connection or listener `id` names;
+    /// once that has ended, why.
     func used(&self, id: ConnId) -> Result<Int, CallError> {
         let i = id.slot as Int
-        if self.generations[i] != id.generation ||
-           self.slots[i].state == State.Closed {
+        if self.generations[i] != id.generation {
             return CallError.NoConnection
+        }
+        if self.slots[i].state == State.Closed {
+            return self.slots[i].ended
         }
         return i
     }
@@ -806,10 +1673,8 @@ extension Table {
     func find_slot(&self, local: SocketAddr, remote: SocketAddr) -> Int? {
         var i = 0
         while i < CONNECTIONS {
-            let c = self.slots[i]
-            if c.state != State.Closed && c.local.addr == local.addr &&
-               c.local.port == local.port && c.remote.addr == remote.addr &&
-               c.remote.port == remote.port {
+            if self.slots[i].state != State.Closed &&
+               self.slots[i].local == local && self.slots[i].remote == remote {
                 return i
             }
             i = i + 1
@@ -833,7 +1698,8 @@ extension Table {
     func free_slot(&self) -> Int? {
         var i = 0
         while i < CONNECTIONS {
-            if self.slots[i].state == State.Closed {
+            if self.slots[i].state == State.Closed &&
+               not self.slots[i].reset_owed {
                 return i
             }
             i = i + 1

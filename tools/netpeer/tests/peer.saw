@@ -4,7 +4,7 @@
 // own byte code, not by src/wire.saw.
 
 import std.data.{Data}
-import netpeer.peer.{Peer, Script, Handled}
+import netpeer.peer.{ECHO_ISS, Peer, Script, Handled}
 
 static GUEST_MAC: UInt = 0x5254_0012_3456
 static PEER_MAC: UInt = 0x5255_0A00_0202
@@ -609,6 +609,7 @@ func script_tests() {
     check(known("dhcp"), "dhcp")
     check(known("dhcp_retry"), "dhcp_retry")
     check(known("dns"), "dns")
+    check(known("tcp_echo"), "tcp_echo")
     check(not known("loud"), "no other")
 }
 
@@ -1252,6 +1253,268 @@ func dnsf(spec: &DnsSpec) -> Data {
     dns_frame(&m)
 }
 
+// ---- TCP --------------------------------------------------------------------
+
+static GUEST_PORT: UInt = 49152
+
+/// A guest's TCP segment from `sport` to `dport` at `seq` acknowledging `ack`
+/// with `flags`, data offset `offset` bytes (options zero), carrying `text`.
+/// `break_sum` breaks its checksum.
+struct TcpSpec {
+    sport: UInt,
+    dport: UInt,
+    seq: UInt,
+    ack: UInt,
+    flags: UInt,
+    offset: Int,
+    text: String,
+    break_sum: Bool,
+}
+
+extension TcpSpec {
+    static func of(seq: UInt, ack: UInt, flags: UInt, text: String) -> TcpSpec {
+        TcpSpec(sport: GUEST_PORT, dport: 7, seq: seq, ack: ack, flags: flags,
+                offset: 20, text: text, break_sum: false)
+    }
+
+    func bytes(&self, field: UInt) -> Data {
+        var t = Data()
+        put(&var t, self.sport, 2)
+        put(&var t, self.dport, 2)
+        put(&var t, self.seq, 4)
+        put(&var t, self.ack, 4)
+        put(&var t, ((self.offset / 4) as UInt) << 4, 1)
+        put(&var t, self.flags, 1)
+        put(&var t, 4096, 2)
+        put(&var t, field, 2)
+        put(&var t, 0, 2)
+        while t.len() < self.offset {
+            put(&var t, 0, 1)
+        }
+        put_text(&var t, self.text)
+        t
+    }
+
+    /// The segment in a frame from the guest to the peer.
+    func frame(&self) -> Data {
+        let plain = self.bytes(0)
+        let seed = (GUEST_IP >> 16) + (GUEST_IP & 0xFFFF) + (PEER_IP >> 16) +
+                   (PEER_IP & 0xFFFF) + 6 + (plain.len() as UInt)
+        var sum = inet(&plain, 0, plain.len(), seed)
+        if self.break_sum {
+            sum = sum ^ 0x0100
+        }
+        IpSpec.to_peer(6).frame(&self.bytes(sum))
+    }
+}
+
+/// Whether `r` is a frame from the peer to the guest carrying a TCP segment
+/// from port 7 to the guest's at `seq` acknowledging `ack`, with `flags`,
+/// window 8192, the segment size option of 1460 when `mss`, `text`, and a
+/// checksum that verifies.
+func tcp_reply_is(r: &Data, seq: UInt, ack: UInt, flags: UInt, mss: Bool,
+                  text: String) -> Bool {
+    let header = if mss { 24 } else { 20 }
+    let total = 20 + header + text.len()
+    if at(&r, 0, 6) != GUEST_MAC || at(&r, 6, 6) != PEER_MAC ||
+       at(&r, 12, 2) != IPV4 || at(&r, 16, 2) != (total as UInt) ||
+       at(&r, 23, 1) != 6 || at(&r, 26, 4) != PEER_IP || at(&r, 30, 4) != GUEST_IP {
+        print("not a TCP frame from the peer to the guest")
+        return false
+    }
+    let t = 34
+    let seed = (PEER_IP >> 16) + (PEER_IP & 0xFFFF) + (GUEST_IP >> 16) +
+               (GUEST_IP & 0xFFFF) + 6 + ((header + text.len()) as UInt)
+    if inet(&r, t, header + text.len(), seed) != 0 {
+        print("a TCP checksum that does not verify")
+        return false
+    }
+    if at(&r, t, 2) != 7 || at(&r, t + 2, 2) != GUEST_PORT ||
+       at(&r, t + 4, 4) != seq || at(&r, t + 8, 4) != ack ||
+       at(&r, t + 12, 1) != ((header / 4) as UInt) << 4 ||
+       at(&r, t + 13, 1) != flags || at(&r, t + 14, 2) != 8192 ||
+       at(&r, t + 18, 2) != 0 {
+        print("seq {at(&r, t + 4, 4)} ack {at(&r, t + 8, 4)} flags {at(&r, t + 13, 1)}")
+        return false
+    }
+    if mss && at(&r, t + 20, 4) != 0x0204_05B4 {
+        return false
+    }
+    var i = 0
+    while i < text.len() {
+        if at(&r, t + header + i, 1) != (text.byte_at(i) as UInt) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Hands `peer` the guest's `spec`, and answers what it did.
+func say(peer: &var Peer, spec: TcpSpec) -> Handled {
+    let f = spec.frame()
+    peer.handle(&f)
+}
+
+/// The peer, `spec` handed to it, logged `line` alone as unexpected and sent
+/// nothing.
+func refuses(peer: &var Peer, spec: TcpSpec, line: String, what: String) {
+    let h = say(&var peer, spec)
+    lines_are(&h, &one("peer: unexpected: {line}"), what)
+    check(h.replies.len() == 0, "{what}: nothing sent")
+}
+
+static ACK: UInt = 0x10
+static SYN: UInt = 0x02
+static FIN: UInt = 0x01
+static PSH: UInt = 0x08
+static RST: UInt = 0x04
+
+/// The echo server after the guest's SYN at 1000.
+func answered() -> Peer {
+    var p = Peer(script: Script.TcpEcho)
+    let _ = say(&var p, TcpSpec.of(1000, 0, SYN, ""))
+    p
+}
+
+/// The echo server with its handshake done.
+func established() -> Peer {
+    var p = answered()
+    let _ = say(&var p, TcpSpec.of(1001, ECHO_ISS + 1, ACK, ""))
+    p
+}
+
+func tcp_tests() {
+    // A whole connection: the handshake, an echo, the close.
+    var p = Peer(script: Script.TcpEcho)
+    let syn = say(&var p, TcpSpec.of(1000, 0, SYN, ""))
+    lines_are(&syn, &one("peer: tcp syn from 10.0.2.15:49152 to port 7, answered"),
+              "syn")
+    check(syn.replies.len() == 1 &&
+          tcp_reply_is(&(syn.replies.get(0) ?? Data()), ECHO_ISS, 1001, SYN | ACK,
+                       true, ""), "the SYN,ACK")
+    let ack = say(&var p, TcpSpec.of(1001, ECHO_ISS + 1, ACK, ""))
+    lines_are(&ack, &one("peer: tcp established"), "the handshake's ACK")
+    check(ack.replies.len() == 0, "is not answered")
+    let hello = say(&var p, TcpSpec.of(1001, ECHO_ISS + 1, ACK | PSH, "hello"))
+    lines_are(&hello, &one("peer: tcp 5 bytes, echoed"), "data")
+    check(hello.replies.len() == 1 &&
+          tcp_reply_is(&(hello.replies.get(0) ?? Data()), ECHO_ISS + 1, 1006,
+                       ACK | PSH, false, "hello"), "is echoed")
+    let acked = say(&var p, TcpSpec.of(1006, ECHO_ISS + 6, ACK, ""))
+    check(acked.lines.len() == 0 && acked.replies.len() == 0,
+          "the echo's acknowledgment is taken quietly")
+    let fin = say(&var p, TcpSpec.of(1006, ECHO_ISS + 6, FIN | ACK, ""))
+    lines_are(&fin, &one("peer: tcp fin, answered with fin"), "the guest's FIN")
+    check(fin.replies.len() == 1 &&
+          tcp_reply_is(&(fin.replies.get(0) ?? Data()), ECHO_ISS + 6, 1007,
+                       FIN | ACK, false, ""), "is answered with the peer's")
+    let last = say(&var p, TcpSpec.of(1007, ECHO_ISS + 7, ACK, ""))
+    lines_are(&last, &one("peer: tcp closed"), "the last ACK")
+    check(last.replies.len() == 0, "is not answered")
+    refuses(&var p, TcpSpec.of(1007, ECHO_ISS + 7, ACK, ""),
+            "a TCP segment after the close", "after the close")
+
+    // Data and the FIN in one segment: both answered, in order.
+    var both = established()
+    let df = say(&var both, TcpSpec.of(1001, ECHO_ISS + 1, FIN | ACK | PSH, "hi"))
+    check(df.replies.len() == 2 && df.lines.len() == 2 &&
+          tcp_reply_is(&(df.replies.get(1) ?? Data()), ECHO_ISS + 3, 1004,
+                       FIN | ACK, false, ""), "data with a FIN")
+
+    // The refusals, each by one check.
+    var fresh = Peer(script: Script.TcpEcho)
+    let short = TcpSpec.of(1000, 0, SYN, "")
+    let sf = trimmed(&short.frame(), 14 + 20 + 19)
+    refused(Script.TcpEcho, &fixed_ip(&sf), "a TCP segment of 19 bytes", "short TCP")
+    var low = TcpSpec.of(1000, 0, SYN, "")
+    low.offset = 16
+    refuses(&var fresh, low, "a TCP data offset of 16 in 20 bytes", "offset under 20")
+    var high = TcpSpec.of(1000, 0, SYN, "")
+    high.offset = 24
+    let hb = high.frame()
+    let hf = trimmed(&hb, 14 + 20 + 20)
+    refused(Script.TcpEcho, &fixed_ip(&hf), "a TCP data offset of 24 in 20 bytes",
+            "offset past the segment")
+    var bad = TcpSpec.of(1000, 0, SYN, "")
+    bad.break_sum = true
+    refuses(&var fresh, bad, "a TCP checksum", "TCP checksum")
+    var elsewhere = TcpSpec.of(1000, 0, SYN, "")
+    elsewhere.dport = 9
+    refuses(&var fresh, elsewhere, "a TCP segment to port 9", "port")
+    refuses(&var fresh, TcpSpec.of(1000, 0, ACK, ""), "TCP flags 16 with no connection",
+            "no connection")
+    refuses(&var fresh, TcpSpec.of(1000, 0, SYN, "x"), "TCP flags 2 with no connection",
+            "a SYN with data")
+    let f = TcpSpec.of(1000, 0, SYN, "").frame()
+    refused(Script.Ping, &f, "IPv4 protocol 6", "ping takes no TCP")
+
+    var s = answered()
+    var other = TcpSpec.of(1001, ECHO_ISS + 1, ACK, "")
+    other.sport = GUEST_PORT + 1
+    refuses(&var s, other, "a TCP segment from port 49153", "another port")
+    refuses(&var s, TcpSpec.of(1001, ECHO_ISS + 1, RST | ACK, ""), "a TCP reset",
+            "reset")
+    refuses(&var s, TcpSpec.of(1000, 0, SYN, ""), "TCP flags 2 on the connection",
+            "a SYN again")
+    refuses(&var s, TcpSpec.of(1000, 0, SYN | ACK, ""),
+            "TCP flags 18 on the connection", "a SYN,ACK")
+    refuses(&var s, TcpSpec.of(1001, ECHO_ISS + 1, PSH, ""),
+            "TCP flags 8 on the connection", "no ACK")
+    refuses(&var s, TcpSpec.of(1002, ECHO_ISS + 1, ACK, ""),
+            "a TCP segment at 1002, not 1001", "sequence")
+    refuses(&var s, TcpSpec.of(1001, ECHO_ISS + 2, ACK, ""),
+            "a TCP acknowledgment of 16777218, not 16777217", "acknowledgment")
+    refuses(&var s, TcpSpec.of(1001, ECHO_ISS + 1, ACK, "x"),
+            "data on the handshake's ACK", "data on the handshake")
+    var closing = established()
+    let _ = say(&var closing, TcpSpec.of(1001, ECHO_ISS + 1, FIN | ACK, ""))
+    refuses(&var closing, TcpSpec.of(1002, ECHO_ISS + 2, ACK, "x"),
+            "data after the close", "data in LAST-ACK")
+}
+
+/// `frame` with its IPv4 total length set to what it holds and the header's
+/// checksum made good again.
+func fixed_ip(frame: &Data) -> Data {
+    var d = Data()
+    var i = 0
+    while i < frame.len() {
+        put(&var d, at(&frame, i, 1), 1)
+        i = i + 1
+    }
+    let total = (frame.len() - 14) as UInt
+    var header = Data()
+    i = 14
+    while i < 34 {
+        if i == 16 {
+            put(&var header, total, 2)
+            i = i + 2
+        } else if i == 24 {
+            put(&var header, 0, 2)
+            i = i + 2
+        } else {
+            put(&var header, at(&frame, i, 1), 1)
+            i = i + 1
+        }
+    }
+    let sum = inet(&header, 0, 20, 0)
+    var out = Data()
+    i = 0
+    while i < frame.len() {
+        if i == 16 {
+            put(&var out, total, 2)
+            i = i + 2
+        } else if i == 24 {
+            put(&var out, sum, 2)
+            i = i + 2
+        } else {
+            put(&var out, at(&frame, i, 1), 1)
+            i = i + 1
+        }
+    }
+    out
+}
+
 func main() {
     greeting_tests()
     arp_tests()
@@ -1263,4 +1526,5 @@ func main() {
     dhcp_refusals()
     dns_tests()
     dns_refusals()
+    tcp_tests()
 }
