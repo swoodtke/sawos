@@ -1,0 +1,44 @@
+// A client of an image's console, written with `main`, that ends as its build
+// input `endsconfig.END` says:
+//
+//   exit   a debug print of one byte, whose answer it prints through the
+//          console (`SOS ends: debug print: ...`), then a return;
+//   panic  a panic on a text longer than the kernel's `PANIC_TEXT_BYTES`:
+//          `SOS ends: a panic ` and then `ALPHABET` five times;
+//   fault  a release of a word that names nothing, the `BadHandle` fault.
+
+import sos.{sos_handle_release}
+import endsconfig
+import sosmain
+
+/// The ends `endsconfig.END` names.
+static END_EXIT: Int = 0
+static END_PANIC: Int = 1
+static END_FAULT: Int = 2
+
+/// The word that names nothing, whose release is the `BadHandle` fault.
+static NAMES_NOTHING: UInt = 0
+
+/// The byte the `exit` end's debug print offers.
+static OFFERED: UInt8 = 0x2A
+
+/// What the panic's text repeats.
+func alphabet() -> String { "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }
+
+func main() {
+    if endsconfig.END == END_EXIT {
+        try sosmain.context().system().debug_print_byte(OFFERED) catch {
+            print("SOS ends: debug print: {}", error)
+            return
+        }
+        print("SOS ends: debug print: written")
+        return
+    }
+    if endsconfig.END == END_PANIC {
+        let a = alphabet()
+        panic("SOS ends: a panic {}{}{}{}{}", a, a, a, a, a)
+    }
+    if endsconfig.END == END_FAULT {
+        let _ = sos_handle_release(NAMES_NOTHING)
+    }
+}

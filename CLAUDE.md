@@ -80,7 +80,11 @@ drivers/           # userspace device drivers and the protocol packages their
                    # and transmit rings, gap marks, held reads and writes,
                    # sync marks and the serve state machine, over a
                    # `UartDevice` trait, with a fake UART and a model of a
-                   # driver's loop for its hosted tests
+                   # driver's loop for its hosted tests; svc-uart-esp32s3/ is
+                   # the ESP32-S3's UART0 driver on it, interrupt-driven both
+                   # ways, which holds the console claim while it serves and
+                   # whose rings and thresholds are its build input
+                   # `uartconfig`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 rt/main/           # `sosmain`: the `_start` of a program written with `main`
@@ -315,7 +319,9 @@ on the gate's machine (QEMU with the esp32s3 machine, esp-clang and its
 `ld.lld`), and it is not part of `sos-test`. Its cases are the gate's harness
 kernels on hand-assembled payloads from `tests/xtensa/`, and gate cases with
 real processes, whose packages carry a `[sos.xtensa-esp-unknown-elf]` section.
-`--case` narrows it as it does the gate.
+`--case` narrows it as it does the gate. A case's `stdin` is typed at UART0 as
+the gate's typist types at its boards (`_boot_esp32s3`), and `stdin_after`
+holds the typing until the console has printed that text.
 
 The runner is parallel by default: one job per performance core, detected.
 `SOS_JOBS` overrides the detection and `-j N` overrides both; the count is

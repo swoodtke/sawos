@@ -1,0 +1,56 @@
+// The end-of-service drain answers a held `Sync` whose bytes have left,
+// whether or not an interrupt said so: the FIFO can empty with no interrupt
+// between the last client's going and the driver's drain, and a `Sync` held
+// then is answered `Ok` and not dropped with the driver.
+
+import uartcore.{KIND_SYNC}
+import uartcore.bench.{Bench}
+import uartproto.{UartBody}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The `Sync` answered by `next_answer` now, as the driver makes its answers
+/// after the drain's calls.
+func sync_ready(b: &var Bench<256, 16>) -> Bool {
+    var body = UartBody.empty()
+    if let a = b.core.next_answer(&var body) {
+        return a.kind == KIND_SYNC && a.len == 1 && body.bytes[0] == 0
+    }
+    false
+}
+
+/// The FIFO empties with no interrupt before the drain begins.
+func passed_at_begin() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    let s = b.post_sync()
+    b.pump()
+    check(not b.answered(s), "the Sync waits for its bytes")
+    b.uart.drain_all()
+    check(b.core.begin_drain(&var b.uart), "the drain is over at once")
+    check(sync_ready(&var b), "and the Sync is answered Ok")
+}
+
+/// The FIFO empties with no interrupt while the drain waits.
+func passed_while_draining() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    let s = b.post_sync()
+    b.pump()
+    check(not b.answered(s), "the Sync waits for its bytes")
+    check(not b.core.begin_drain(&var b.uart), "the bytes are still in the FIFO")
+    check(not sync_ready(&var b), "so the Sync still waits")
+    b.uart.drain_all()
+    check(b.core.drained(&var b.uart), "the drain is over")
+    check(sync_ready(&var b), "and the Sync is answered Ok")
+}
+
+func main() {
+    passed_at_begin()
+    passed_while_draining()
+}

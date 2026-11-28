@@ -46,7 +46,7 @@
 import uartcore.device.{EV_BREAK, EV_ERRORS, EV_FRAME, EV_OVERRUN, EV_PARITY,
                         EV_RECEIVE, EV_RX, UartDevice}
 import uartcore.rx.{Counts, Input, Rx}
-import uartcore.tx.{MAX_SYNCS, SyncTake, Tx, TxConfig}
+import uartcore.tx.{MAX_SYNCS, SyncTake, Tx, TxConfig, seq_before}
 import uartproto.{Frame, UartBody, UartCounts, UartStats, UartStatus}
 
 /// How many `Read`s are held at once; past it a `Read` is answered `Busy`.
@@ -120,6 +120,14 @@ extension Core<T, R> {
 
     /// Whether the driver may take another message.
     public func intake_open(&self) -> Bool { self.tx.intake_open() }
+
+    /// Gives out the held `Read`s' and `Sync`s' sequence numbers from `at`
+    /// on: `new` starts at 0, and a test starts near the top to cross the
+    /// wrap.
+    public func start_sequences(&var self, at: UInt) {
+        self.next_seq = at
+        self.tx.start_sequence(at)
+    }
 
     /// The `Read`s held.
     public func reads_held(&self) -> Int {
@@ -220,7 +228,7 @@ extension Core<T, R> {
             if not self.read_used[i] {
                 self.read_used[i] = true
                 self.read_seq[i] = self.next_seq
-                self.next_seq = self.next_seq + 1
+                self.next_seq = self.next_seq &+ 1
                 return Served.Held(KIND_READ, i)
             }
             i = i + 1
@@ -354,7 +362,7 @@ extension Core<T, R> {
         var i = 0
         while i < MAX_HELD_READS {
             if self.read_used[i] {
-                if best < 0 || self.read_seq[i] < self.read_seq[best] {
+                if best < 0 || seq_before(self.read_seq[i], self.read_seq[best]) {
                     best = i
                 }
             }
@@ -379,13 +387,15 @@ extension Core<T, R> {
     /// Starts waiting for the transmitter to send everything queued so far, a
     /// held `Write`'s remainder included, for the driver that is ending.
     /// Answers whether that is already so; when it is not, the interrupt
-    /// that sees the last byte leave makes `drained` true.
+    /// that sees the last byte leave makes `drained` true. Each `Sync` whose
+    /// mark has passed is flagged here and by `drained`, so the driver makes
+    /// its answer from `next_answer` after either, interrupt or not.
     public func begin_drain<D: UartDevice>(&var self, dev: &var D) -> Bool {
         self.tx.begin_drain(&var dev)
     }
 
     /// Whether that wait is over: the ring and the FIFO are empty.
-    public func drained<D: UartDevice>(&self, dev: &var D) -> Bool {
+    public func drained<D: UartDevice>(&var self, dev: &var D) -> Bool {
         self.tx.drained(&var dev)
     }
 }

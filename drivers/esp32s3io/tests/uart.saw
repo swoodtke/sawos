@@ -6,7 +6,7 @@ import esp32s3io.{
     ConfigError, INT_BRK_DET, INT_FRM_ERR, INT_PARITY_ERR, INT_RX, INT_RXFIFO_FULL,
     INT_RXFIFO_OVF, INT_RXFIFO_TOUT, INT_TXFIFO_EMPTY, RxSink, TxSource, UART0_BASE,
     UartPort, UartRegister, check_uart_thresholds, fill_tx, service_rx, start_uart,
-    uart_conf1, uart_conf1_tx_empty, uart_conf1_word, uart_fifo, uart_int_clr,
+    uart_conf0, uart_conf0_word, uart_conf1, uart_conf1_tx_empty, uart_conf1_word, uart_fifo, uart_int_clr,
     uart_int_ena, uart_int_ena_word, uart_int_st, uart_mem_conf, uart_mem_conf_word,
     uart_rxfifo_cnt, uart_set_tx_interrupt, uart_set_tx_threshold, uart_status,
     uart_txfifo_cnt, UART0_SOURCE, check_rx_full, check_rx_timeout, check_tx_empty,
@@ -55,6 +55,7 @@ struct Fake {
     after_clear: UInt8?
     after_clear_bits: UInt32
     raw: UInt32
+    conf0: UInt32
     conf1: UInt32
     mem_conf: UInt32
     tx_held: UInt32
@@ -66,7 +67,7 @@ extension Fake: NoCopy {}
 extension Fake {
     static func fresh() -> Fake {
         Fake(log: Vector<String>(), rx: Vector<UInt8>(), rx_at: 0, more: None,
-             more_bits: 0, after_clear: None, after_clear_bits: 0, raw: 0, conf1: 0, mem_conf: 0, tx_held: 0, popped: false)
+             more_bits: 0, after_clear: None, after_clear_bits: 0, raw: 0, conf0: 0, conf1: 0, mem_conf: 0, tx_held: 0, popped: false)
     }
 
     func lines(&self) -> String {
@@ -78,6 +79,7 @@ extension Fake: UartPort {
     func read_word(&var self, reg: UartRegister) -> UInt32 {
         try! self.log.push("read {hex(reg.address())}")
         if reg == uart_int_st() { return self.raw }
+        if reg == uart_conf0() { return self.conf0 }
         if reg == uart_conf1() { return self.conf1 }
         if reg == uart_mem_conf() { return self.mem_conf }
         if reg == uart_status() {
@@ -107,6 +109,7 @@ extension Fake: UartPort {
 
     func write_word(&var self, reg: UartRegister, word: UInt32) {
         try! self.log.push("write {hex(reg.address())} <- {hex(word)}")
+        if reg == uart_conf0() { self.conf0 = word }
         if reg == uart_conf1() { self.conf1 = word }
         if reg == uart_mem_conf() { self.mem_conf = word }
         if reg == uart_int_clr() {
@@ -191,6 +194,7 @@ func main() {
     check(uart_status().address() == 0x6000_001C, "STATUS")
     check(uart_conf1().address() == 0x6000_0024, "CONF1")
     check(uart_mem_conf().address() == 0x6000_0060, "MEM_CONF")
+    check(uart_conf0().address() == 0x6000_0020, "CONF0")
 
     // The interrupt bits, and the set a driver takes for the receiver.
     check(INT_RXFIFO_FULL == 0x001 && INT_TXFIFO_EMPTY == 0x002, "FULL and EMPTY")
@@ -207,28 +211,34 @@ func main() {
     check(uart_rxfifo_cnt(0xFFFF_FFFF) == 0x3FF && uart_txfifo_cnt(0xFFFF_FFFF) == 0x3FF,
           "each count is ten bits")
 
-    // CONF1 and MEM_CONF: the fields set, every other bit kept.
-    check(uart_conf1_word(0x4020_FFFF, 64, 32) == 0x40A0_8040,
-          "CONF1: the thresholds, the timeout enable, other bits kept")
+    // CONF0, CONF1 and MEM_CONF: the fields set, every other bit kept.
+    // 0x0400_001C is what the emulator's `CONF0` reads after the ROM's boot
+    // (hal/xtensa-esp32s3/ABI.md §4): `ERR_WR_MASK` set.
+    check(uart_conf0_word(0x0400_001C) == 0x0000_001C,
+          "CONF0: ERR_WR_MASK cleared, the frame's format kept")
+    check(uart_conf0_word(0xFFFF_FFFF) == 0xFBFF_FFFF, "CONF0 from all ones")
+    check(uart_conf1_word(0x4020_FFFF, 64, 32) == 0x4080_8040,
+          "CONF1: the thresholds, the timeout enable, bits 20 to 22 clear, other bits kept")
     check(uart_conf1_word(0, 127, 128) == 0x0082_007F, "CONF1 at the thresholds' ends")
     check(uart_conf1_tx_empty(0x40A0_8040, 5) == 0x40A0_1440, "CONF1: the transmit threshold alone")
-    check(uart_mem_conf_word(0x1800_0001, 30) == 0x183C_0001,
-          "MEM_CONF: the timeout, other bits kept")
-    check(uart_mem_conf_word(0x07FE_0000, 1) == 0x0002_0000, "MEM_CONF replaces the old timeout")
+    check(uart_mem_conf_word(0x1800_0001, 30) == 0x183C_0013,
+          "MEM_CONF: the timeout and the sizes, other bits kept")
+    check(uart_mem_conf_word(0x07FE_0000, 1) == 0x0002_0012, "MEM_CONF replaces the old timeout")
+    check(uart_mem_conf_word(0x0000_0070, 30) == 0x003C_0012, "MEM_CONF replaces the old sizes")
     // From all-ones, every bit a field does not own survives: any mask that
     // reaches past its field clears one.
-    check(uart_conf1_word(0xFFFF_FFFF, 64, 32) == 0xFFF0_8040,
-          "CONF1 from all ones: only the two fields change")
+    check(uart_conf1_word(0xFFFF_FFFF, 64, 32) == 0xFF80_8040,
+          "CONF1 from all ones: only the two fields and bits 20 to 22 change")
     check(uart_conf1_tx_empty(0xFFFF_FFFF, 5) == 0xFFF0_17FF,
           "CONF1's transmit threshold from all ones")
-    check(uart_mem_conf_word(0xFFFF_FFFF, 30) == 0xF83D_FFFF,
-          "MEM_CONF from all ones: only the timeout changes")
+    check(uart_mem_conf_word(0xFFFF_FFFF, 30) == 0xF83D_FF93,
+          "MEM_CONF from all ones: only the timeout and the sizes change")
     // A value past its field never reaches a neighbour: DIS_RX_DAT_OVF
     // (CONF1 bit 20), the transmit field, MEM_FORCE_PD (MEM_CONF bit 27).
     check(uart_conf1_word(0, 0xFFFF_FFFF, 0) == 0x0080_03FF, "an oversized receive threshold")
     check(uart_conf1_word(0, 0, 0xFFFF_FFFF) == 0x008F_FC00, "an oversized transmit threshold")
     check(uart_conf1_tx_empty(0, 0xFFFF_FFFF) == 0x000F_FC00, "an oversized transmit-only threshold")
-    check(uart_mem_conf_word(0, 0xFFFF_FFFF) == 0x07FE_0000, "an oversized timeout")
+    check(uart_mem_conf_word(0, 0xFFFF_FFFF) == 0x07FE_0012, "an oversized timeout")
 
     // The thresholds the driver accepts.
     check(accepted(check_uart_thresholds(64, 32, 30)), "the default thresholds")
@@ -256,26 +266,31 @@ func main() {
     check(ConfigError.RxTimeout(0).describe().equals("the receive timeout 0 is not 1..1023 bit times"),
           "the timeout's refusal prints")
 
-    // The bring-up: the receive bits cleared first, then MEM_CONF, then CONF1
-    // (each read-modify-write), then INT_ENA whole.
+    // The bring-up: the receive bits cleared first, then CONF0, MEM_CONF and
+    // CONF1 (each read-modify-write), then INT_ENA whole.
     var up = Fake.fresh()
+    up.conf0 = 0x0400_001C
     up.conf1 = 0x4020_FFFF
     up.mem_conf = 0x1800_0001
     check(accepted(start_uart(&var up, 64, 32, 30)), "start_uart accepts the defaults")
     expect("start_uart", up.lines(), [
         "write 0x60000010 <- 0x0000019d",   // INT_CLR, the receive bits
+        "read 0x60000020",
+        "write 0x60000020 <- 0x0000001c",   // CONF0
         "read 0x60000060",
-        "write 0x60000060 <- 0x183c0001",   // MEM_CONF
+        "write 0x60000060 <- 0x183c0013",   // MEM_CONF
         "read 0x60000024",
-        "write 0x60000024 <- 0x40a08040",   // CONF1
+        "write 0x60000024 <- 0x40808040",   // CONF1
         "write 0x6000000c <- 0x0000019d",   // INT_ENA, the receive bits
     ])
     // From all-ones registers, only the fields change.
     var ones = Fake.fresh()
+    ones.conf0 = 0xFFFF_FFFF
     ones.conf1 = 0xFFFF_FFFF
     ones.mem_conf = 0xFFFF_FFFF
     check(accepted(start_uart(&var ones, 64, 32, 30)), "start_uart from all ones")
-    check(ones.conf1 == 0xFFF0_8040 && ones.mem_conf == 0xF83D_FFFF,
+    check(ones.conf0 == 0xFBFF_FFFF && ones.conf1 == 0xFF80_8040 &&
+          ones.mem_conf == 0xF83D_FF93,
           "start_uart keeps every bit it does not own")
     // A refusal writes nothing and reads nothing.
     var no = Fake.fresh()

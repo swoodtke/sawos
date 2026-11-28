@@ -30,10 +30,10 @@ console key) and the `esptool` command that writes it; it runs nothing,
 so connecting and writing the part is yours.
 
 `images/hello-riscv32.toml` launches sawos's UART driver and `hello`, its
-client; `images/hello-esp32s3.toml`, on a board with no UART driver,
-launches sawos's console driver, which writes to the kernel's console, and
-`greeter`. Each image names its driver's serve as its console, so both
-processes `print` through it.
+client; `images/hello-esp32s3.toml` launches sawos's ESP32-S3 UART driver,
+which serves UART0 on its interrupt, and `greeter`, which only prints. Each
+image names its driver's serve as its console, so both processes `print`
+through it.
 
 An image chooses its board's build keys in `[keys]`: on the ESP32-S3,
 

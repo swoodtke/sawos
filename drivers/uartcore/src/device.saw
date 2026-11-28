@@ -10,10 +10,21 @@
 //! `events` answers the interrupt causes as the core's own bits, not the
 //! device's: an implementation maps its status register onto them, and
 //! `clear_events` maps them back. A cause is reported only while the device
-//! has it enabled, so a masked cause is never seen. The transmit cause is a
-//! level the hardware derives from the FIFO's fill, so clearing it never
-//! stops it recurring while the condition holds; the core therefore fills the
-//! FIFO before it clears the cause.
+//! has it enabled, so a masked cause is never seen.
+//!
+//! # The transmit cause's clear
+//!
+//! The core clears the transmit cause before it fills the FIFO, never after.
+//! On a device that latches the cause when the FIFO falls below the level, a
+//! clear after the fill would wipe the wakeup of a FIFO that fell below it
+//! again while the fill ran (an emulator's, which sends each byte as it is
+//! stored, does so at every store), and nothing would raise it again. On a
+//! device whose cause sets itself again for as long as the FIFO is below the
+//! level (the ESP32-S3's UART0), the clear before the fill takes at once,
+//! the fill then lifts the FIFO above the level, and the raised cause costs
+//! one more interrupt, which finds the FIFO above it and loses nothing. So
+//! the one order is right on both kinds, at the price of that interrupt on
+//! the second.
 //!
 //! A cause that is a latch (the device sets it when its condition becomes
 //! true and `clear_events` drops it) is why the core orders its clears
@@ -24,9 +35,11 @@
 //!
 //! # Order
 //!
-//! Every access the core makes comes before the driver acknowledges the
-//! interrupt line (`Core.service` makes them all), because a register read
-//! after the acknowledgement races the line's next assertion.
+//! Every access of the interrupt's service comes before the driver
+//! acknowledges the line (`Core.service` makes them all), because a register
+//! read after the acknowledgement races the line's next assertion. A
+//! request's own accesses (a `Write`'s fill, a `Sync`'s count read) are made
+//! when the request is taken, outside any interrupt.
 
 /// The receive FIFO reached its level, or its idle timeout expired with bytes
 /// in it.

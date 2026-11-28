@@ -209,6 +209,12 @@ STOCK_GOLDFISH_PKG = os.path.join(TESTS_DIR, "stock-goldfish")
 STOCK_TIMG_PKG = os.path.join(TESTS_DIR, "stock-timg")
 # The ESP32-S3's GPIO driver, a child of a stock root (`drivers/`).
 GPIO_DRIVER_PKG = os.path.join(REPO_ROOT, "drivers", "svc-gpio-esp32s3")
+# The ESP32-S3's UART driver (`drivers/`), and a root that launches it and
+# panics while it holds the console claim.
+UART_S3_DRIVER_PKG = os.path.join(DRIVERS_DIR, "svc-uart-esp32s3")
+UART_PANIC_ROOT_PKG = os.path.join(TESTS_DIR, "uart-panic-root")
+# A root that holds the console claim when it starts the S3 UART driver.
+UART_CLAIM_ROOT_PKG = os.path.join(TESTS_DIR, "uart-claim-root")
 # The console driver, a child of a stock root (`drivers/`), and a root that
 # starts it without `Debug`.
 CONSOLE_DRIVER_PKG = os.path.join(DRIVERS_DIR, "svc-console")
@@ -3039,6 +3045,359 @@ _CONSOLE_WATCHDOG_CASES = _console_watchdog_cases(
         "expect_clean_exit": True,
     },
 ]
+
+
+def _uart_lines(count):
+    """What `tests/uart-lines` prints for `count` lines: each line's text,
+    newline included, with the running sum of every byte before it."""
+    fill = ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "01234567")
+    lines, total = [], 0
+    for i in range(1, count + 1):
+        line = f"SOS lines: line {i} of {count} {fill} sum={total}\n"
+        lines.append(line)
+        total = (total + sum(line.encode())) % 65536
+    return lines
+
+
+def _uart_s3_cases(board):
+    """The ESP32-S3 UART driver's cases (`drivers/svc-uart-esp32s3`), each on
+    a described image for the board named `board`.
+
+    In each, the driver claims the console before it serves, so the kernel
+    holds back its lines about the clients' ends and root prints them through
+    the driver; once every client is gone and root has dropped its inlet, the
+    driver drains its ring and the FIFO, releases the console, and the
+    kernel's held-back count line comes first after root's last line through
+    the driver. That count is two lines for each client's end (its exit or
+    fault line and its teardown line), and the debug-print bytes refused are
+    root's first, which moved root's lines to the driver."""
+    def image(name):
+        return {board: f"{name}.toml"}
+
+    client_ended = "root: client ended status=65536\n"
+
+    def released(held, refused):
+        return (f"SOS: console returned, lines held={{{held}}}, debug bytes "
+                f"refused={{{refused}}}\n")
+
+    def driver_end(queued, held):
+        """The driver's report for `queued` bytes, every one sent, and its
+        exit; whether a write was held is the fixed line's choice, and the
+        count of messages and of holds is printed for a reader."""
+        done = ("every write that did not fit was held, every byte sent"
+                if held else "every byte queued was sent")
+        return [f"SOS uarts3 drv: queued={queued} sent={queued}\n",
+                f"SOS uarts3 drv: {done}\n"
+                "SOS: process exit: code={zero} process={one}",
+                "root: console ended status=65536"]
+
+    def lines_case(name, count, held):
+        lines = _uart_lines(count)
+        queued = len("".join(lines)) + len(client_ended)
+        return {
+            "name": name,
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image(name),
+            # From the handover to the release, nothing but the client's
+            # lines and root's: the kernel wrote nothing under the claim.
+            "expect_out": ["{banner}",
+                           "SOS: console handover\n" + "".join(lines)
+                           + client_ended + released("two", "one"),
+                           *driver_end(queued, held)],
+            "expect_clean_exit": True,
+        }
+
+    return [
+        # Sixteen lines of about a hundred bytes, each with the running sum
+        # of every byte before it (`tests/uart-lines`), through the driver at
+        # its shipping configuration; then root's line for the client's end,
+        # which follows the client's last line because the client's exit
+        # `Sync` is answered only once every byte before it has left the
+        # FIFO. Every byte the driver queued it sent.
+        lines_case("uart_s3_lines", 16, False),
+        # The same lines with a 16-byte transmit ring and an 8-byte fill cap
+        # (`tests/images/uart/hold.saw`): every line's `Write` is longer than
+        # the ring, so it is held by construction, and the driver takes no
+        # message until its rest is queued. The fixed line says a write was
+        # held and every byte was sent.
+        lines_case("uart_s3_hold", 16, True),
+        # The hold configuration with the serving thread lowered to `Low`,
+        # the client's level (`tests/images/uart/backpressure.saw`), and 64
+        # lines told in one burst: at one level a post does not preempt, so
+        # the client fills the connection's ring and its tells become calls
+        # that park until the driver answers. Every line arrives, in order.
+        lines_case("uart_s3_backpressure", 64, True),
+        {
+            # Receive (`tests/uart-reader`): the runner types `ECHO_INPUT`
+            # one byte at a time once the client has said it is ready, so
+            # each byte is below the receive threshold and reaches the driver
+            # only through the RX timeout. The client reads four bytes and
+            # writes them back.
+            "name": "uart_s3_read",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_read"),
+            "stdin": ECHO_INPUT,
+            "stdin_after": "SOS reader: ready",
+            "expect_out": ["{banner}",
+                           "SOS reader: ready\n"
+                           f"SOS reader: read {ECHO_INPUT}\n"
+                           + client_ended + released("two", "one"),
+                           "SOS uarts3 drv: received=4 lost=0 frame=0 "
+                           "parity=0 breaks=0\n",
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # `uart_s3_read` typed at once as the emulator starts, before
+            # the guest has run far (how far is the host's speed): every byte
+            # arrives, whether it waited in UART0's receive FIFO or came
+            # once the driver was up.
+            "name": "uart_s3_read_early",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_read_early"),
+            "stdin": ECHO_INPUT,
+            "stdin_at_once": True,
+            "expect_out": ["{banner}",
+                           f"SOS reader: read {ECHO_INPUT}\n"
+                           + client_ended + released("two", "one"),
+                           "SOS uarts3 drv: received=4 lost=0 frame=0 "
+                           "parity=0 breaks=0\n",
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # More bytes than the receive threshold, 64, typed at once once the
+            # client is ready (`tests/uart-reader` with `config/full.saw`):
+            # the FIFO rises past the threshold before the driver runs, so the
+            # full cause raises the line. Every byte arrives, in order. The
+            # timeout would deliver them too once the receiver idles, so no
+            # mutant of the full cause alone is red here; with the timeout
+            # off the full cause alone delivers them.
+            "name": "uart_s3_full",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_full"),
+            "stdin": _UART_FULL_TYPED,
+            "stdin_at_once": True,
+            "stdin_after": "SOS reader: ready",
+            "expect_out": ["{banner}",
+                           "SOS reader: ready\n"
+                           f"SOS reader: read {_UART_FULL_TYPED}\n"
+                           + client_ended + released("two", "one"),
+                           "SOS uarts3 drv: received=100 lost=0 frame=0 "
+                           "parity=0 breaks=0\n",
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Overflow reported in band (`tests/images/uart/lost.saw`, an
+            # 8-byte receive ring): 32 bytes are typed once the client is
+            # ready, and the client takes no `Read` until `Stats` says the
+            # driver has received all 32, so the ring kept the first 8 and
+            # the rest were dropped behind the one mark. Every number is
+            # exact by construction. The driver's message count follows how
+            # often the client asked `Stats`, which is the host's speed, and
+            # is printed only.
+            "name": "uart_s3_lost",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_lost"),
+            "stdin": _UART_LOST_TYPED,
+            "stdin_after": "SOS reader: ready",
+            "expect_out": ["{banner}",
+                           "SOS reader: ready\n"
+                           f"SOS reader: read {_UART_LOST_TYPED[:8]}\n"
+                           "SOS reader: lost at_least=24 frame=0 parity=0 "
+                           "breaks=0\n"
+                           "SOS reader: stats received=32 lost=24 frame=0 "
+                           "parity=0 breaks=0\n"
+                           + client_ended + released("two", "one"),
+                           "SOS uarts3 drv: received=32 lost=24 frame=0 "
+                           "parity=0 breaks=0\n",
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The `Sync`s' limit (`tests/images/uart/syncs.saw`, a 16-byte
+            # ring, a 4-byte fill cap and the serving thread at the client's
+            # level, and `tests/uart-reader` with `config/syncs.saw`): the
+            # client posts a line longer than the transmit ring and five
+            # `Sync`s behind it before the driver runs, since at one level a
+            # post does not preempt. The line is held. Once the line is
+            # wholly queued its last bytes are still in the ring, so the
+            # driver takes four, which wait for them, and with four held it
+            # takes nothing more until one is answered; the fifth is taken
+            # then. Every one is answered `Ok`, none `Busy`.
+            "name": "uart_s3_syncs",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_syncs"),
+            "expect_out": ["{banner}",
+                           "SOS reader: ready\n"
+                           "SOS reader: a line the Syncs wait behind "
+                           + _UART_SYNCS_FILL + "\n"
+                           "SOS reader: 5 Syncs behind a held Write, each "
+                           "answered Ok\n"
+                           + client_ended + released("two", "one"),
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Held reads (`tests/uart-reader` with `config/held.saw`): with
+            # nothing typed, the driver holds four `Read`s, the most it
+            # holds, and answers a fifth `Busy`; the client drops the four
+            # claims and does it again, and the second four are held too, so
+            # each dropped claim freed its slot. The driver's report counts
+            # the eight (`abandoned=8`).
+            "name": "uart_s3_held",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_held"),
+            "expect_out": ["{banner}",
+                           "SOS reader: ready\n"
+                           "SOS reader: four reads held, a fifth answered "
+                           "Busy, the four dropped; twice\n"
+                           + client_ended + released("two", "one"),
+                           " abandoned=8 writes held=0 interrupts=",
+                           "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Deaths under the claim (`tests/uart-ends`): `ends` makes a
+            # debug print, which is refused, and prints the answer through
+            # the console before it exits; `panics` panics on a text longer
+            # than the kernel keeps, which the runtime cuts to 256 bytes
+            # ending `...`; `faults` faults on a syscall. Root prints each
+            # end from its death record through the driver, a teardown line
+            # after the panic and the fault and none after the exit. The
+            # order between the three is the scheduler's, so each one's
+            # lines are a group, and every group ends with the kernel's
+            # count line: two lines held for each end, and two bytes
+            # refused, root's first and `ends`' one.
+            "name": "uart_s3_claimed_ends",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_claimed_ends"),
+            "expect_out": ["{banner}",
+                           released("six", "two"),
+                           *driver_end(601, False)],
+            "expect_groups": [
+                ["SOS ends: debug print: the console is claimed\n",
+                 "root: ends ended status=65536\n",
+                 released("six", "two")],
+                [f"root: panics ended status=131086 text={_UART_ENDS_TEXT}\n"
+                 "root: panics teardown " + _ROOT_TEARDOWN_FOUR,
+                 released("six", "two")],
+                ["root: faults ended status=131073\n"
+                 "root: faults fault: bad handle\n"
+                 "root: faults teardown " + _ROOT_TEARDOWN_FOUR,
+                 released("six", "two")]],
+            # The kernel wrote nothing from the handover to the release, and
+            # root printed no teardown line for the exit.
+            "expect_regex": [_NO_KERNEL_LINE_UNDER_CLAIM,
+                             r"(?s)\A(?!.*root: ends teardown)"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A driver that takes one message and then stops taking, alive
+            # (`tests/images/uart/stall.saw`). `faults` faults; root's first
+            # line about it is the one message the driver serves, and the
+            # next two wait behind the stopped driver. Root's watchdog kills
+            # it (no duration is asserted, only the kill), its teardown ends
+            # the claim and the kernel prints its count and the driver's
+            # teardown, and root writes `console stalled, killed` and the
+            # lines it held through the debug print.
+            "name": "uart_s3_stall",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": image("uart_s3_stall"),
+            "expect_out": ["{banner}",
+                           "SOS: console handover\n"
+                           "root: faults ended status=131073\n"
+                           + released("two", "one")
+                           + "SOS: process teardown ",
+                           _CONSOLE_STALLED_LINE + "\n"
+                           "root: faults fault: bad handle\n"
+                           "root: faults teardown " + _ROOT_TEARDOWN_FOUR
+                           + f"root: console ended status={_CONSOLE_STALLED_STATUS}"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Root panics while the driver holds the claim
+            # (`tests/uart-panic-root`, a hand-written root that launches the
+            # driver and writes a line through it, the line's `Sync`
+            # answered before the panic). A root's panic is a kernel panic:
+            # the kernel takes the console back, and its panic line, root's
+            # text in it, follows the driver's bytes with nothing between.
+            "name": "root_panic_claimed",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": UART_PANIC_ROOT_PKG,
+            "children": [UART_S3_DRIVER_PKG],
+            "devices": ["UART0"],
+            "inputs": {"uartconfig": "drivers/svc-uart-esp32s3/config/default.saw"},
+            "expect_out": ["{banner}",
+                           "SOS panicroot: the driver started\n"
+                           "SOS panicroot: a line through the driver\n"
+                           "SOS: process fault: the program panicked "
+                           "process={zero} text=panic at main.saw:",
+                           ": SOS panicroot: a panic under the claim\n",
+                           "SOS-S3: halt fail code=0x00000040"],
+            "expect_clean_exit": False,
+            "expect_status": EXIT_PANIC,
+        },
+        {
+            # A claim refused (`tests/uart-claim-root`, a hand-written root
+            # that claims the console itself, then starts the driver with
+            # the right to claim it too): the driver's claim answers
+            # `Claimed` and it exits 2 without serving, its line about it
+            # refused at the debug print. Root releases, and the kernel's
+            # count line comes first: the driver's exit and teardown lines,
+            # and the bytes of its line.
+            "name": "uart_s3_claim_refused",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": UART_CLAIM_ROOT_PKG,
+            "children": [UART_S3_DRIVER_PKG],
+            "devices": ["UART0"],
+            "inputs": {"uartconfig": "drivers/svc-uart-esp32s3/config/default.saw"},
+            "expect_out": ["{banner}",
+                           "SOS claimroot: claiming the console, then "
+                           "starting the driver\n"
+                           + "SOS: console returned, lines held={two}, debug "
+                           f"bytes refused=0x{len(_UART_NOT_CLAIMED):08x}\n"
+                           + "SOS claimroot: the driver ended status=65538"],
+            "expect_clean_exit": True,
+        },
+    ]
+
+
+# The bytes `uart_s3_full` types: digits and letters, in turn.
+_UART_FULL_TYPED = "".join(
+    ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")[i % 62]
+    for i in range(100))
+
+# The line `tests/uart-reader` writes in its `syncs` mode, after its fixed
+# start.
+_UART_SYNCS_FILL = "".join(chr(0x61 + i % 26) for i in range(58))
+
+# The driver's line about a refused claim, every byte of which the debug
+# print refuses (the board's words are eight hex digits wide).
+_UART_NOT_CLAIMED = "SOS uarts3 drv: the console is claimed by another process\n"
+
+# The bytes `uart_s3_lost` types: the alphabet's capitals, in turn.
+_UART_LOST_TYPED = "".join(chr(0x41 + i % 26) for i in range(32))
+
+# `tests/uart-ends`' panic text as root prints it from the death record: the
+# panic line the runtime formats, cut to the kernel's 256 bytes with its last
+# three `...`.
+_UART_ENDS_TEXT = ("panic at main.saw:39: SOS ends: a panic "
+                   + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" * 5
+                   )[:253] + "..."
+
+# Root's teardown line's counts for a stock-root child that holds its System,
+# its Process, its main thread's Thread and its console inlet.
+_ROOT_TEARDOWN_FOUR = ("handles=4 threads=1 events=0 waiters=0 interrupts=0 "
+                       "timers=0\n")
+
+# No kernel line between the console's handover and its return: what the
+# kernel writes under a claim is held back and counted.
+_NO_KERNEL_LINE_UNDER_CLAIM = (r"(?s)SOS: console handover\n(?:(?!SOS: ).)*"
+                               r"SOS: console returned")
+
 
 # What a stock root's plan gives a child it only starts: its System record.
 _STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
@@ -20605,6 +20964,22 @@ def _check(case, arch, status, out, timed_out):
                 return False, (f"{where} expected output {want!r} "
                                f"(got {out!r})")
             cursor = at + (1 if step_one else len(want))
+    # A case may match lines as groups (`expect_groups`): each group is
+    # matched in order on its own, from the transcript's start, so the order
+    # between groups is free. Where the order between processes is the
+    # scheduler's, each process's lines are a group; a line every group ends
+    # with holds them all before it.
+    for group in case.get("expect_groups", ()):
+        fmt = expectations(arch)
+        cursor = 0
+        for want in group:
+            want = want.format(**fmt)
+            at = hay.find(want, cursor)
+            if at < 0:
+                where = "out of order" if want in hay else "missing"
+                return False, (f"{where} expected output {want!r} in its "
+                               f"group (got {out!r})")
+            cursor = at + len(want)
     # A `stack_peak` case must have printed its report line: a kernel that
     # never reports would otherwise pass for one that measured. The prefix is
     # matched and the number never is.
@@ -22023,7 +22398,8 @@ def _esp32s3_qemu_command(qemu, flash, extra=()):
             "-drive", f"file={flash},if=mtd,format=raw", *extra]
 
 
-def _boot_esp32s3(qemu, flash, timeout_s, extra=()):
+def _boot_esp32s3(qemu, flash, timeout_s, extra=(), feed=None, at_once=False,
+                  feed_after=None):
     """Boot the flash image `flash` under the Espressif QEMU `qemu`, with
     `extra` after the board's own arguments; collect the console until the
     emulator exits, for at most `timeout_s` seconds.
@@ -22031,13 +22407,47 @@ def _boot_esp32s3(qemu, flash, timeout_s, extra=()):
     Returns the transcript and the exit status, or None for a run killed
     at the deadline. Stderr is discarded: QEMU writes `Adding SPI flash
     device` there on every run, which is noise a diff should never see.
+
+    Serial input: with `feed`, its bytes are typed at UART0 as `_run_qemu`
+    types them at the gate's boards, one at a time behind
+    `SERIAL_TYPE_DELAY_S`, or all at once with `at_once`, from a pipe this
+    process holds. With `feed_after`, typing starts only once the console
+    has printed that text, for a case whose bytes must not reach the FIFO
+    before the program that reads them is up. With no `feed` the emulator's
+    stdin is closed, as it always was.
     """
     import select
 
+    stdin = subprocess.DEVNULL
+    write_fd = None
+    if feed is not None:
+        stdin, write_fd = os.pipe()
     proc = subprocess.Popen(
         _esp32s3_qemu_command(qemu, flash, extra),
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stdin=stdin, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL)
+    seen = threading.Event()
+    if feed is not None:
+        os.close(stdin)
+        if feed_after is None:
+            seen.set()
+
+        def typist():
+            # Owns the write end for its whole life, including the closing,
+            # as `_run_qemu`'s does. It waits for `feed_after` no longer than
+            # the run's deadline.
+            try:
+                if seen.wait(timeout_s):
+                    for ch in feed:
+                        if not at_once:
+                            time.sleep(SERIAL_TYPE_DELAY_S)
+                        os.write(write_fd, ch.encode())
+            except OSError:
+                pass                # the guest stopped first; nothing to say
+            finally:
+                os.close(write_fd)
+
+        threading.Thread(target=typist, daemon=True).start()
     out = b""
     deadline = time.time() + timeout_s
     status = None
@@ -22048,6 +22458,9 @@ def _boot_esp32s3(qemu, flash, timeout_s, extra=()):
                 chunk = os.read(proc.stdout.fileno(), 4096)
                 if chunk:
                     out += chunk
+                    if (feed_after is not None and not seen.is_set()
+                            and feed_after.encode() in out):
+                        seen.set()
                     continue
                 # End of output: the emulator is exiting, so wait for its
                 # status, but never past the deadline.
@@ -22652,8 +23065,15 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                            f"followed the {at} expected before it")
         return True, ""
 
-    def boot(flash, extra=()):
-        return _boot_esp32s3(qemu, flash, timeout_s, extra)
+    def boot(flash, extra=(), case=None):
+        # A case's `stdin` is typed at UART0 (`_boot_esp32s3`), as the
+        # gate's boards are typed at; `stdin_after` holds the typing back
+        # until the console has printed that text.
+        case = case or {}
+        return _boot_esp32s3(qemu, flash, timeout_s, extra,
+                             feed=case.get("stdin"),
+                             at_once=case.get("stdin_at_once", False),
+                             feed_after=case.get("stdin_after"))
 
     rom = "ESP-ROM:esp32s3-20210327"
     banner = "SOS M1: kernel up on xtensa (ESP32-S3)"
@@ -26489,6 +26909,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         # The gate's console cases on this board (`*_s3.toml`).
         *_console_print_cases(lambda name: {arch["name"]: f"{name}_s3.toml"}),
         *_console_watchdog_cases(lambda name: {arch["name"]: f"{name}_s3.toml"}),
+        # The UART driver's cases (`drivers/svc-uart-esp32s3`).
+        *_uart_s3_cases(arch["name"]),
         {
             # The GPIO driver stops on a configuration that names a pin the
             # chip holds, before it maps anything: its Mapping row is 0, so a
@@ -27754,7 +28176,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                 if status is None:
                     status = 0
             else:
-                out, status = boot(flash, extra)
+                out, status = boot(flash, extra, case)
         except ToolError as e:
             if case.get("expect_build_error") and \
                     case["expect_build_error"] in str(e):

@@ -604,19 +604,24 @@ the driver delivers.
 **Bring-up**, in order, after the three values pass the driver's checks (a
 receive threshold of 1 to 127, a transmit threshold of 1 to 128, a timeout of
 1 to 1023 bit times; a refusal writes nothing): `INT_CLR` of the receive set;
-`MEM_CONF` read, then written with the timeout and every other bit as read;
-`CONF1` the same with the two thresholds and RX_TOUT_EN; then `INT_ENA` of
-the receive set. The clear comes first so a timeout that bytes left in the
-FIFO raise while the registers are configured is not erased. Each register
-keeps every bit the driver does not own, except `INT_ENA`, which the driver
-owns whole and writes as a word; each field written is masked to its width, so
-a value past it cannot reach `DIS_RX_DAT_OVF` (CONF1 bit 20), `MEM_FORCE_PD`
-(MEM_CONF bit 27) or the field beside it.
+`CONF0` read, then written with `ERR_WR_MASK` (bit 26) clear and every other
+bit as read; `MEM_CONF` the same with the timeout and `RX_SIZE` and `TX_SIZE`
+(bits 3:1 and 6:4) at one 128-byte block each; `CONF1` the same with the two
+thresholds, RX_TOUT_EN, and `DIS_RX_DAT_OVF`, `RX_TOUT_FLOW_DIS` and
+`RX_FLOW_EN` (bits 20 to 22) clear; then `INT_ENA` of the receive set. The
+clear comes first so a timeout that bytes left in the FIFO raise while the
+registers are configured is not erased. Each register keeps every bit the
+driver does not rely on, except `INT_ENA`, which the driver owns whole and
+writes as a word; each field written is masked to its width, so a value past
+it cannot reach `MEM_FORCE_PD` (MEM_CONF bit 27) or the field beside it.
 
-**What the driver relies on at reset**: `MEM_CONF`'s `RX_SIZE` and `TX_SIZE`
-are 1, which gives each FIFO its 128 bytes, and the driver neither writes nor
-checks them. The emulator's `MEM_CONF` reads 0 (below), and its FIFOs are 128
-bytes whatever it says.
+**What the driver relies on, it writes**, whatever the reset value: a damaged
+byte stored (`ERR_WR_MASK` 0, so its error is reported at a mark after it),
+the overflow detected and no flow control (`CONF1` bits 20 to 22 at 0), and
+128-byte FIFOs. The emulator's `CONF0` reads `0x0400_001C` after the ROM's
+boot (§4), `ERR_WR_MASK` set, and its `MEM_CONF` reads 0 (below), though its
+FIFOs are 128 bytes whatever it says. Left alone are the frame's format in
+`CONF0` and the divisor, which are the console key's.
 
 **The receive service**, before the line is acknowledged: `INT_ST` read; for
 any receive bit, in this order, `INT_CLR` of the events it showed (parity,
@@ -632,10 +637,12 @@ see is cleared. Every register access comes before the acknowledgement (spec
 **The transmit service** stores whole words to `FIFO` after one `STATUS`
 read, as many as 128 less `TXFIFO_CNT`, and never reads `FIFO`, whose read
 pops the receiver. TXFIFO_EMPTY rises when the FIFO holds fewer bytes than
-`TXFIFO_EMPTY_THRHD`, and its raw bit stays set until cleared, whatever a
-fill has stored since. A driver with bytes left re-arms after every fill by
-clearing the bit and enabling it, so the line rises at the next crossing and
-not at once.
+`TXFIFO_EMPTY_THRHD`, and its raw bit sets itself again for as long as that
+holds (`uart_reg.h`: R/WTC/SS), so a clear holds only once the FIFO is above
+the threshold. ESP-IDF clears after the fill. A driver over `uartcore` clears
+before each top-up and fills after, the order that loses no wakeup on a UART
+that latches the cause instead (`uartcore`'s `device.saw`); here that costs
+one more interrupt per top-up, which finds the FIFO above the threshold.
 
 **The emulator** (`esp32s3_soc.uart`, over `esp_soc.uart`, in Espressif's
 QEMU 9.2.2). A call0 program booted with `-kernel` and polling with no
@@ -675,6 +682,49 @@ pop 128            the bytes in order; then RXFIFO_CNT=1, the 129th
 What only a part can check: a transmit FIFO that holds bytes, so the empty
 threshold's timing; a receive FIFO that overflows at a high rate; the timeout
 with a person at the terminal; and the errors.
+
+**The driver** (`drivers/svc-uart-esp32s3`) is these orders as `uartcore`'s
+device: `INT_ST`'s bits map onto the core's causes (FULL and TOUT both onto
+its receive level, which it takes as "look"), `STATUS`'s two counts are the
+FIFOs' fills, and the transmit level is `TXFIFO_EMPTY_THRHD`, which it
+writes 1 to 128 whatever the core asks. It brings the UART up with
+`start_uart` at its build input's thresholds, attaches source 27 and its
+connection's outlet to one Waiter, claims the console (spec §9a), and serves
+from one thread at `Rt0`; every register access of an interrupt comes before
+the line's acknowledgement. It releases the console once every client is gone
+and the ring and the FIFO have drained.
+
+What the S3 smoke's `uart_s3_*` cases showed on the emulator:
+
+- Bytes typed at once as the emulator starts all arrive
+  (`uart_s3_read_early`): the typist writes them before the guest has run
+  far, though the case cannot say how far, so whether they wait in the FIFO
+  through the ROM's boot is not shown.
+- A byte typed alone, below the receive threshold, arrives through the
+  timeout (`uart_s3_read`); more bytes than the threshold typed at once raise
+  the full cause (`uart_s3_full`), which the receive service clears with the
+  timeout's.
+- The transmit count reads 0 after every fill, so a `Write` longer than the
+  ring is held by construction and only the fill cap paces the fills
+  (`uart_s3_hold`); every byte queued is sent.
+- An overflow of the driver's own ring is reported at one mark with its count
+  (`uart_s3_lost`). The FIFO itself never overflows here (above).
+- Four `Read`s are held and a fifth answered `Busy`, and a dropped claim frees
+  its slot (`uart_s3_held`); four `Sync`s held pause the driver's intake until
+  one is answered (`uart_s3_syncs`).
+- A driver whose claim is refused, because another process holds the console,
+  exits 2 without serving (`uart_s3_claim_refused`).
+- A stop under the claim (a root's panic, `root_panic_claimed`) writes its
+  lines after the driver's last bytes, with nothing lost between.
+
+What only a part can show: the FIFO draining at the wire's rate, so a
+nonzero `TXFIFO_CNT`, a ring that fills under one writer and the empty
+threshold's timing; `RXFIFO_OVF` at a high rate; the timeout with a person
+at the terminal; parity, frame and break errors reported as `Garbled`; a stop
+taking the console back while the FIFO still holds the driver's bytes; the
+extra interrupt per top-up that clearing TXFIFO_EMPTY before the fill costs
+(the report's `interrupts=`); the bits the bring-up writes, read back; and
+what the console costs the CPU against the kernel's synchronous console.
 
 ---
 

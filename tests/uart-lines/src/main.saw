@@ -1,0 +1,57 @@
+// A client of an image's console, written with `main`. It prints
+// `linesconfig.LINES` numbered lines through the console, each one write:
+//
+//   SOS lines: line N of LINES FILL sum=S
+//
+// where `FILL` is the same sixty letters on every line and `S` is the sum,
+// modulo 65536, of every byte of every line before it, its newline included.
+// Then it returns, and the start-up's `Sync` waits for the console's driver
+// to send every byte first. A byte lost, doubled or moved anywhere before a
+// line shows as that line's sum disagreeing with the text above it.
+
+import uartproto.{ascii_or_substitute}
+import linesconfig
+import sosmain
+
+/// The line's text outside its four arguments: the bytes of `main`'s format
+/// string but its placeholders.
+func fill() -> String { "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567" }
+func fixed_text() -> String { "SOS lines: line  of   sum=" }
+static NEWLINE: UInt32 = 10
+
+/// The sum of `s`'s bytes, each an ASCII scalar.
+func text_sum(s: String) -> UInt32 {
+    var t: UInt32 = 0
+    for scalar in s.scalars() {
+        t = t + (ascii_or_substitute(scalar) as UInt32)
+    }
+    t
+}
+
+/// The sum of the bytes of `n` written in decimal.
+func digits_sum(n: Int) -> UInt32 {
+    if n == 0 {
+        return 0x30
+    }
+    var t: UInt32 = 0
+    var v = n
+    while v > 0 {
+        t = t + 0x30 + ((v % 10) as UInt32)
+        v = v / 10
+    }
+    t
+}
+
+func main() {
+    let fixed = text_sum(fixed_text()) + text_sum(fill()) + NEWLINE
+    let lines = linesconfig.LINES
+    var sum: UInt32 = 0
+    var i = 1
+    while i <= lines {
+        print("SOS lines: line {} of {} {} sum={}", i, lines, fill(), sum)
+        let line = (fixed + digits_sum(i) + digits_sum(lines) +
+                    digits_sum(sum as Int))
+        sum = (sum + line) % 65536
+        i = i + 1
+    }
+}

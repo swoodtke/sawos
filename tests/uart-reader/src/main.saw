@@ -1,0 +1,209 @@
+// A `uartproto` client that reads what the runner types at the console's
+// UART, written with `main`. Everything it prints goes through its own inlet
+// of the console's connection, in the order it is written.
+//
+// It first writes `SOS reader: ready` and waits for the `Sync`, so the line
+// is on the wire before the runner types (`stdin_after`). Then, as its build
+// input `readconfig.MODE` says:
+//
+//   read  it reads `readconfig.TYPED` bytes and writes them back on one line;
+//   lost  it asks `Stats` until the driver has received every byte typed, so
+//         no `Read` is taken before the last byte has arrived; reads the
+//         `readconfig.RING` bytes the driver's ring kept and writes them
+//         back; then reads once more, which meets the driver's `Lost` mark,
+//         and prints its counts; then prints `Stats` again;
+//   syncs it writes a line longer than the driver's transmit ring, so the
+//         driver holds it, then posts `SYNCS` `Sync`s, one more than the
+//         driver holds at once, keeping each claim, and resolves them in
+//         turn: the driver takes the last only once a held one is answered,
+//         and every one is answered `Ok`;
+//   held  with nothing typed, it posts four `Read`s, keeping each claim, and
+//         sends a fifth as a call, which is answered `Busy`; it drops the
+//         four claims, and does it all again: the second four are held too,
+//         so the driver freed the first four's slots when their claims were
+//         dropped.
+
+import sos.{BootSet, PipeReply, SosStatus}
+import uartproto.{Frame, Uart, UartBody, UartError, UartOp, empty_reply}
+import uartpipe.{PipeTransport, uart, uart_error}
+import readconfig
+import sosmain
+
+/// The tag its declaration gives its `uart` record (`process.toml`).
+static TAG_UART: UInt = 2
+
+static MODE_READ: Int = 1
+static MODE_LOST: Int = 2
+static MODE_SYNCS: Int = 3
+static MODE_HELD: Int = 4
+
+/// The `Sync`s `syncs` posts: one more than the driver holds at once.
+static SYNCS: Int = 5
+
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
+
+/// Reads `RING` bytes and writes them back on one line.
+func read_back(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    var got: [UInt8; readconfig.RING] = [0; readconfig.RING]
+    var i = 0
+    while i < readconfig.RING {
+        got[i] = try u.read()
+        i = i + 1
+    }
+    try u.write("SOS reader: read ")
+    i = 0
+    while i < readconfig.RING {
+        try u.write_byte(got[i])
+        i = i + 1
+    }
+    try u.write("\n")
+    return
+}
+
+/// Posts a `Sync`, keeping its claim.
+func post_sync(u: &var Uart<PipeTransport>) -> Result<PipeReply, UartError> {
+    post(&var u, UartOp.Sync)
+}
+
+/// Posts a request of `op` alone, keeping its claim.
+func post(u: &var Uart<PipeTransport>, op: UartOp) -> Result<PipeReply, UartError> {
+    var body = UartBody.empty()
+    let n = body.bare(op)
+    let claim = try u.transport.inlet.post(body: &body.bytes, len: n) catch {
+        return uart_error(error)
+    }
+    return move claim
+}
+
+/// The answer to a `Sync` posted with `post_sync`.
+func resolved(claim: PipeReply) -> Result<Void, UartError> {
+    let answer = try (move claim).resolve() catch {
+        return uart_error(error)
+    }
+    let reply = Frame(len: answer.len, bytes: answer.bytes)
+    let _ = move answer
+    empty_reply(&reply)
+}
+
+/// `syncs`: a held `Write`, then `SYNCS` `Sync`s behind it.
+func syncs(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    try u.write("SOS reader: a line the Syncs wait behind abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdef\n")
+    let s0 = try post_sync(&var u)
+    let s1 = try post_sync(&var u)
+    let s2 = try post_sync(&var u)
+    let s3 = try post_sync(&var u)
+    let s4 = try post_sync(&var u)
+    try resolved(move s0)
+    try resolved(move s1)
+    try resolved(move s2)
+    try resolved(move s3)
+    try resolved(move s4)
+    print("SOS reader: {} Syncs behind a held Write, each answered Ok", SYNCS)
+    return
+}
+
+static_assert(SYNCS == 5, "`syncs` posts its Syncs written out at this count")
+
+/// Whether the claim of a `Read` posted with `post` has its answer.
+func answered(claim: &PipeReply) -> Result<Bool, UartError> {
+    try claim.ready() catch {
+        return uart_error(error)
+    }
+}
+
+/// `held`: four `Read`s held, a fifth answered `Busy`, the four dropped;
+/// twice.
+func held(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    var round = 0
+    while round < 2 {
+        let r0 = try post(&var u, UartOp.Read)
+        let r1 = try post(&var u, UartOp.Read)
+        let r2 = try post(&var u, UartOp.Read)
+        let r3 = try post(&var u, UartOp.Read)
+        try u.sync()
+        let a0 = try answered(&r0)
+        let a1 = try answered(&r1)
+        let a2 = try answered(&r2)
+        let a3 = try answered(&r3)
+        if a0 || a1 || a2 || a3 {
+            print("SOS reader: held: a read was answered with nothing typed")
+            return UartError.Malformed
+        }
+        match u.read() {
+            case Err(Busy) -> {},
+            case Err(e) -> {
+                print("SOS reader: held: a fifth read: {}", e)
+                return e
+            },
+            case Ok(b) -> {
+                print("SOS reader: held: a fifth read: a byte {}", b)
+                return UartError.Malformed
+            },
+        }
+        let _ = move r0
+        let _ = move r1
+        let _ = move r2
+        let _ = move r3
+        round = round + 1
+    }
+    print("SOS reader: four reads held, a fifth answered Busy, the four dropped; twice")
+    return
+}
+
+func run(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    try u.write("SOS reader: ready\n")
+    try u.sync()
+    if readconfig.MODE == MODE_HELD {
+        try held(&var u)
+        try u.sync()
+        return
+    }
+    if readconfig.MODE == MODE_SYNCS {
+        try syncs(&var u)
+        try u.sync()
+        return
+    }
+    if readconfig.MODE == MODE_READ {
+        try read_back(&var u)
+        try u.sync()
+        return
+    }
+    var stats = try u.stats()
+    while (stats.received as Int) < readconfig.TYPED {
+        stats = try u.stats()
+    }
+    try read_back(&var u)
+    match u.read() {
+        case Err(Lost(c)) -> {
+            print("SOS reader: lost at_least={} frame={} parity={} breaks={}",
+                  c.lost, c.frame, c.parity, c.breaks)
+        },
+        case Err(e) -> { print("SOS reader: after the ring: {}", e) },
+        case Ok(b) -> { print("SOS reader: after the ring: a byte {}", b) },
+    }
+    let after = try u.stats()
+    print("SOS reader: stats received={} lost={} frame={} parity={} breaks={}",
+          after.received, after.lost, after.frame_errors, after.parity_errors,
+          after.breaks)
+    try u.sync()
+    return
+}
+
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_UART) else {
+        print("SOS reader: no record {}", TAG_UART)
+        return EXIT_FAILED
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS reader: record {} is no inlet", TAG_UART)
+        return EXIT_FAILED
+    }
+    var u = uart(move inlet)
+    try run(&var u) catch {
+        print("SOS reader: stopped: {}", error)
+        return EXIT_FAILED
+    }
+    EXIT_OK
+}

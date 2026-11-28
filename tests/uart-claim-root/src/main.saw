@@ -1,0 +1,77 @@
+// A root that holds the console claim when the console's driver asks for it.
+//
+// Its boot set is the driver's image blob and destination, then UART0's
+// window (rows 0, 1 and 2). It claims the console (root's System holds every
+// right), then creates the driver (`drivers/svc-uart-esp32s3`) and gives it
+// what its declaration names, under its tags, its System holding `Console`
+// as well. The driver's own claim is refused with `Claimed`, and it exits
+// without serving. Root waits for that end, releases the console, and prints
+// the driver's status word.
+
+import sos.{SosStatus, SystemRight}
+import sosmain
+
+/// The boot set's rows.
+static ROW_IMAGE: UInt = 0
+static ROW_DESTINATION: UInt = 1
+static ROW_WINDOW: UInt = 2
+
+/// The driver's tags (its `process.toml`).
+static TAG_SYSTEM: UInt = 21
+static TAG_WINDOW: UInt = 22
+static TAG_OUTLET: UInt = 23
+static TAG_LINE: UInt = 24
+
+/// UART0's interrupt matrix source.
+static UART0_LINE: UInt = 27
+
+/// The driver's key on root's Waiter.
+static KEY_DRIVER: UInt = 1
+
+/// What the driver's System may do: print, name its own Process, and claim
+/// the console.
+static DRIVER_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf |
+                                SystemRight.Console | SystemRight.Transfer)
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    guard var image_rec = set.take(ROW_IMAGE) else { return SosStatus.BadImage }
+    guard var dest_rec = set.take(ROW_DESTINATION) else { return SosStatus.BadImage }
+    guard var window_rec = set.take(ROW_WINDOW) else { return SosStatus.BadImage }
+    guard let image = image_rec.take_memory() else { return SosStatus.BadImage }
+    guard let dest = dest_rec.take_memory() else { return SosStatus.BadImage }
+    guard let window = window_rec.take_iomemory() else { return SosStatus.BadImage }
+
+    let driver = try sosmain.context().system().process_create(image: &image, memory: &dest)
+    let (inlet, outlet) = try sosmain.context().process().pipe_create()
+    let drv_system = try sosmain.context().system().mint(rights: DRIVER_SYSTEM)
+    try driver.give(system: move drv_system, tag: TAG_SYSTEM) catch {
+        return error.0
+    }
+    try driver.give(iomemory: move window, tag: TAG_WINDOW) catch {
+        return error.0
+    }
+    try driver.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+        return error.0
+    }
+    let line = try sosmain.context().system().interrupt_bind(line: UART0_LINE)
+    try driver.give(interrupt: move line, tag: TAG_LINE) catch {
+        return error.0
+    }
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &driver, key: KEY_DRIVER)
+
+    print("SOS claimroot: claiming the console, then starting the driver")
+    try sosmain.context().system().console_claim()
+    try driver.start(boot_tag: TAG_SYSTEM)
+    let wake = try waiter.wait()
+    var status: UInt = 0
+    match wake.what {
+        case Process(s) -> { status = s },
+        case _ -> { return SosStatus.BadImage },
+    }
+    try sosmain.context().system().console_release()
+    print("SOS claimroot: the driver ended status={}", status)
+    let _ = move inlet
+    return
+}

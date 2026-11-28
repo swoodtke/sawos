@@ -1,0 +1,66 @@
+// Held requests' sequence numbers wrap: a driver that holds requests for long
+// enough gives out every number, and the held `Read`s and `Sync`s are still
+// answered oldest first across the wrap, with no overflow on the way.
+
+import uartcore.{seq_before}
+import uartcore.bench.{Bench}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The comparison itself, at the top of the number space.
+func before() {
+    check(seq_before(0, 1), "0 is before 1")
+    check(not seq_before(1, 0), "1 is not before 0")
+    check(not seq_before(5, 5), "a number is not before itself")
+    check(seq_before(UInt.max, 0), "the top is before 0, across the wrap")
+    check(seq_before(UInt.max - 1, 1), "two below the top is before 1")
+    check(not seq_before(0, UInt.max), "0 is after the top")
+}
+
+/// Three `Read`s held across the wrap are answered in the order they were
+/// asked in.
+func reads_across() {
+    var b = Bench<64, 16>.standard()
+    b.core.start_sequences(UInt.max - 1)
+    let r0 = b.post_read()
+    let r1 = b.post_read()
+    let r2 = b.post_read()
+    b.pump()
+    check(b.core.reads_held() == 3, "three are held")
+    b.uart.feed_run(30, 3)
+    b.interrupt()
+    check(b.answered(r0) && b.answered(r1) && b.answered(r2), "all answered")
+    check(b.order(r0) < b.order(r1) && b.order(r1) < b.order(r2),
+          "oldest first, the one numbered 0 last")
+    check(b.reply_byte(r0, 1) == 30 && b.reply_byte(r2, 1) == 32,
+          "the bytes in the order they arrived")
+}
+
+/// Three `Sync`s held across the wrap, all passed by the one byte run ahead
+/// of them leaving, are answered in the order they were taken.
+func syncs_across() {
+    var b = Bench<256, 16>.standard()
+    b.core.start_sequences(UInt.max - 1)
+    let _ = b.post_write(10)
+    let s0 = b.post_sync()
+    let s1 = b.post_sync()
+    let s2 = b.post_sync()
+    b.pump()
+    check(b.core.tx.syncs_held() == 3, "the three wait for the same bytes")
+    b.uart.drain_all()
+    b.interrupt()
+    check(b.answered(s0) && b.answered(s1) && b.answered(s2), "all answered")
+    check(b.order(s0) < b.order(s1) && b.order(s1) < b.order(s2),
+          "oldest first, the one numbered 0 last")
+}
+
+func main() {
+    before()
+    reads_across()
+    syncs_across()
+}

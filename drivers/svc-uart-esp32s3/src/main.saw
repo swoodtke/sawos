@@ -1,0 +1,699 @@
+// The ESP32-S3's UART0 as a service, interrupt-driven both ways.
+//
+// The driver serves `uartproto` from UART0's window and its interrupt line,
+// and while it serves it holds the console claim, so the kernel writes nothing
+// to UART0 but a stop's lines. Every decision a UART driver makes is
+// `uartcore`'s (`Core`): the receive ring and its one gap mark, the transmit
+// ring, the held `Write` and the held `Sync`s, and when the driver may take
+// another message. This file is the rest: UART0's registers as `uartcore`'s
+// device (`Uart0`, over `esp32s3io`'s words), the threads, the claim, the
+// Waiter, and the obligations a reply is made through.
+//
+// # The threads
+//
+// The main thread starts at `Normal`. It maps the window, makes the Waiter,
+// attaches the line and the outlet, brings the UART up (`start_uart`, from
+// `esp32s3io`: the thresholds and the receive timeout, every field it relies
+// on written, the divisor, the clock and the FIFOs left alone, so bytes the
+// kernel stored go out first and bytes typed before the driver started are
+// delivered),
+// claims the console, starts the serving thread at `uartconfig.serve_band()`
+// (`Rt0`, level 4 under the full band map, above every client a simple map can
+// make) and joins it. When the serving thread returns, every client is gone
+// and the ring and the FIFO are empty: the main thread releases the console
+// and prints its report through the debug print, which the kernel honours
+// again. A driver that dies instead has its claim ended by its teardown, and
+// the kernel prints its end itself.
+//
+// The serving thread owns everything else: the one Interrupt (UART0 has one
+// line for both directions, so a second thread would be a second servicer of
+// it), the messages and the holds.
+//
+// # The loop
+//
+// The outlet is attached by the borrowing attach (`Waiter.add`), as a level,
+// and messages are taken with `take`: intake must be able to pause, and the
+// consuming attach owns the outlet, whose removal would close the connection.
+// Each wake is one of:
+//
+//   Interrupt    `Core.service` makes every register access (the receive
+//                drain, the transmit top-up), then the line is acknowledged,
+//                then each answer that is ready is made: a held `Write` that
+//                is now wholly queued, each `Sync` whose bytes have left the
+//                FIFO, a held `Read` for each byte or mark.
+//   Abandoned    a client dropped its claim on a `Read` this driver holds: the
+//                obligation is discarded.
+//   Readable     something is staged, or every inlet is gone.
+//
+// After each, the driver takes messages until the ring is dry, or until the
+// core closes intake: a `Write` that did not fit is held, and while it is held
+// (or while `MAX_SYNCS` are) the driver takes nothing, so the connection's own
+// ring fills and its writers park, and every message is answered in the order
+// it was posted. With intake closed the outlet's attachment is removed, so a
+// staged message cannot wake the driver into a busy loop; it is attached again
+// when intake opens. Nothing spins: a fill stores only what the FIFO's count
+// says fits, and otherwise the thread is parked in `wait`.
+//
+// A reply that does not land is not an error. A `Write` told rather than
+// called has no claim behind it; a `Read` whose client is gone has its byte
+// put back at the front (`Core.undeliver`).
+//
+// When every inlet is gone the serving thread waits for the ring and the FIFO
+// to drain (`Core.begin_drain`) and returns. An RX timeout is "look", never a
+// byte: the core drains what the count says, which may be nothing.
+//
+// `uartconfig` sizes the rings and sets the thresholds and the held-request
+// limits (`config/default.saw` names every key). Two keys are for tests
+// only: `STALL_AFTER`, the number of messages the driver takes before it stops
+// taking and stays alive, and `serve_band`, the serving thread's band.
+//
+// It is written with `main`: `sosmain`'s start-up adopts its System, derives
+// its Process and drains its boot set, from which `run` takes the records by
+// tag. As the image's console it has no console record, so its own lines go
+// through the debug print, after the release.
+
+import sos.{BootSet, Interrupt, IoMemory, PipeOutlet, PipeRequest, Waiter,
+            WaitResult, AttachMode, OutletLevel, SosStatus, PIPE_BODY_BYTES}
+import uartproto.{BODY_BYTES, Frame, UartBody}
+import uartcore.{Config, Core, Served, TxConfig, UartDevice, EV_BREAK,
+                 EV_FRAME, EV_OVERRUN, EV_PARITY, EV_RX, EV_TX, KIND_READ,
+                 KIND_SYNC, KIND_WRITE}
+import uartcore.{MAX_HELD_READS, MAX_SYNCS}
+import esp32s3io.{UartPort, UartRegister, INT_BRK_DET, INT_FRM_ERR, INT_PARITY_ERR,
+                  INT_RXFIFO_FULL, INT_RXFIFO_OVF, INT_RXFIFO_TOUT, INT_TXFIFO_EMPTY,
+                  TX_EMPTY_MAX, UART_FIFO_BYTES, count_up, start_uart, uart_fifo,
+                  uart_int_clr, uart_int_ena,
+                  uart_int_st, uart_rxfifo_cnt, uart_set_tx_interrupt,
+                  uart_set_tx_threshold, uart_status, uart_txfifo_cnt}
+import uartconfig
+import sosmain
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+// The configuration is held to its ranges here, so a build input out of range
+// is a build that fails, not a driver that does.
+static_assert(uartconfig.TX_RING_BYTES >= 1, "the transmit ring holds a byte")
+static_assert(uartconfig.RX_RING_BYTES >= 1, "the receive ring holds a byte")
+static_assert(uartconfig.TX_EMPTY >= 1 && uartconfig.TX_EMPTY <= 128,
+              "the transmit threshold is 1 to the FIFO's 128")
+static_assert(uartconfig.RX_FULL >= 1 && uartconfig.RX_FULL <= 127,
+              "the receive threshold is 1 to 127")
+static_assert(uartconfig.RX_TIMEOUT_BITS >= 1 && uartconfig.RX_TIMEOUT_BITS <= 1023,
+              "the receive timeout is 1 to 1023 bit times")
+static_assert(uartconfig.TX_FILL_CAP >= 1 && uartconfig.TX_FILL_CAP <= 128,
+              "a fill stores 1 to the FIFO's 128 bytes")
+static_assert(uartconfig.MAX_HELD_READS >= 1 &&
+              uartconfig.MAX_HELD_READS <= MAX_HELD_READS,
+              "the held Reads are 1 to uartcore's MAX_HELD_READS")
+static_assert(uartconfig.MAX_SYNCS >= 1 && uartconfig.MAX_SYNCS <= MAX_SYNCS,
+              "the held Syncs are 1 to uartcore's MAX_SYNCS")
+static_assert(uartconfig.STALL_AFTER >= 0, "STALL_AFTER is a count, 0 for never")
+
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
+/// The console was claimed by another process when this one asked.
+static EXIT_NOT_CLAIMED: Int = 2
+
+/// A status this driver can never legitimately produce, so meeting it means an
+/// assertion in this file failed rather than a call did.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The tags its declaration gives its records (`process.toml`).
+static TAG_WINDOW: UInt = 22
+static TAG_OUTLET: UInt = 23
+static TAG_LINE: UInt = 24
+
+/// The Waiter's keys. The held band is a base plus the slot, so an abandoned
+/// delivery says which held `Read` it is about without a second table.
+static KEY_OUTLET: UInt = 11
+static KEY_IRQ: UInt = 12
+static KEY_HELD: UInt = 100
+
+/// The serving thread's stack, in words. It holds the core, whose rings are
+/// `uartconfig`'s sizes, and the message and reply bodies.
+static SERVE_STACK_WORDS: Int = (2048 + (uartconfig.TX_RING_BYTES +
+                                         uartconfig.RX_RING_BYTES) / 4)
+unsafe static var SERVE_STACK: [UInt; SERVE_STACK_WORDS] = [0; SERVE_STACK_WORDS]
+
+// =============================================================================
+// UART0
+// =============================================================================
+
+/// A 4 KiB device window as the words it is.
+struct Words {
+    word: [UInt32; 1024],
+}
+
+static_assert(sizeof<Words>() == 0x1000, "a window is 4 KiB of words")
+
+/// A mapped window. A safe type: only the methods reaching through `regs`
+/// carry the `unsafe` effect.
+struct Window {
+    regs: UnsafeMemory<Words, Device>,
+}
+
+extension Window {
+    init(at: UInt) unsafe -> Window {
+        Window(regs: UnsafeMemory<Words, Device>(at))
+    }
+
+    func get(&self, offset: UInt32) unsafe -> UInt32 {
+        self.regs.word[(offset / 4) as Int].read()
+    }
+
+    func put(&self, offset: UInt32, word: UInt32) unsafe {
+        self.regs.word[(offset / 4) as Int].write(word)
+    }
+}
+
+/// UART0 through its mapped window, and its line.
+struct Uart0 {
+    window: Window,
+    irq: Interrupt,
+    /// What the line's acknowledgement answered, when it failed.
+    ack_failed: SosStatus?,
+}
+
+extension Uart0: NoCopy {}
+
+extension Uart0: UartPort {
+    func read_word(&var self, reg: UartRegister) -> UInt32 {
+        self.window.get(reg.offset)
+    }
+
+    func write_word(&var self, reg: UartRegister, word: UInt32) {
+        self.window.put(reg.offset, word)
+    }
+
+    func acknowledge(&var self) -> Bool {
+        try self.irq.ack() catch {
+            self.ack_failed = error
+            return false
+        }
+        true
+    }
+}
+
+/// UART0's interrupt bits for each of `uartcore`'s causes. The receive level
+/// is two bits, the FIFO's threshold and its idle timeout, and the core takes
+/// either as "look".
+static RX_LEVELS: UInt32 = INT_RXFIFO_FULL | INT_RXFIFO_TOUT
+
+/// `uartcore`'s causes in `bits`, as UART0's interrupt bits.
+func device_bits(bits: UInt32) -> UInt32 {
+    var w: UInt32 = 0
+    if (bits & EV_RX) != 0 { w = w | RX_LEVELS }
+    if (bits & EV_TX) != 0 { w = w | INT_TXFIFO_EMPTY }
+    if (bits & EV_OVERRUN) != 0 { w = w | INT_RXFIFO_OVF }
+    if (bits & EV_PARITY) != 0 { w = w | INT_PARITY_ERR }
+    if (bits & EV_FRAME) != 0 { w = w | INT_FRM_ERR }
+    if (bits & EV_BREAK) != 0 { w = w | INT_BRK_DET }
+    w
+}
+
+/// UART0's interrupt bits in `w`, as `uartcore`'s causes.
+func core_bits(w: UInt32) -> UInt32 {
+    var bits: UInt32 = 0
+    if (w & RX_LEVELS) != 0 { bits = bits | EV_RX }
+    if (w & INT_TXFIFO_EMPTY) != 0 { bits = bits | EV_TX }
+    if (w & INT_RXFIFO_OVF) != 0 { bits = bits | EV_OVERRUN }
+    if (w & INT_PARITY_ERR) != 0 { bits = bits | EV_PARITY }
+    if (w & INT_FRM_ERR) != 0 { bits = bits | EV_FRAME }
+    if (w & INT_BRK_DET) != 0 { bits = bits | EV_BREAK }
+    bits
+}
+
+extension Uart0: UartDevice {
+    func rx_count(&var self) -> Int {
+        uart_rxfifo_cnt(self.read_word(uart_status())) as Int
+    }
+
+    /// A read of `FIFO` pops the receiver.
+    func rx_pop(&var self) -> UInt8 {
+        (self.read_word(uart_fifo()) & 0xFF) as UInt8
+    }
+
+    func tx_count(&var self) -> Int {
+        uart_txfifo_cnt(self.read_word(uart_status())) as Int
+    }
+
+    func tx_capacity(&var self) -> Int { UART_FIFO_BYTES as Int }
+
+    /// A whole-word store: `FIFO` is never read on the transmit side.
+    func tx_push(&var self, b: UInt8) {
+        self.write_word(uart_fifo(), b as UInt32)
+    }
+
+    /// `INT_ST`: the causes raised and enabled.
+    func events(&var self) -> UInt32 {
+        core_bits(self.read_word(uart_int_st()))
+    }
+
+    func clear_events(&var self, bits: UInt32) {
+        let w = device_bits(bits)
+        if w != 0 {
+            self.write_word(uart_int_clr(), w)
+        }
+    }
+
+    func tx_interrupt(&var self, on: Bool) {
+        uart_set_tx_interrupt(&var self, on)
+    }
+
+    /// The core asks for 1 to the FIFO's depth. A level past the depth is a
+    /// `Sync`'s mark already passed, and the depth stands for it: the cause
+    /// rises whenever the FIFO holds fewer than 128 bytes, which is at once
+    /// unless the FIFO is full.
+    func set_tx_threshold(&var self, level: Int) {
+        var l = level
+        if l < 1 { l = 1 }
+        if l > (TX_EMPTY_MAX as Int) { l = TX_EMPTY_MAX as Int }
+        let _ = uart_set_tx_threshold(&var self, l as UInt32)
+    }
+}
+
+// =============================================================================
+// The service
+// =============================================================================
+
+/// The rings' sizes, the core's two parameters.
+static TX_RING: Int = uartconfig.TX_RING_BYTES
+static RX_RING: Int = uartconfig.RX_RING_BYTES
+
+/// The tuning `uartconfig` gives.
+func core_config() -> Config {
+    Config(tx: TxConfig(tx_empty: uartconfig.TX_EMPTY, fill_cap: uartconfig.TX_FILL_CAP,
+                        max_syncs: uartconfig.MAX_SYNCS),
+           held_reads: uartconfig.MAX_HELD_READS)
+}
+
+/// What a serving run answers with: the messages it took, the `Read`s its
+/// clients abandoned, and the core's counters.
+struct Report {
+    served: UInt32,
+    abandoned: UInt32,
+    interrupts: UInt32,
+    received: UInt32,
+    lost: UInt32,
+    frame: UInt32,
+    parity: UInt32,
+    breaks: UInt32,
+    queued: UInt64,
+    sent: UInt64,
+    writes_held: UInt32,
+}
+
+extension Report {
+    static func empty() -> Report {
+        Report(served: 0, abandoned: 0, interrupts: 0, received: 0, lost: 0,
+               frame: 0, parity: 0,
+               breaks: 0, queued: 0, sent: 0, writes_held: 0)
+    }
+}
+
+/// What the main thread hands the serving thread, by its address: the device,
+/// the Waiter the line and the outlet are attached to, and the outlet. It
+/// lives in `run`'s frame, which outlives the thread, since `run` joins it
+/// before it returns; and the main thread touches none of it until then.
+struct Shared {
+    dev: Uart0,
+    waiter: Waiter,
+    outlet: PipeOutlet,
+    report: Report,
+    /// Why the serving thread stopped, when it failed.
+    failed: SosStatus?,
+}
+
+extension Shared: NoCopy {}
+
+/// The obligations the driver holds: the `Read`s, the `Write`, the `Sync`s,
+/// each under the slot the core named.
+struct Held {
+    reads: [PipeRequest?; MAX_HELD_READS],
+    write: PipeRequest?,
+    syncs: [PipeRequest?; MAX_SYNCS],
+}
+
+extension Held: NoCopy {}
+
+extension Held {
+    static func empty() -> Held {
+        Held(reads: [None, None, None, None], write: None,
+             syncs: [None, None, None, None])
+    }
+
+    /// Keeps `request` under the core's name for it.
+    func put(&var self, kind: Int, slot: Int, request: PipeRequest) {
+        if kind == KIND_READ {
+            self.reads[slot] = move request
+        } else if kind == KIND_WRITE {
+            self.write = move request
+        } else {
+            self.syncs[slot] = move request
+        }
+    }
+
+    /// The obligation the core named, taken out.
+    func take(&var self, kind: Int, slot: Int) -> PipeRequest? {
+        if kind == KIND_READ {
+            return self.reads[slot].take()
+        }
+        if kind == KIND_WRITE {
+            return self.write.take()
+        }
+        if kind == KIND_SYNC {
+            return self.syncs[slot].take()
+        }
+        None
+    }
+}
+
+/// Answers `request` with `n` bytes of `body`; whether the reply landed. A
+/// client that dropped its claim (a told `Write`, a `Read` given up) is not a
+/// failure: the obligation is discharged either way.
+func answer(request: PipeRequest, body: &UartBody, n: UInt) -> Bool {
+    var r = move request
+    try (move r).reply(body: &body.bytes, len: n) catch {
+        return false
+    }
+    true
+}
+
+/// What a wake is, decided by borrowing the record.
+static WAKE_IRQ: Int = 0
+static WAKE_ABANDONED: Int = 1
+static WAKE_GONE: Int = 2
+static WAKE_OTHER: Int = 3
+
+func wake_of(r: &WaitResult) -> Int {
+    match r.what {
+        case Interrupt(_) -> WAKE_IRQ,
+        case Abandoned -> WAKE_ABANDONED,
+        case Readable(state) -> {
+            if state == OutletLevel.PeerGone { WAKE_GONE } else { WAKE_OTHER }
+        },
+        case _ -> WAKE_OTHER,
+    }
+}
+
+/// The serving thread's state.
+struct Server {
+    core: Core<TX_RING, RX_RING>,
+    held: Held,
+    body: UartBody,
+    /// Whether the outlet is attached to the Waiter.
+    attached: Bool,
+    /// Whether a client may still post: false once every inlet is gone.
+    open: Bool,
+    /// Whether the driver has stopped taking (`uartconfig.STALL_AFTER`).
+    stalled: Bool,
+    served: UInt32,
+    abandoned: UInt32,
+    interrupts: UInt32,
+}
+
+extension Server: NoCopy {}
+
+extension Server {
+    /// The interrupt: every register access, the acknowledgement, then every
+    /// answer that is ready.
+    func interrupt(&var self, s: &var Shared) -> Result<Void, SosStatus> {
+        self.interrupts = count_up(self.interrupts)
+        self.core.service(&var s.dev)
+        if not s.dev.acknowledge() {
+            return s.dev.ack_failed ?? BUG
+        }
+        self.deliver()
+        return
+    }
+
+    /// Makes every answer the core has ready, oldest kind first as the core
+    /// orders them. A `Read` whose reply does not land has its input put back
+    /// before the core is used again, and so does one whose obligation the
+    /// driver does not hold: the core and the held table agree, and if they
+    /// ever did not, the byte would wait for the next reader rather than be
+    /// lost.
+    func deliver(&var self) {
+        while let a = self.core.next_answer(&var self.body) {
+            guard let request = self.held.take(a.kind, a.slot) else {
+                self.core.undeliver(&a)
+                continue
+            }
+            if not answer(move request, &self.body, a.len) {
+                self.core.undeliver(&a)
+            }
+        }
+    }
+
+    /// Takes and serves messages until none is staged, every inlet is gone,
+    /// or intake closes.
+    func take_all(&var self, s: &var Shared) -> Result<Void, SosStatus> {
+        while self.open && not self.stalled && self.core.intake_open() {
+            let taken = try s.outlet.take() catch {
+                if error == SosStatus.WouldBlock {
+                    break
+                }
+                if error == SosStatus.PeerClosed {
+                    self.open = false
+                    break
+                }
+                return error
+            }
+            let (msg, request) = move taken
+            // The bytes are copied out and the message dropped, so whatever
+            // handles it carried are released before anything else is done.
+            let frame = Frame(len: msg.len, bytes: msg.bytes)
+            let _ = move msg
+            self.served = count_up(self.served)
+            try self.serve(&var s, &frame, move request)
+            let stall = uartconfig.STALL_AFTER as UInt32
+            if stall != 0 && self.served >= stall {
+                self.stalled = true
+            }
+        }
+        return
+    }
+
+    /// One request: answered now, or held under the core's name for it.
+    func serve(&var self, s: &var Shared, frame: &Frame,
+               request: PipeRequest) -> Result<Void, SosStatus> {
+        match self.core.request(&var s.dev, &frame, &var self.body) {
+            case Now(a) -> {
+                if not answer(move request, &self.body, a.len) {
+                    self.core.undeliver(&a)
+                }
+            },
+            case Held(kind, slot) -> {
+                var obligation = move request
+                if kind == KIND_READ {
+                    // Watched for abandonment, so a client that gives up
+                    // frees its slot.
+                    try s.waiter.add(request: &obligation, key: KEY_HELD + (slot as UInt),
+                                     mode: AttachMode.OneShot)
+                }
+                self.held.put(kind, slot, move obligation)
+            },
+        }
+        return
+    }
+
+    /// Attaches the outlet while the driver may take, and removes it while it
+    /// may not, so a staged message wakes it only when it would take one.
+    func settle_outlet(&var self, s: &var Shared) -> Result<Void, SosStatus> {
+        let want = self.open && not self.stalled && self.core.intake_open()
+        if want && not self.attached {
+            try s.waiter.add(outlet: &s.outlet, key: KEY_OUTLET)
+            self.attached = true
+        } else if not want && self.attached {
+            try s.waiter.remove(KEY_OUTLET)
+            self.attached = false
+        }
+        return
+    }
+}
+
+/// The serving loop, until every inlet is gone and every byte has left the
+/// FIFO. The outlet is attached when this starts.
+func serve(s: &var Shared) -> Result<Void, SosStatus> {
+    var server = Server(core: Core<TX_RING, RX_RING>.new(core_config()), held: Held.empty(),
+                        body: UartBody.empty(), attached: true, open: true,
+                        stalled: false, served: 0, abandoned: 0, interrupts: 0)
+    while server.open {
+        let wake = try s.waiter.wait()
+        let what = wake_of(&wake)
+        let key = wake.key
+        let _ = move wake
+        if what == WAKE_IRQ {
+            try server.interrupt(&var s)
+        } else if what == WAKE_ABANDONED {
+            if key >= KEY_HELD && key < KEY_HELD + (MAX_HELD_READS as UInt) {
+                let slot = (key - KEY_HELD) as Int
+                let _ = server.held.reads[slot].take()
+                server.core.abandon(slot)
+                server.abandoned = count_up(server.abandoned)
+            }
+        } else if what == WAKE_GONE {
+            server.open = false
+        }
+        try server.take_all(&var s)
+        try server.settle_outlet(&var s)
+    }
+    // Every client is gone: what is queued goes out before the driver
+    // returns. A `Sync` still held is answered once its bytes have left,
+    // whether an interrupt said so or the drain's own count read did, so its
+    // answer is made after each of the drain's calls too.
+    var drained = server.core.begin_drain(&var s.dev)
+    server.deliver()
+    while not drained {
+        let wake = try s.waiter.wait()
+        let what = wake_of(&wake)
+        let _ = move wake
+        if what == WAKE_IRQ {
+            try server.interrupt(&var s)
+        }
+        drained = server.core.drained(&var s.dev)
+        server.deliver()
+    }
+    let rx = server.core.rx.totals
+    let tx = server.core.tx.totals
+    s.report = Report(served: server.served, abandoned: server.abandoned,
+                      interrupts: server.interrupts,
+                      received: rx.received, lost: rx.lost, frame: rx.frame,
+                      parity: rx.parity, breaks: rx.breaks, queued: tx.queued,
+                      sent: tx.pushed, writes_held: tx.writes_held)
+    return
+}
+
+/// The serving thread: `at` is `run`'s `Shared`.
+func serving(at: UInt) unsafe sync -> UInt {
+    let s = at as UnsafePointer<Shared>
+    try serve(&var s[0]) catch {
+        s[0].failed = error
+        return 1
+    }
+    0
+}
+
+/// The record `tag`, taken out of the boot set.
+func take_window(set: &var BootSet) -> IoMemory? {
+    guard var record = set.take(TAG_WINDOW) else { return None }
+    record.take_iomemory()
+}
+
+func take_outlet(set: &var BootSet) -> PipeOutlet? {
+    guard var record = set.take(TAG_OUTLET) else { return None }
+    record.take_outlet()
+}
+
+func take_line(set: &var BootSet) -> Interrupt? {
+    guard var record = set.take(TAG_LINE) else { return None }
+    record.take_interrupt()
+}
+
+/// Why `run` stopped short of serving.
+enum Stop {
+    case Failed(status: SosStatus),
+    case NotClaimed,
+}
+
+/// Maps the window, wires the Waiter, brings the UART up, claims the console,
+/// and serves on the serving thread until every client is gone; the console is
+/// released before this returns.
+func run() unsafe -> Result<Report, Stop> {
+    var set = sosmain.take_boot_set()
+    guard let window = take_window(&var set) else { return Stop.Failed(BUG) }
+    guard let outlet = take_outlet(&var set) else { return Stop.Failed(BUG) }
+    guard let irq = take_line(&var set) else { return Stop.Failed(BUG) }
+
+    let mapping = try sosmain.context().process().map(iomemory: &window) catch {
+        return Stop.Failed(error)
+    }
+    let base = try mapping.base() catch { return Stop.Failed(error) }
+    let waiter = try sosmain.context().process().waiter_create() catch {
+        return Stop.Failed(error)
+    }
+    var shared = Shared(dev: Uart0(window: Window(at: base), irq: move irq,
+                                   ack_failed: None),
+                        waiter: move waiter, outlet: move outlet,
+                        report: Report.empty(), failed: None)
+    try shared.waiter.add(interrupt: &shared.dev.irq, key: KEY_IRQ) catch {
+        return Stop.Failed(error)
+    }
+    try shared.waiter.add(outlet: &shared.outlet, key: KEY_OUTLET) catch {
+        return Stop.Failed(error)
+    }
+    try start_uart(&var shared.dev, uartconfig.RX_FULL as UInt32,
+                   uartconfig.TX_EMPTY as UInt32,
+                   uartconfig.RX_TIMEOUT_BITS as UInt32) catch {
+        return Stop.Failed(BUG)
+    }
+
+    // The claim comes once the line is attached and the receiver is up, and
+    // before the serving thread starts, so every byte the driver stores comes
+    // after the kernel's last line.
+    try sosmain.context().system().console_claim() catch {
+        // The receiver's interrupts go off again: a driver that does not
+        // serve leaves UART0 raising nothing.
+        shared.dev.write_word(uart_int_ena(), 0)
+        if error == SosStatus.Claimed {
+            return Stop.NotClaimed
+        }
+        return Stop.Failed(error)
+    }
+
+    let top = ((&var SERVE_STACK) as UnsafePointer<UInt>) as UInt +
+              (SERVE_STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let entry: FuncPointer<(UInt) sync -> UInt> = serving
+    let at = ((&var shared) as UnsafePointer<Shared>) as UInt
+    let thread = try sosmain.context().process().thread_create(run: entry, arg: at,
+                                                              stack_top: top) catch {
+        let _ = sosmain.context().system().console_release()
+        return Stop.Failed(error)
+    }
+    try thread.start(band: uartconfig.serve_band()) catch {
+        let _ = sosmain.context().system().console_release()
+        return Stop.Failed(error)
+    }
+    let _ = try thread.join() catch {
+        let _ = sosmain.context().system().console_release()
+        return Stop.Failed(error)
+    }
+    try sosmain.context().system().console_release() catch {
+        return Stop.Failed(error)
+    }
+    if let why = shared.failed {
+        return Stop.Failed(why)
+    }
+    let report = shared.report
+    let _ = move mapping
+    let _ = move window
+    return report
+}
+
+func main() -> Int {
+    let done = try run() catch {
+        match error {
+            case NotClaimed -> {
+                print("SOS uarts3 drv: the console is claimed by another process")
+                return EXIT_NOT_CLAIMED
+            },
+            case Failed(why) -> {
+                print("SOS uarts3 drv: failed: {}", why)
+                return EXIT_FAILED
+            },
+        }
+    }
+    print("SOS uarts3 drv: served={} abandoned={} writes held={} interrupts={}",
+          done.served, done.abandoned, done.writes_held, done.interrupts)
+    print("SOS uarts3 drv: queued={} sent={}", done.queued, done.sent)
+    print("SOS uarts3 drv: received={} lost={} frame={} parity={} breaks={}",
+          done.received, done.lost, done.frame, done.parity, done.breaks)
+    if done.sent == done.queued {
+        if done.writes_held >= 1 {
+            print("SOS uarts3 drv: every write that did not fit was held, every byte sent")
+        } else {
+            print("SOS uarts3 drv: every byte queued was sent")
+        }
+    }
+    EXIT_OK
+}

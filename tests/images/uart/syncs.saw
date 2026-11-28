@@ -1,0 +1,44 @@
+//! `svc-uart-esp32s3` with a 16-byte transmit ring and a 4-byte fill cap: a
+//! `Write` longer than 16 bytes is held, and when its last part is queued the
+//! fill that follows leaves bytes in the ring, so a `Sync` taken then waits
+//! for them. The serving thread is lowered to `Low`, its client's level, so
+//! the client posts everything before the driver takes any of it. The
+//! `uart_s3_syncs` case's.
+
+import sos.{Priority}
+
+/// The transmit ring, in bytes: what a `Write` is copied into before the FIFO
+/// takes it.
+public static TX_RING_BYTES: Int = 16
+
+/// The receive ring, in bytes: what the interrupt drains the FIFO into until a
+/// `Read` takes it.
+public static RX_RING_BYTES: Int = 256
+
+/// The transmit FIFO level below which the transmit interrupt rises while the
+/// ring holds bytes, 1 to 128.
+public static TX_EMPTY: Int = 32
+
+/// The receive FIFO level above which the receive interrupt rises, 1 to 127.
+public static RX_FULL: Int = 64
+
+/// The receiver's idle time, in bit times, after which the receive timeout
+/// rises with fewer than `RX_FULL` bytes in the FIFO, 1 to 1023.
+public static RX_TIMEOUT_BITS: Int = 30
+
+/// The most bytes one fill stores in the transmit FIFO, 1 to 128.
+public static TX_FILL_CAP: Int = 4
+
+/// The `Read`s held at once, 1 to 4; past it a `Read` is answered `Busy`.
+public static MAX_HELD_READS: Int = 4
+
+/// The `Sync`s held at once, 1 to 4; with that many held the driver takes no
+/// message.
+public static MAX_SYNCS: Int = 4
+
+/// For tests only: the messages the driver takes before it stops taking and
+/// stays alive; 0 is never.
+public static STALL_AFTER: Int = 0
+
+/// The band the serving thread runs at. Only a test lowers it.
+public func serve_band() -> Priority { Priority.Low }

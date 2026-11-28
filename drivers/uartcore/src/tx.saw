@@ -33,6 +33,18 @@ import uartproto.{Frame, MAX_PAYLOAD}
 /// How many `Sync`s are held at once; at the limit intake pauses.
 public static MAX_SYNCS: Int = 4
 
+/// Whether sequence number `a` was given out before `b`.
+///
+/// A held request's sequence number orders it among the held ones, and the
+/// numbers wrap: a driver that holds requests for long enough gives out every
+/// number. At most `MAX_SYNCS` or `MAX_HELD_READS` are held at once, so two
+/// held numbers are always within a few of each other, and `a` is before `b`
+/// when `b` is less than half the number space ahead of it, across the wrap
+/// too.
+public func seq_before(a: UInt, b: UInt) -> Bool {
+    a != b && (b &- a) <= (UInt.max >> 1)
+}
+
 /// The transmit path's tuning.
 public struct TxConfig {
     /// The FIFO level below which the transmit cause rises while the ring
@@ -118,6 +130,10 @@ extension Tx<N> {
 
     /// Whether a `Write` is held.
     public func holds_write(&self) -> Bool { self.hold_active }
+
+    /// Gives out sequence numbers from `at` on: `empty` starts at 0, and a test
+    /// starts near the top to cross the wrap.
+    public func start_sequence(&var self, at: UInt) { self.next_seq = at }
 
     /// The `Sync`s held, answered or not yet taken back.
     public func syncs_held(&self) -> Int {
@@ -227,7 +243,7 @@ extension Tx<N> {
                 self.sync_ready[i] = false
                 self.sync_mark[i] = mark
                 self.sync_seq[i] = self.next_seq
-                self.next_seq = self.next_seq + 1
+                self.next_seq = self.next_seq &+ 1
                 return SyncTake.Waits(i)
             }
             i = i + 1
@@ -259,15 +275,19 @@ extension Tx<N> {
         }
         self.draining = true
         self.drain_mark = mark
-        self.drain_passed = self.passed(&var dev, mark)
+        self.drain_passed = false
+        self.pass_syncs(&var dev)
         self.settle(&var dev)
         self.drain_passed
     }
 
-    /// Whether the drain `begin_drain` started is over.
-    public func drained<D: UartDevice>(&self, dev: &var D) -> Bool {
-        let over = self.drain_passed || self.passed(&var dev, self.drain_mark)
-        self.draining && over
+    /// Whether the drain `begin_drain` started is over. Like `begin_drain`, it
+    /// flags every held `Sync` whose mark has passed, from the same read of
+    /// the count: the FIFO can empty with no interrupt to say so, and a `Sync`
+    /// held when the last client went must still be answered.
+    public func drained<D: UartDevice>(&var self, dev: &var D) -> Bool {
+        self.pass_syncs(&var dev)
+        self.draining && self.drain_passed
     }
 
     /// Flags every held `Sync` whose mark the FIFO has passed, and the drain,
@@ -388,7 +408,7 @@ extension Tx<N> {
         var i = 0
         while i < MAX_SYNCS {
             if self.sync_used[i] && self.sync_ready[i] {
-                if best < 0 || self.sync_seq[i] < self.sync_seq[best] {
+                if best < 0 || seq_before(self.sync_seq[i], self.sync_seq[best]) {
                     best = i
                 }
             }
