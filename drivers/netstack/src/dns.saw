@@ -1,0 +1,497 @@
+//! A DNS stub resolver's wire half (RFC 1035): the query for a name's A
+//! record, and the parser of its response.
+//!
+//! A message is a 12-byte header, then its sections:
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       2      id
+//! 2       2      flags: QR (0x8000), opcode (0x7800), AA, TC (0x0200), RD
+//!                (0x0100), RA, and the response code (0x000F)
+//! 4       2      questions
+//! 6       2      answers
+//! 8       2      authority records
+//! 10      2      additional records
+//! 12             the questions, then the records
+//! ```
+//!
+//! A question is a name, a 2-byte type and a 2-byte class. A record is a
+//! name, a type, a class, a 4-byte time to live, a 2-byte data length and
+//! the data. A name is a run of labels, each a length byte (under 64) and
+//! that many bytes, ended by a zero length; a length byte whose top two bits
+//! are set is instead a pointer, a 14-bit offset into the message where the
+//! rest of the name continues (RFC 1035 §4.1.4).
+//!
+//! The stub asks for one address and takes the first it is told:
+//!
+//!   - `Query` checks a name and keeps it, with the id the caller chose and
+//!     the server it is asked of; `Query.write` writes the datagram to send
+//!     to `PORT` on that server, recursion desired;
+//!   - `Query.parse` takes the datagram that came back, and the address and
+//!     port it came from, and answers what the server said (`Resolution`), or
+//!     why it is refused. A response from any other source is refused here,
+//!     so a caller cannot forget to ask.
+//!
+//! A name in a response is read as input. A pointer must lead strictly
+//! backward in the message, and a name may follow no more than `MAX_JUMPS` of
+//! them, so a loop of pointers ends in a refusal; a name's decoded length is
+//! held to `MAX_NAME_BYTES`, its labels to `MAX_LABEL_BYTES`, and every length
+//! and offset to the bytes received. Names are compared without regard to
+//! case (RFC 1035 §2.3.3).
+//!
+//! The answer section is read in order, following a CNAME from the name
+//! asked for to the name it names, and the first A record for the name
+//! reached is the answer. The authority and additional sections are not
+//! read. A response is refused unless it answers this query: its source, its
+//! id, its opcode and its one question must be the query's, and the question
+//! is checked before the response code, so a negative answer takes the same
+//! guesses as a positive one (RFC 5452 §9.1).
+//!
+//! The answer section is followed in order: a CNAME is taken only for a name
+//! already reached, so an A record that comes before the CNAME it belongs to
+//! is not found, and the response is `NoData`.
+
+import netstack.addr.{Ipv4Addr, SocketAddr}
+import netstack.bytes.{be16, be32, put16}
+
+/// The port a DNS server listens on.
+public static PORT: UInt16 = 53
+
+/// The header's bytes.
+public static HEADER_BYTES: Int = 12
+
+/// The most bytes a name has on the wire, its final zero length included.
+public static MAX_NAME_BYTES: Int = 255
+
+/// The most bytes in one label.
+public static MAX_LABEL_BYTES: Int = 63
+
+/// The most bytes a query is, which `Query.write` needs of its `out`.
+public static MAX_QUERY_BYTES: Int = HEADER_BYTES + MAX_NAME_BYTES + 4
+
+/// How many pointers a name may follow.
+public static MAX_JUMPS: Int = 16
+
+static TYPE_A: UInt16 = 1
+static TYPE_CNAME: UInt16 = 5
+static CLASS_IN: UInt16 = 1
+
+static FLAG_RESPONSE: UInt16 = 0x8000
+static FLAG_TRUNCATED: UInt16 = 0x0200
+static FLAG_RECURSION_DESIRED: UInt16 = 0x0100
+
+static RCODE_NAME_ERROR: UInt16 = 3
+
+static DOT: UInt8 = 0x2E
+
+// =============================================================================
+// Names
+// =============================================================================
+
+/// Why a name cannot be asked for.
+public enum NameError {
+    /// No name at all.
+    case Empty,
+    /// Two dots in a row, or a dot first: a label of no bytes.
+    case EmptyLabel,
+    /// A label of more than `MAX_LABEL_BYTES`.
+    case LabelTooLong,
+    /// A name of more than `MAX_NAME_BYTES` on the wire.
+    case TooLong,
+    /// A byte that is not a letter, a digit, a hyphen or an underscore, in a
+    /// label.
+    case BadCharacter,
+}
+
+@synthesize
+extension NameError: Equatable {}
+
+extension NameError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case Empty -> "an empty name",
+            case EmptyLabel -> "an empty label",
+            case LabelTooLong -> "a label too long",
+            case TooLong -> "a name too long",
+            case BadCharacter -> "a byte a name may not have",
+        }
+    }
+}
+
+extension NameError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension NameError: Error {}
+
+/// A name as it stands on the wire without pointers, its letters lowered:
+/// the form two names are compared in.
+public struct Name {
+    wire: [UInt8; MAX_NAME_BYTES],
+    len: Int,
+}
+
+/// Whether `c` may be in a label.
+func label_byte(c: UInt8) -> Bool {
+    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) ||
+        (c >= 0x61 && c <= 0x7A) || c == 0x2D || c == 0x5F
+}
+
+func lower(c: UInt8) -> UInt8 {
+    if c >= 0x41 && c <= 0x5A { c + 0x20 } else { c }
+}
+
+extension Name {
+    /// The name `text` spells, labels between dots and one dot after the
+    /// last allowed, or why it is refused.
+    public init(text: &[UInt8]) -> Result<Name, NameError> {
+        var n = text.len()
+        if n > 0 && text[n - 1] == DOT {
+            n = n - 1
+        }
+        if n == 0 {
+            return NameError.Empty
+        }
+        // The labels' bytes, a length byte for each label, and the final zero.
+        if n + 2 > MAX_NAME_BYTES {
+            return NameError.TooLong
+        }
+        var name = Name(wire: [0; MAX_NAME_BYTES], len: 0)
+        var label_at = 0
+        var at = 1
+        var label_len = 0
+        var i = 0
+        while i < n {
+            let c = text[i]
+            if c == DOT {
+                if label_len == 0 {
+                    return NameError.EmptyLabel
+                }
+                name.wire[label_at] = label_len as UInt8
+                label_at = at
+                at = at + 1
+                label_len = 0
+            } else {
+                if not label_byte(c) {
+                    return NameError.BadCharacter
+                }
+                if label_len == MAX_LABEL_BYTES {
+                    return NameError.LabelTooLong
+                }
+                name.wire[at] = lower(c)
+                at = at + 1
+                label_len = label_len + 1
+            }
+            i = i + 1
+        }
+        if label_len == 0 {
+            return NameError.EmptyLabel
+        }
+        name.wire[label_at] = label_len as UInt8
+        name.wire[at] = 0
+        name.len = at + 1
+        return name
+    }
+
+    /// Whether both are the same name.
+    public func equals(&self, other: &Name) -> Bool {
+        if self.len != other.len {
+            return false
+        }
+        var i = 0
+        while i < self.len {
+            if self.wire[i] != other.wire[i] {
+                return false
+            }
+            i = i + 1
+        }
+        true
+    }
+}
+
+// =============================================================================
+// Responses
+// =============================================================================
+
+/// Why a response is refused.
+public enum Refusal {
+    /// The message ends inside the header, a name, a question or a record.
+    case Truncated,
+    /// A response from another address or port than the server asked.
+    case WrongSource,
+    /// An id other than the query's.
+    case WrongId,
+    /// A message that is not a response: QR is clear.
+    case NotResponse,
+    /// An opcode other than a standard query's.
+    case BadOpcode,
+    /// A response the server cut to fit (TC), which the stub cannot ask
+    /// again over TCP.
+    case Cut,
+    /// A question section other than the one question, an A query in the
+    /// Internet class.
+    case BadQuestion,
+    /// A question about another name than the one asked for.
+    case WrongQuestion,
+    /// A label length byte whose top two bits are neither both clear (a
+    /// label) nor both set (a pointer).
+    case BadLabel,
+    /// A pointer that does not lead strictly backward, or one more than
+    /// `MAX_JUMPS` deep.
+    case BadPointer,
+    /// A name of more than `MAX_NAME_BYTES` once decoded.
+    case NameTooLong,
+    /// An A record whose data is not four bytes, or a CNAME whose name runs
+    /// past its data.
+    case BadRecord,
+    /// An A record for an address no host has: 0.0.0.0, a multicast group or
+    /// the limited broadcast.
+    case BadAddress,
+}
+
+@synthesize
+extension Refusal: Equatable {}
+
+extension Refusal {
+    /// What a transcript should call this refusal.
+    public func describe(&self) -> String {
+        match self {
+            case Truncated -> "truncated",
+            case WrongSource -> "from another source than the server",
+            case WrongId -> "another query's id",
+            case NotResponse -> "not a response",
+            case BadOpcode -> "not a standard query's response",
+            case Cut -> "cut by the server",
+            case BadQuestion -> "not the question asked",
+            case WrongQuestion -> "another name than the one asked",
+            case BadLabel -> "a label of a kind that does not exist",
+            case BadPointer -> "a pointer that leads nowhere sound",
+            case NameTooLong -> "a name too long",
+            case BadRecord -> "a malformed record",
+            case BadAddress -> "an address no host has",
+        }
+    }
+}
+
+extension Refusal: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension Refusal: Error {}
+
+/// What a well-formed response to a query says.
+public enum Resolution {
+    /// The name's address, and the seconds the server says it holds.
+    case Found(address: Ipv4Addr, ttl: UInt32),
+    /// The server says the name does not exist (response code 3).
+    case NoSuchName,
+    /// The name exists and has no A record.
+    case NoData,
+    /// Any other response code: the server could not answer.
+    case Failed(code: UInt8),
+}
+
+@synthesize
+extension Resolution: Equatable {}
+
+/// A name decoded from a message, and where the message goes on after it.
+struct NameAt {
+    name: Name,
+    next: Int,
+}
+
+/// The name that starts at `at` in `msg`, pointers followed.
+func read_name(msg: &[UInt8], at: Int) -> Result<NameAt, Refusal> {
+    let n = msg.len()
+    var name = Name(wire: [0; MAX_NAME_BYTES], len: 0)
+    var pos = at
+    var next = 0
+    var jumps = 0
+    while true {
+        if pos >= n {
+            return Refusal.Truncated
+        }
+        let b = msg[pos]
+        if b == 0 {
+            // The root: the name's own final zero. Each label left room for
+            // it.
+            name.wire[name.len] = 0
+            name.len = name.len + 1
+            if jumps == 0 {
+                next = pos + 1
+            }
+            break
+        }
+        let kind = b & 0xC0
+        if kind == 0xC0 {
+            if pos + 1 >= n {
+                return Refusal.Truncated
+            }
+            let target = (((b & 0x3F) as Int) << 8) | (msg[pos + 1] as Int)
+            if jumps == 0 {
+                next = pos + 2
+            }
+            jumps = jumps + 1
+            if target >= pos || jumps > MAX_JUMPS {
+                return Refusal.BadPointer
+            }
+            pos = target
+        } else if kind != 0 {
+            return Refusal.BadLabel
+        } else {
+            let len = b as Int
+            if pos + 1 + len > n {
+                return Refusal.Truncated
+            }
+            // The label, its length byte, and the final zero still to come.
+            if name.len + 1 + len + 1 > MAX_NAME_BYTES {
+                return Refusal.NameTooLong
+            }
+            name.wire[name.len] = b
+            var i = 0
+            while i < len {
+                name.wire[name.len + 1 + i] = lower(msg[pos + 1 + i])
+                i = i + 1
+            }
+            name.len = name.len + 1 + len
+            pos = pos + 1 + len
+        }
+    }
+    return NameAt(name: name, next: next)
+}
+
+/// Whether `address` is one a host can have.
+func host(address: Ipv4Addr) -> Bool {
+    not address.is_unspecified() && not address.is_multicast() &&
+        not address.is_broadcast()
+}
+
+/// A question asked: the id it carries and the name.
+public struct Query {
+    public id: UInt16,
+    /// The server the query is for; responses are taken from it alone.
+    public server: Ipv4Addr,
+    name: Name,
+}
+
+extension Query {
+    /// A query with `id`, to `server`, for the A record of `text`, or why the
+    /// name cannot be asked for.
+    public init(id: UInt16, server: Ipv4Addr,
+                text: &[UInt8]) -> Result<Query, NameError> {
+        let name = try Name(text: &text)
+        return Query(id: id, server: server, name: name)
+    }
+
+    /// Writes the query datagram into `out`, which holds at least
+    /// `MAX_QUERY_BYTES`, and answers its length.
+    public func write(&self, out: &var [UInt8]) -> Int {
+        put16(&var out, 0, self.id)
+        put16(&var out, 2, FLAG_RECURSION_DESIRED)
+        put16(&var out, 4, 1)
+        put16(&var out, 6, 0)
+        put16(&var out, 8, 0)
+        put16(&var out, 10, 0)
+        var i = 0
+        while i < self.name.len {
+            out[HEADER_BYTES + i] = self.name.wire[i]
+            i = i + 1
+        }
+        let at = HEADER_BYTES + self.name.len
+        put16(&var out, at, TYPE_A)
+        put16(&var out, at + 2, CLASS_IN)
+        at + 4
+    }
+
+    /// What the datagram `msg`, which came from `from`, says to this query, or
+    /// why it is refused.
+    public func parse(&self, msg: &[UInt8],
+                      from: SocketAddr) -> Result<Resolution, Refusal> {
+        if from.addr != self.server || from.port != PORT {
+            return Refusal.WrongSource
+        }
+        let n = msg.len()
+        if n < HEADER_BYTES {
+            return Refusal.Truncated
+        }
+        if be16(&msg, 0) != self.id {
+            return Refusal.WrongId
+        }
+        let flags = be16(&msg, 2)
+        if (flags & FLAG_RESPONSE) == 0 {
+            return Refusal.NotResponse
+        }
+        if ((flags >> 11) & 0xF) != 0 {
+            return Refusal.BadOpcode
+        }
+        if (flags & FLAG_TRUNCATED) != 0 {
+            return Refusal.Cut
+        }
+        if be16(&msg, 4) != 1 {
+            return Refusal.BadQuestion
+        }
+        let asked = try read_name(&msg, HEADER_BYTES)
+        var pos = asked.next
+        if pos + 4 > n {
+            return Refusal.Truncated
+        }
+        if be16(&msg, pos) != TYPE_A || be16(&msg, pos + 2) != CLASS_IN {
+            return Refusal.BadQuestion
+        }
+        if not asked.name.equals(&self.name) {
+            return Refusal.WrongQuestion
+        }
+        pos = pos + 4
+        let code = flags & 0xF
+        if code == RCODE_NAME_ERROR {
+            return Resolution.NoSuchName
+        }
+        if code != 0 {
+            return Resolution.Failed(code as UInt8)
+        }
+        var current = self.name
+        var answers = be16(&msg, 6)
+        while answers > 0 {
+            answers = answers - 1
+            let owner = try read_name(&msg, pos)
+            pos = owner.next
+            if pos + 10 > n {
+                return Refusal.Truncated
+            }
+            let kind = be16(&msg, pos)
+            let class = be16(&msg, pos + 2)
+            let ttl = be32(&msg, pos + 4)
+            let data_bytes = be16(&msg, pos + 8) as Int
+            let data = pos + 10
+            if data + data_bytes > n {
+                return Refusal.Truncated
+            }
+            if class == CLASS_IN && owner.name.equals(&current) {
+                if kind == TYPE_A {
+                    if data_bytes != 4 {
+                        return Refusal.BadRecord
+                    }
+                    let address = Ipv4Addr(bytes: &msg, at: data)
+                    if not host(address) {
+                        return Refusal.BadAddress
+                    }
+                    return Resolution.Found(address, ttl)
+                }
+                if kind == TYPE_CNAME {
+                    let target = try read_name(&msg, data)
+                    if target.next > data + data_bytes {
+                        return Refusal.BadRecord
+                    }
+                    current = target.name
+                }
+            }
+            pos = data + data_bytes
+        }
+        return Resolution.NoData
+    }
+}

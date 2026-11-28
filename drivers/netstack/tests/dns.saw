@@ -1,0 +1,670 @@
+// The DNS stub: the query it writes against golden bytes written out from
+// RFC 1035's layout, the names it refuses to ask for, the responses it
+// reads (name compression, a CNAME chain, each response code), and every
+// reason it refuses one.
+//
+// The query is for `example.com` with id 0x1234; its question is
+// `07 example 03 com 00`, 13 bytes at offset 12, then type A and class IN, so
+// the first record of a response starts at 29.
+
+import netstack.addr.{Ipv4Addr, SocketAddr}
+import netstack.dns
+import netstack.dns.{Name, NameError, Query, Refusal, Resolution}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+static ID: UInt16 = 0x1234
+
+/// The server the queries are for, and where its responses come from.
+func server() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 53) }
+func from_server() -> SocketAddr { SocketAddr(addr: server(), port: 53) }
+
+/// The datagram that asks for `example.com`'s A record.
+static QUERY: [UInt8; 29] = [
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65,
+    0x03, 0x63, 0x6F, 0x6D, 0x00,
+    0x00, 0x01, 0x00, 0x01,
+]
+
+/// The server's answer: a recursive response with no error, the question
+/// repeated, and one A record whose owner is a pointer to the question's name
+/// (offset 12): 93.184.216.34, 300 seconds.
+static RESPONSE: [UInt8; 45] = [
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65,
+    0x03, 0x63, 0x6F, 0x6D, 0x00,
+    0x00, 0x01, 0x00, 0x01,
+    0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x04,
+    0x5D, 0xB8, 0xD8, 0x22,
+]
+
+// -----------------------------------------------------------------------------
+// Names as text
+// -----------------------------------------------------------------------------
+
+static TEXT_BYTES: Int = 400
+
+struct Text {
+    bytes: [UInt8; TEXT_BYTES],
+    len: Int,
+}
+
+extension Text {
+    static func of(s: String) -> Text {
+        var t = Text(bytes: [0; TEXT_BYTES], len: 0)
+        var i = 0
+        while i < s.len() {
+            t.bytes[i] = s.byte_at(i) as UInt8
+            i = i + 1
+        }
+        t.len = s.len()
+        t
+    }
+
+    /// `count` labels of `len` letters each, dots between.
+    static func labels(len: Int, count: Int) -> Text {
+        var t = Text(bytes: [0; TEXT_BYTES], len: 0)
+        var k = 0
+        while k < count {
+            if k > 0 {
+                t.bytes[t.len] = 0x2E
+                t.len = t.len + 1
+            }
+            var i = 0
+            while i < len {
+                t.bytes[t.len] = 0x61
+                t.len = t.len + 1
+                i = i + 1
+            }
+            k = k + 1
+        }
+        t
+    }
+}
+
+func query_of(t: &Text) -> Result<Query, NameError> {
+    Query(id: ID, server: server(), text: &t.bytes[..t.len])
+}
+
+func example() -> Query {
+    let t = Text.of("example.com")
+    try! query_of(&t)
+}
+
+func naming() {
+    // The query, byte for byte, over a buffer that held other bytes.
+    var out: [UInt8; 271] = [0xEE; 271]
+    let q = example()
+    let n = q.write(&var out)
+    check(n == 29 && same(&out[..n], &QUERY), "the query, byte for byte")
+
+    // A trailing dot is the root; a name's case is lowered.
+    let dotted = Text.of("Example.COM.")
+    var other: [UInt8; 271] = [0; 271]
+    let dq = try! query_of(&dotted)
+    let m = dq.write(&var other)
+    check(m == 29 && same(&other[..m], &QUERY), "a trailing dot, and case, do not change the query")
+
+    // A name that is one label.
+    let one = Text.of("localhost")
+    let oq = try! query_of(&one)
+    let k = oq.write(&var other)
+    check(k == 12 + 11 + 4, "a name of one label")
+
+}
+
+func name_refusals() {
+    refuse_name(Text.of(""), NameError.Empty, "no name")
+    refuse_name(Text.of("."), NameError.Empty, "the root alone")
+    refuse_name(Text.of(".a"), NameError.EmptyLabel, "a leading dot")
+    refuse_name(Text.of("a..b"), NameError.EmptyLabel, "two dots")
+    refuse_name(Text.of("a.."), NameError.EmptyLabel, "two trailing dots")
+    refuse_name(Text.of("a b"), NameError.BadCharacter, "a space")
+    refuse_name(Text.of("a/b"), NameError.BadCharacter, "a slash")
+    refuse_name(Text.labels(64, 1), NameError.LabelTooLong, "a label of 64 bytes")
+    // 63 bytes: accepted. Three of 63 and one of 61 is 253 characters:
+    // accepted; one more byte is not.
+    accept_name(Text.labels(63, 1), "a label of 63 bytes")
+    var t = Text.labels(63, 3)
+    t.bytes[t.len] = 0x2E
+    t.len = t.len + 1
+    var i = 0
+    while i < 61 {
+        t.bytes[t.len] = 0x62
+        t.len = t.len + 1
+        i = i + 1
+    }
+    accept_name(t, "a name of 255 bytes on the wire")
+    t.bytes[t.len] = 0x62
+    t.len = t.len + 1
+    refuse_name(t, NameError.TooLong, "a name of 256 bytes on the wire")
+    accept_name(Text.of("a-b_c.D9"), "letters, digits, hyphens, underscores")
+}
+
+func refuse_name(t: Text, why: NameError, what: String) {
+    let r = query_of(&t)
+    match r {
+        case Ok(_) -> check(false, what),
+        case Err(e) -> check(e == why, what),
+    }
+}
+
+func accept_name(t: Text, what: String) {
+    let r = query_of(&t)
+    match r {
+        case Ok(_) -> {},
+        case Err(_) -> check(false, what),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// A response written a field at a time
+// -----------------------------------------------------------------------------
+
+static MSG_BYTES: Int = 700
+
+struct Wire {
+    bytes: [UInt8; MSG_BYTES],
+    len: Int,
+}
+
+extension Wire {
+    static func empty() -> Wire {
+        Wire(bytes: [0; MSG_BYTES], len: 0)
+    }
+
+    /// The header of a response to `example.com`'s query, with `flags`, and
+    /// `answers` records, and the question after it.
+    static func response(flags: UInt16, answers: UInt16) -> Wire {
+        var w = Wire.empty()
+        w.u16(0x1234)
+        w.u16(flags)
+        w.u16(1)
+        w.u16(answers)
+        w.u16(0)
+        w.u16(0)
+        w.question()
+        w
+    }
+
+    func u8(&var self, v: UInt8) {
+        self.bytes[self.len] = v
+        self.len = self.len + 1
+    }
+
+    func u16(&var self, v: UInt16) {
+        self.u8((v >> 8) as UInt8)
+        self.u8((v & 0xFF) as UInt8)
+    }
+
+    func u32(&var self, v: UInt32) {
+        self.u16((v >> 16) as UInt16)
+        self.u16((v & 0xFFFF) as UInt16)
+    }
+
+    func label(&var self, s: String) {
+        self.u8(s.len() as UInt8)
+        var i = 0
+        while i < s.len() {
+            self.u8(s.byte_at(i) as UInt8)
+            i = i + 1
+        }
+    }
+
+    /// `example.com` in full.
+    func name(&var self) {
+        self.label("example")
+        self.label("com")
+        self.u8(0)
+    }
+
+    func ptr(&var self, at: Int) {
+        self.u16((0xC000 | at) as UInt16)
+    }
+
+    func question(&var self) {
+        self.name()
+        self.u16(1)
+        self.u16(1)
+    }
+
+    /// A record's type, class, time to live and data length; its owner is
+    /// already written.
+    func record(&var self, kind: UInt16, class: UInt16, ttl: UInt32,
+                data_bytes: UInt16) {
+        self.u16(kind)
+        self.u16(class)
+        self.u32(ttl)
+        self.u16(data_bytes)
+    }
+
+    /// An A record for `example.com` by pointer.
+    func a_record(&var self, a: UInt8, b: UInt8, c: UInt8, d: UInt8, ttl: UInt32) {
+        self.ptr(12)
+        self.record(1, 1, ttl, 4)
+        self.u8(a)
+        self.u8(b)
+        self.u8(c)
+        self.u8(d)
+    }
+}
+
+func parse(w: &Wire) -> Result<Resolution, Refusal> {
+    example().parse(&w.bytes[..w.len], from_server())
+}
+
+func resolved(w: &Wire) -> Resolution {
+    try! parse(&w)
+}
+
+func refused(w: &Wire, why: Refusal, what: String) {
+    let r = parse(&w)
+    match r {
+        case Ok(_) -> check(false, what),
+        case Err(e) -> check(e == why, what),
+    }
+}
+
+func found(a: UInt8, b: UInt8, c: UInt8, d: UInt8, ttl: UInt32) -> Resolution {
+    Resolution.Found(Ipv4Addr(a, b, c, d), ttl)
+}
+
+// -----------------------------------------------------------------------------
+// Responses
+// -----------------------------------------------------------------------------
+
+func answers() {
+    // The golden response.
+    let golden = try! example().parse(&RESPONSE, from_server())
+    check(golden == found(93, 184, 216, 34, 300), "the golden response")
+
+    // The first A record is the answer, whatever follows.
+    var two = Wire.response(0x8180, 2)
+    two.a_record(10, 0, 0, 1, 60)
+    two.a_record(10, 0, 0, 2, 60)
+    check(resolved(&two) == found(10, 0, 0, 1, 60), "the first A record")
+
+    // Records that are not the answer come first, and are skipped: another
+    // owner, another class, another type.
+    var skip = Wire.response(0x8180, 4)
+    skip.label("other")
+    skip.u8(0)
+    skip.record(1, 1, 5, 4)
+    skip.u32(0x0909_0909)
+    skip.ptr(12)
+    skip.record(1, 3, 5, 4)
+    skip.u32(0x0808_0808)
+    skip.ptr(12)
+    skip.record(16, 1, 5, 3)
+    skip.u8(2)
+    skip.u8(0x68)
+    skip.u8(0x69)
+    skip.a_record(10, 0, 0, 3, 7)
+    check(resolved(&skip) == found(10, 0, 0, 3, 7), "records for others are skipped")
+
+    // Names compare without regard to case, in the question and in an owner.
+    var upper = Wire.empty()
+    upper.u16(0x1234)
+    upper.u16(0x8180)
+    upper.u16(1)
+    upper.u16(1)
+    upper.u16(0)
+    upper.u16(0)
+    upper.label("EXAMPLE")
+    upper.label("Com")
+    upper.u8(0)
+    upper.u16(1)
+    upper.u16(1)
+    upper.label("ExAmPlE")
+    upper.label("cOM")
+    upper.u8(0)
+    upper.record(1, 1, 9, 4)
+    upper.u32(0x0A00_0004)
+    check(resolved(&upper) == found(10, 0, 0, 4, 9), "names compare without regard to case")
+
+    // The authority and additional sections are not read.
+    var extra = Wire.response(0x8180, 1)
+    extra.a_record(10, 0, 0, 5, 1)
+    extra.u8(0xFF)
+    extra.u8(0xFF)
+    extra.u8(0xFF)
+    extra.bytes[8] = 0
+    extra.bytes[9] = 1
+    check(resolved(&extra) == found(10, 0, 0, 5, 1), "what follows the answers is not read")
+}
+
+func chains() {
+    // example.com CNAME www.example.com, and that one's A: the name of the
+    // CNAME's data is `www` and a pointer to the question's name; the A
+    // record's owner is a pointer to that data (offset 41).
+    var w = Wire.response(0x8180, 2)
+    w.ptr(12)
+    w.record(5, 1, 30, 6)
+    check(w.len == 41, "the CNAME's data is at 41")
+    w.label("www")
+    w.ptr(12)
+    w.ptr(41)
+    w.record(1, 1, 120, 4)
+    w.u32(0x0A00_0006)
+    check(resolved(&w) == found(10, 0, 0, 6, 120), "a CNAME to a name with an A record")
+
+    // The A record comes with the wrong owner: it is for a name the chain did
+    // not reach.
+    var wrong = Wire.response(0x8180, 2)
+    wrong.ptr(12)
+    wrong.record(5, 1, 30, 6)
+    wrong.label("www")
+    wrong.ptr(12)
+    wrong.ptr(12)
+    wrong.record(1, 1, 120, 4)
+    wrong.u32(0x0A00_0006)
+    check(resolved(&wrong) == Resolution.NoData,
+          "an A record for a name the chain did not reach is not the answer")
+
+    // A name that is its own CNAME and has no A record: no data, not a
+    // loop.
+    var cyc = Wire.response(0x8180, 1)
+    cyc.ptr(12)
+    cyc.record(5, 1, 30, 2)
+    cyc.ptr(12)
+    check(resolved(&cyc) == Resolution.NoData, "a CNAME to itself ends in no data")
+}
+
+func codes() {
+    var nx = Wire.response(0x8183, 0)
+    check(resolved(&nx) == Resolution.NoSuchName, "a name error")
+    var servfail = Wire.response(0x8182, 0)
+    check(resolved(&servfail) == Resolution.Failed(2), "a server failure")
+    var refused_code = Wire.response(0x8185, 0)
+    check(resolved(&refused_code) == Resolution.Failed(5), "a refusal")
+    var nodata = Wire.response(0x8180, 0)
+    check(resolved(&nodata) == Resolution.NoData, "a name with no records")
+
+    // The question is held to the query's before the response code is
+    // believed: a negative answer that does not repeat it is refused, so
+    // forging one takes more than the id.
+    var bare = Wire.empty()
+    bare.u16(0x1234)
+    bare.u16(0x8183)
+    bare.u16(0)
+    bare.u16(0)
+    bare.u16(0)
+    bare.u16(0)
+    refused(&bare, Refusal.BadQuestion, "a name error that repeats no question")
+    var twice = Wire.response(0x8183, 0)
+    twice.bytes[5] = 2
+    refused(&twice, Refusal.BadQuestion, "a name error with two questions")
+    var other = Wire.response(0x8183, 0)
+    other.bytes[13] = 0x64
+    refused(&other, Refusal.WrongQuestion, "a name error about another name")
+    var aaaa = Wire.response(0x8182, 0)
+    aaaa.bytes[26] = 28
+    refused(&aaaa, Refusal.BadQuestion, "a server failure for another type")
+    var id = Wire.response(0x8183, 0)
+    id.bytes[1] = 0x35
+    refused(&id, Refusal.WrongId, "a name error for another id")
+}
+
+func sources() {
+    let w = Wire.response(0x8180, 0)
+    let q = example()
+    check(try! q.parse(&w.bytes[..w.len], from_server()) == Resolution.NoData,
+          "from the server")
+    let elsewhere = SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 54), port: 53)
+    let r1 = q.parse(&w.bytes[..w.len], elsewhere)
+    match r1 {
+        case Ok(_) -> check(false, "from another address"),
+        case Err(e) -> check(e == Refusal.WrongSource, "from another address"),
+    }
+    let off_port = SocketAddr(addr: server(), port: 5353)
+    let r2 = q.parse(&w.bytes[..w.len], off_port)
+    match r2 {
+        case Ok(_) -> check(false, "from another port"),
+        case Err(e) -> check(e == Refusal.WrongSource, "from another port"),
+    }
+}
+
+/// A response whose one A record's owner is a chain of pointers `jumps` long:
+/// the first record carries `jumps - 1` pointer cells in its data, each to the
+/// one before and the first to the question's name, and the owner points at
+/// the last cell.
+func chain(jumps: Int) -> Wire {
+    var w = Wire.response(0x8180, 2)
+    // A TXT record, owned by the question's name, holding the cells.
+    w.ptr(12)
+    w.record(16, 1, 1, ((jumps - 1) * 2) as UInt16)
+    let first = w.len
+    var k = 0
+    while k < jumps - 1 {
+        if k == 0 {
+            w.ptr(12)
+        } else {
+            w.ptr(first + (k - 1) * 2)
+        }
+        k = k + 1
+    }
+    w.ptr(first + (jumps - 2) * 2)
+    w.record(1, 1, 5, 4)
+    w.u32(0x0A00_0009)
+    w
+}
+
+func jump_limit() {
+    // Exactly `MAX_JUMPS` pointers are followed; one more is refused.
+    var ok = chain(16)
+    check(resolved(&ok) == found(10, 0, 0, 9, 5), "a name of 16 pointers")
+    var one = chain(1 + 1)
+    check(resolved(&one) == found(10, 0, 0, 9, 5), "a name of 2 pointers")
+    var past = chain(17)
+    refused(&past, Refusal.BadPointer, "a name of 17 pointers")
+}
+
+func refusals() {
+    // The header.
+    var short = Wire.response(0x8180, 1)
+    short.len = 11
+    refused(&short, Refusal.Truncated, "a header cut short")
+    var id = Wire.response(0x8180, 0)
+    id.bytes[1] = 0x35
+    refused(&id, Refusal.WrongId, "another query's id")
+    var query = Wire.response(0x0100, 0)
+    refused(&query, Refusal.NotResponse, "a query, not a response")
+    var opcode = Wire.response(0x8980, 0)
+    refused(&opcode, Refusal.BadOpcode, "an opcode that is not a query's")
+    var cut = Wire.response(0x8380, 0)
+    refused(&cut, Refusal.Cut, "a response the server cut")
+
+    // The question.
+    var none = Wire.response(0x8180, 0)
+    none.bytes[5] = 0
+    refused(&none, Refusal.BadQuestion, "no question")
+    var twice = Wire.response(0x8180, 0)
+    twice.bytes[5] = 2
+    refused(&twice, Refusal.BadQuestion, "two questions")
+    var aaaa = Wire.response(0x8180, 0)
+    aaaa.bytes[26] = 28
+    refused(&aaaa, Refusal.BadQuestion, "a question of another type")
+    var chaos = Wire.response(0x8180, 0)
+    chaos.bytes[28] = 3
+    refused(&chaos, Refusal.BadQuestion, "a question of another class")
+    var name = Wire.response(0x8180, 0)
+    name.bytes[13] = 0x64
+    refused(&name, Refusal.WrongQuestion, "a question about another name")
+    var cutq = Wire.response(0x8180, 0)
+    cutq.len = 27
+    refused(&cutq, Refusal.Truncated, "a question cut short")
+    var cutname = Wire.response(0x8180, 0)
+    cutname.len = 20
+    refused(&cutname, Refusal.Truncated, "a question's name cut short")
+
+    // The records.
+    var missing = Wire.response(0x8180, 2)
+    missing.label("other")
+    missing.u8(0)
+    missing.record(1, 1, 1, 4)
+    missing.u32(0x0A00_0001)
+    refused(&missing, Refusal.Truncated, "two records announced, one sent")
+    var rdata = Wire.response(0x8180, 1)
+    rdata.ptr(12)
+    rdata.record(16, 1, 1, 9)
+    rdata.u8(0)
+    refused(&rdata, Refusal.Truncated, "data past the end")
+    var header = Wire.response(0x8180, 1)
+    header.ptr(12)
+    header.u16(1)
+    header.u16(1)
+    refused(&header, Refusal.Truncated, "a record cut inside its fixed fields")
+    var a3 = Wire.response(0x8180, 1)
+    a3.ptr(12)
+    a3.record(1, 1, 1, 3)
+    a3.u8(1)
+    a3.u8(2)
+    a3.u8(3)
+    refused(&a3, Refusal.BadRecord, "an A record of three bytes")
+    var a5 = Wire.response(0x8180, 1)
+    a5.ptr(12)
+    a5.record(1, 1, 1, 5)
+    a5.u32(0x0A00_0001)
+    a5.u8(0)
+    refused(&a5, Refusal.BadRecord, "an A record of five bytes")
+    var zero = Wire.response(0x8180, 1)
+    zero.a_record(0, 0, 0, 0, 1)
+    refused(&zero, Refusal.BadAddress, "an address of 0.0.0.0")
+    var group = Wire.response(0x8180, 1)
+    group.a_record(224, 0, 0, 1, 1)
+    refused(&group, Refusal.BadAddress, "a multicast address")
+    var all = Wire.response(0x8180, 1)
+    all.a_record(255, 255, 255, 255, 1)
+    refused(&all, Refusal.BadAddress, "the limited broadcast")
+    // A CNAME whose name runs past its data.
+    var rec = Wire.response(0x8180, 1)
+    rec.ptr(12)
+    rec.record(5, 1, 1, 3)
+    rec.label("www")
+    rec.ptr(12)
+    refused(&rec, Refusal.BadRecord, "a CNAME's name past its data")
+}
+
+func names() {
+    // A label of a kind that does not exist: the top bits 01 and 10.
+    var ext = Wire.response(0x8180, 1)
+    ext.u8(0x41)
+    ext.u8(0)
+    refused(&ext, Refusal.BadLabel, "an extended label")
+    var res = Wire.response(0x8180, 1)
+    res.u8(0x81)
+    res.u8(0)
+    refused(&res, Refusal.BadLabel, "a reserved label")
+
+    // Pointers: forward, to itself, past the message, in a loop.
+    var forward = Wire.response(0x8180, 1)
+    forward.u8(0xC0)
+    forward.u8(0xFF)
+    refused(&forward, Refusal.BadPointer, "a pointer past the message")
+    var ahead = Wire.response(0x8180, 1)
+    ahead.ptr(31)
+    ahead.u8(0)
+    refused(&ahead, Refusal.BadPointer, "a pointer forward")
+    var itself = Wire.response(0x8180, 1)
+    itself.ptr(29)
+    refused(&itself, Refusal.BadPointer, "a pointer to itself")
+    // A label and then a pointer back to the label: a loop with bytes in it.
+    var cycle = Wire.response(0x8180, 1)
+    cycle.u8(1)
+    cycle.u8(0x61)
+    cycle.ptr(29)
+    refused(&cycle, Refusal.BadPointer, "a loop of a label and a pointer")
+    // A pointer at the end of the message, its second byte missing.
+    var half = Wire.response(0x8180, 1)
+    half.u8(0xC0)
+    refused(&half, Refusal.Truncated, "half a pointer")
+    // A label running past the message.
+    var runs = Wire.response(0x8180, 1)
+    runs.u8(5)
+    runs.u8(0x61)
+    refused(&runs, Refusal.Truncated, "a label past the message")
+    // No end to a name.
+    var open = Wire.response(0x8180, 1)
+    open.u8(1)
+    open.u8(0x61)
+    refused(&open, Refusal.Truncated, "a name that does not end")
+
+    // A name past 255 bytes once decoded: four labels of 63 bytes in the
+    // question itself.
+    var long = Wire.empty()
+    long.u16(0x1234)
+    long.u16(0x8180)
+    long.u16(1)
+    long.u16(0)
+    long.u16(0)
+    long.u16(0)
+    var k = 0
+    while k < 4 {
+        long.u8(63)
+        var i = 0
+        while i < 63 {
+            long.u8(0x61)
+            i = i + 1
+        }
+        k = k + 1
+    }
+    long.u8(0)
+    long.u16(1)
+    long.u16(1)
+    refused(&long, Refusal.NameTooLong, "a name past 255 bytes")
+
+    // The same, reached through a pointer: an owner whose labels, with the
+    // question's name behind them, pass 255.
+    var through = Wire.response(0x8180, 1)
+    var j = 0
+    while j < 3 {
+        through.u8(63)
+        var i = 0
+        while i < 63 {
+            through.u8(0x62)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    through.u8(60)
+    var i = 0
+    while i < 60 {
+        through.u8(0x62)
+        i = i + 1
+    }
+    through.ptr(12)
+    refused(&through, Refusal.NameTooLong, "a name too long behind a pointer")
+}
+
+func main() {
+    naming()
+    name_refusals()
+    answers()
+    chains()
+    codes()
+    sources()
+    jump_limit()
+    refusals()
+    names()
+}

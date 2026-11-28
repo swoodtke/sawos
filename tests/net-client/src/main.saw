@@ -28,13 +28,25 @@
 //!   - `wait_abandoned`     a held `WaitEvent` whose claim is dropped.
 //!   - `greeted`            a frame the peer sends before the client has said
 //!                          anything.
+//!   - `dhcp`               a DHCP client with no address gets a lease from
+//!                          the peer, configures the stack with it, and pings
+//!                          the router it names.
+//!   - `dhcp_retry`         the same, against a peer that does not answer the
+//!                          first DISCOVER: the client sends another.
+//!   - `dns`                three names asked of the peer's DNS server: two it
+//!                          knows (one by a CNAME) and one it does not.
 //!
-//! Nothing here keeps time: every stack call is given `now = 0`, and `poll`
-//! is never called. Each wait is on an event the driver sends for something
-//! that already happened, or on a reply the peer sends to a frame this
-//! program sent.
+//! Nothing here keeps time but `dhcp_retry`: every stack call is given
+//! `now = 0`, and `poll` is never called. Each wait is on an event the driver
+//! sends for something that already happened, or on a reply the peer sends to
+//! a frame this program sent. The DHCP scenarios give the DHCP client a time
+//! of its own, 0 for `dhcp`, whose client therefore never retransmits.
+//! `dhcp_retry` reads the clock until it has sent a second DISCOVER, and
+//! gives the client that time from then on: it never reads the clock again, so
+//! no other message is retransmitted and nothing it prints depends on how long
+//! anything took.
 
-import sos.{BootSet, Heap, MapAccess, Memory, MemoryRight, PipeHandles, PipeInlet, PipeMsg,
+import sos.{BootSet, Clock, Heap, MapAccess, Memory, MemoryRight, PipeHandles, PipeInlet, PipeMsg,
             PipeReply, SosStatus, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
 import pktring.{Endpoint, Layout, Ring, RingError, Shared, SharedWindow, SlotRange}
 import netdevproto.{AttachInfo, BODY_BYTES, Frame, NetdevBody, NetdevError, NetdevEvent,
@@ -43,6 +55,10 @@ import netdevproto.{AttachInfo, BODY_BYTES, Frame, NetdevBody, NetdevError, Netd
 import netstack.{Config, DROP_KINDS, Delivery, Drop, Ipv4Addr, MacAddr, Sink, SinkError,
                  SocketAddr, Stack}
 import netstack.bytes.{put_bytes}
+import netstack.dhcp
+import netstack.dhcp.{Client, Lease, Step}
+import netstack.dns
+import netstack.dns.{Query, Resolution}
 import netcase.{name}
 import sosmain
 
@@ -73,6 +89,9 @@ static PAGE: UInt = 0x1000
 /// The datagrams a burst asks for, and the port the client listens on.
 static BURST: UInt16 = 20
 static LISTEN_PORT: UInt16 = 5000
+
+/// The most a datagram kept for a scenario holds.
+static DATAGRAM_BYTES: Int = 600
 
 /// The echo port the peer's `burst` script answers.
 static BURST_PORT: UInt16 = 7
@@ -263,6 +282,13 @@ struct Link {
     wrong: Bool,
     /// The first failure a transmit met, which the stack cannot carry.
     failed: Failure?,
+    /// Whether a datagram is kept (`datagram`, from `datagram_from`, and
+    /// `heard`) rather than counted as one of a burst.
+    capture: Bool,
+    heard: Bool,
+    datagram: [UInt8; DATAGRAM_BYTES],
+    datagram_len: Int,
+    datagram_from: SocketAddr,
 }
 
 extension Link: NoCopy {}
@@ -425,7 +451,18 @@ extension Link: Sink {
                 self.reply_from = from
                 self.reply_bytes = data.len()
             },
-            case Datagram(_, _) -> self.hears(&data),
+            case Datagram(_, from) -> {
+                if self.capture {
+                    if data.len() <= DATAGRAM_BYTES {
+                        put_bytes(&var self.datagram, 0, &data)
+                        self.datagram_len = data.len()
+                        self.datagram_from = from
+                        self.heard = true
+                    }
+                } else {
+                    self.hears(&data)
+                }
+            },
         }
         return
     }
@@ -504,6 +541,9 @@ func scenario(inlet: PipeInlet) -> Int {
     if which.equals("client_dies") { return client_dies(&var link) }
     if which.equals("wait_abandoned") { return wait_abandoned(&var link) }
     if which.equals("greeted") { return greeted(&var link) }
+    if which.equals("dhcp") { return dhcp_flow(&var link, false) }
+    if which.equals("dhcp_retry") { return dhcp_flow(&var link, true) }
+    if which.equals("dns") { return dns_flow(&var link) }
     no_scenario(which)
 }
 
@@ -587,7 +627,9 @@ func take_ring(reply: &var PipeMsg, info: &AttachInfo, inlet: PipeInlet) -> Resu
     return Link(inlet: move inlet, end: Endpoint.client_given(window, shape), raw: raw,
                 shape: shape, ring: move ring, mac: info.mac, replied: 0,
                 reply_from: Ipv4Addr.unspecified(), reply_bytes: 0, datagrams: 0, wrong: false,
-                failed: None)
+                failed: None, capture: false, heard: false, datagram: [0; DATAGRAM_BYTES],
+                datagram_len: 0,
+                datagram_from: SocketAddr(addr: Ipv4Addr.unspecified(), port: 0))
 }
 
 /// `Attach` of `to_server` and `to_client` slots, and the ring in its reply
@@ -661,8 +703,13 @@ func start_stack(l: &var Link) -> Result<Box<Stack>, Int> {
 /// counts.
 func ping_flow(l: &var Link, pings: UInt16) -> Int {
     var stack = try start_stack(&var l) catch { return error }
-    let peer = Ipv4Addr(10, 0, 2, 2)
-    report_pinging(Ipv4Addr(10, 0, 2, 15), peer)
+    ping_peer(&var l, &var stack.value(), Ipv4Addr(10, 0, 2, 15), Ipv4Addr(10, 0, 2, 2), pings)
+}
+
+/// `pings` echo requests from `guest` to `peer` through `stack`, each answered
+/// before the next, and the counts.
+func ping_peer(l: &var Link, stack: &var Stack, guest: Ipv4Addr, peer: Ipv4Addr, pings: UInt16) -> Int {
+    report_pinging(guest, peer)
     var data: [UInt8; ECHO_BYTES] = [0; ECHO_BYTES]
     var i = 0
     while i < ECHO_BYTES {
@@ -671,17 +718,17 @@ func ping_flow(l: &var Link, pings: UInt16) -> Int {
     }
     var k: UInt16 = 1
     while k <= pings {
-        try stack.value().ping(peer, IDENT, k, &data, 0, &var l) catch {
+        try stack.ping(peer, IDENT, k, &data, 0, &var l) catch {
             return failed("ping", &error)
         }
         if let f = l.failed.take() { return failed("ping", &f) }
-        try await_reply(&var l, &var stack.value(), k) catch { return error }
+        try await_reply(&var l, &var stack, k) catch { return error }
         report_reply(k, &l)
         k = k + 1
     }
     let stats = try driver_stats(&l) catch { return error }
     report_stats(&stats)
-    report_drops(drops(&stack.value()))
+    report_drops(drops(&stack))
     EXIT_OK
 }
 
@@ -1001,4 +1048,149 @@ func mac_at(frame: &[UInt8; SLOT], at: Int) -> [UInt8; 6] {
         i = i + 1
     }
     octets
+}
+
+// =============================================================================
+// DHCP and DNS
+// =============================================================================
+
+func report_lease(lease: &Lease) {
+    print("SOS netclient: dhcp lease {} netmask {} router {} dns {} server {} for {} s",
+          IpText(addr: lease.config.addr()), IpText(addr: lease.config.netmask()),
+          IpText(addr: lease.config.gateway()), IpText(addr: lease.dns),
+          IpText(addr: lease.server), lease.lease_secs)
+}
+
+/// The time on the process's clock, in milliseconds.
+func now_ms(clock: &Clock) -> Result<UInt64, Int> {
+    let ns = try clock.now() catch { return failed("the clock", &error) }
+    return ns / 1_000_000
+}
+
+/// A DHCP client with no address, driven until it holds a lease: what it asks
+/// for is sent from the stack (from 0.0.0.0, to the broadcast), what arrives
+/// is handed to it, and the stack is configured with the lease. The loop
+/// yields between looks at the ring, so the driver runs to fill it, and no
+/// step waits on an event or on the clock.
+///
+/// The client's time is 0 unless `timed`, so it never retransmits. A timed
+/// client reads the clock until its second DISCOVER has gone, and then keeps
+/// that time.
+func dhcp_flow(l: &var Link, timed: Bool) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try boxed_stack(MacAddr(octets: l.mac)) catch {
+        return failed_plainly("no room for the stack")
+    }
+    let socket = try stack.value().udp_open(dhcp.CLIENT_PORT) catch {
+        return failed("udp_open", &error)
+    }
+    l.capture = true
+    let clock = try sosmain.context().system().clock_get() catch { return failed("the clock", &error) }
+    let me = try sosmain.context().process().thread_self() catch { return failed("thread", &error) }
+    var client = Client(MacAddr(octets: l.mac), 0x5AF0_0000, 200)
+    var out: [UInt8; dhcp.MESSAGE_BYTES] = [0; dhcp.MESSAGE_BYTES]
+    var frozen = false
+    var held: UInt64 = 0
+    while {
+        var now: UInt64 = 0
+        if timed {
+            now = if frozen { held } else { try now_ms(&clock) catch { return error } }
+        }
+        let step = client.poll(now, &var out)
+        match step {
+            case Send(len, to) -> {
+                let dest = SocketAddr(addr: to, port: dhcp.SERVER_PORT)
+                try stack.value().udp_send(socket.id, dest, &out[..len], 0, &var l) catch {
+                    return failed("udp_send", &error)
+                }
+                if let f = l.failed.take() { return failed("transmit", &f) }
+                if timed && not frozen && client.attempts() >= 2 {
+                    frozen = true
+                    held = now
+                    print("SOS netclient: dhcp: no offer, discover sent again")
+                }
+            },
+            case Lost -> { return failed_plainly("dhcp: the lease was lost") },
+            case _ -> {},
+        }
+        try l.receive_all(&var stack.value()) catch { return failed("receive", &error) }
+        if let f = l.failed.take() { return failed("transmit", &f) }
+        if l.heard {
+            l.heard = false
+            let got = try client.receive(now, &l.datagram[..l.datagram_len],
+                                       l.datagram_from.addr) catch {
+                return failed("dhcp: a reply was refused", &error)
+            }
+            match got {
+                case Leased(lease) -> {
+                    report_lease(&lease)
+                    stack.value().configure(lease.config, &var l)
+                    if let f = l.failed.take() { return failed("announce", &f) }
+                    return ping_peer(&var l, &var stack.value(), lease.config.addr(),
+                                     lease.config.gateway(), 1)
+                },
+                case _ -> {},
+            }
+        }
+        try me.yield_now() catch { return failed("yield", &error) }
+    }
+}
+
+/// Asks the DNS server `server` for `text`'s address with id `id`, from socket
+/// `socket`, waits for the datagram that comes back and says what it holds.
+func resolve(l: &var Link, stack: &var Stack, socket: UInt8, server: Ipv4Addr, id: UInt16,
+             text: &Text) -> Result<Void, Int> {
+    let query = try Query(id, server, &text.bytes[..text.len]) catch { return failed("a name", &error) }
+    var out: [UInt8; dns.MAX_QUERY_BYTES] = [0; dns.MAX_QUERY_BYTES]
+    let n = query.write(&var out)
+    l.heard = false
+    try stack.udp_send(socket, SocketAddr(addr: server, port: dns.PORT), &out[..n], 0, &var l) catch {
+        return failed("udp_send", &error)
+    }
+    if let f = l.failed.take() { return failed("transmit", &f) }
+    while not l.heard {
+        let event = try l.wait_event() catch { return failed("wait_event", &error) }
+        match event {
+            case RxReady(_) -> {
+                try l.receive_all(&var stack) catch { return failed("receive", &error) }
+                if let f = l.failed.take() { return failed("transmit", &f) }
+            },
+            case _ -> {},
+        }
+    }
+    let said = try query.parse(&l.datagram[..l.datagram_len], l.datagram_from) catch {
+        return failed("dns: a response was refused", &error)
+    }
+    match said {
+        case Found(address, ttl) -> {
+            print("SOS netclient: dns {} is {}, ttl {}", text, IpText(addr: address), ttl)
+        },
+        case NoSuchName -> print("SOS netclient: dns {}: no such name", text),
+        case NoData -> { return failed_plainly("dns: no data") },
+        case Failed(code) -> { return failed("dns: the server failed", &code) },
+    }
+    return
+}
+
+/// Three names asked of the peer's DNS server, 10.0.2.2, from an ephemeral
+/// port: one it has, one it has by a CNAME, and one it does not have.
+func dns_flow(l: &var Link) -> Int {
+    try link_up(&l) catch { return error }
+    var stack = try start_stack(&var l) catch { return error }
+    l.capture = true
+    let socket = try stack.value().udp_open(0) catch { return failed("udp_open", &error) }
+    let server = Ipv4Addr(10, 0, 2, 2)
+    var known = Text(bytes: [0; 64], len: 0)
+    put_text(&var known, "sawos.test")
+    var alias = Text(bytes: [0; 64], len: 0)
+    put_text(&var alias, "alias.sawos.test")
+    var absent = Text(bytes: [0; 64], len: 0)
+    put_text(&var absent, "nope.test")
+    try resolve(&var l, &var stack.value(), socket.id, server, 0x1001, &known) catch { return error }
+    try resolve(&var l, &var stack.value(), socket.id, server, 0x1002, &alias) catch { return error }
+    try resolve(&var l, &var stack.value(), socket.id, server, 0x1003, &absent) catch { return error }
+    let stats = try driver_stats(&l) catch { return error }
+    report_stats(&stats)
+    report_drops(drops(&stack.value()))
+    EXIT_OK
 }

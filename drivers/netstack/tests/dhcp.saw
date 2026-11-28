@@ -1,0 +1,1050 @@
+// The DHCP client: the messages it builds against golden bytes written out
+// from RFC 2131's layout, the replies it parses and each reason it refuses
+// one, and the state machine's every transition driven by the time the test
+// gives it.
+//
+// The client is 02:00:00:00:00:0a, whose first transaction id is
+// 0x12345678, so its first exchange is 0x12345679. The server is 10.0.0.2,
+// and offers 10.0.0.1/24 with the router 10.0.0.254 and the DNS server
+// 10.0.0.53 for an hour.
+
+import netstack.addr.{Ipv4Addr, MacAddr}
+import netstack.dhcp
+import netstack.dhcp.{Client, Lease, MessageType, Refusal, Reply, State, Step}
+import netstack.ipv4.{Config, ConfigError}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func ip_server() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func ip_other() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 3) }
+func ip_lease() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_router() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 254) }
+func ip_dns() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 53) }
+func mask24() -> Ipv4Addr { Ipv4Addr(a: 255, b: 255, c: 255, d: 0) }
+func bcast() -> Ipv4Addr { Ipv4Addr.broadcast() }
+
+static XID: UInt32 = 0x1234_5679
+static HOUR: UInt32 = 3600
+
+func the_lease(secs: UInt32) -> Lease {
+    let config = try! Config(addr: ip_lease(), netmask: mask24(),
+                             gateway: ip_router())
+    Lease(config: config, server: ip_server(), dns: ip_dns(), lease_secs: secs)
+}
+
+// -----------------------------------------------------------------------------
+// Golden messages
+// -----------------------------------------------------------------------------
+
+/// The 16 bytes from `op` to `ciaddr` of the first DISCOVER: a request on
+/// Ethernet, transaction 0x12345679, no seconds, the broadcast flag.
+static DISCOVER_HEAD: [UInt8; 16] = [
+    0x01, 0x01, 0x06, 0x00, 0x12, 0x34, 0x56, 0x79,
+    0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+]
+
+/// DISCOVER's options: the type, a parameter request list of the mask,
+/// router and DNS server, and the end.
+static DISCOVER_OPTIONS: [UInt8; 9] = [
+    0x35, 0x01, 0x01, 0x37, 0x03, 0x01, 0x03, 0x06, 0xFF,
+]
+
+/// The REQUEST that answers an OFFER of 10.0.0.1 from 10.0.0.2: the
+/// requested address and the server's identifier ride in options.
+static REQUEST_OPTIONS: [UInt8; 21] = [
+    0x35, 0x01, 0x03,
+    0x32, 0x04, 0x0A, 0x00, 0x00, 0x01,
+    0x36, 0x04, 0x0A, 0x00, 0x00, 0x02,
+    0x37, 0x03, 0x01, 0x03, 0x06, 0xFF,
+]
+
+/// A renewal's head: transaction 0x1234567A, no broadcast flag, ciaddr
+/// 10.0.0.1; its options are a bare REQUEST's.
+static RENEW_HEAD: [UInt8; 16] = [
+    0x01, 0x01, 0x06, 0x00, 0x12, 0x34, 0x56, 0x7A,
+    0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+]
+
+static RENEW_OPTIONS: [UInt8; 9] = [
+    0x35, 0x01, 0x03, 0x37, 0x03, 0x01, 0x03, 0x06, 0xFF,
+]
+
+/// The server's reply head, to 0x12345679, with yiaddr 10.0.0.1.
+static REPLY_HEAD: [UInt8; 20] = [
+    0x02, 0x01, 0x06, 0x00, 0x12, 0x34, 0x56, 0x79,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0A, 0x00, 0x00, 0x01,
+]
+
+/// An OFFER's options: type 2, server 10.0.0.2, lease 3600 s, mask
+/// 255.255.255.0, router 10.0.0.254, DNS 10.0.0.53.
+static OFFER_OPTIONS: [UInt8; 34] = [
+    0x35, 0x01, 0x02,
+    0x36, 0x04, 0x0A, 0x00, 0x00, 0x02,
+    0x33, 0x04, 0x00, 0x00, 0x0E, 0x10,
+    0x01, 0x04, 0xFF, 0xFF, 0xFF, 0x00,
+    0x03, 0x04, 0x0A, 0x00, 0x00, 0xFE,
+    0x06, 0x04, 0x0A, 0x00, 0x00, 0x35,
+    0xFF,
+]
+
+static ACK_OPTIONS: [UInt8; 34] = [
+    0x35, 0x01, 0x05,
+    0x36, 0x04, 0x0A, 0x00, 0x00, 0x02,
+    0x33, 0x04, 0x00, 0x00, 0x0E, 0x10,
+    0x01, 0x04, 0xFF, 0xFF, 0xFF, 0x00,
+    0x03, 0x04, 0x0A, 0x00, 0x00, 0xFE,
+    0x06, 0x04, 0x0A, 0x00, 0x00, 0x35,
+    0xFF,
+]
+
+static NAK_OPTIONS: [UInt8; 10] = [
+    0x35, 0x01, 0x06, 0x36, 0x04, 0x0A, 0x00, 0x00, 0x02, 0xFF,
+]
+
+/// `head` from byte 0, the client's hardware address at 28, the cookie at
+/// 236 and `options` at 240, in 300 bytes of zeros.
+func golden(head: &[UInt8], options: &[UInt8]) -> [UInt8; 300] {
+    var m: [UInt8; 300] = [0; 300]
+    var i = 0
+    while i < head.len() {
+        m[i] = head[i]
+        i = i + 1
+    }
+    m[28] = 0x02
+    m[33] = 0x0A
+    m[236] = 0x63
+    m[237] = 0x82
+    m[238] = 0x53
+    m[239] = 0x63
+    i = 0
+    while i < options.len() {
+        m[240 + i] = options[i]
+        i = i + 1
+    }
+    m
+}
+
+/// The bytes of `a` and `b`, the same.
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// -----------------------------------------------------------------------------
+// A reply written one option at a time
+// -----------------------------------------------------------------------------
+
+static MSG_BYTES: Int = 400
+
+struct Msg {
+    bytes: [UInt8; MSG_BYTES],
+    len: Int,
+}
+
+extension Msg {
+    /// A reply to `xid` for client `mac_a`, with yiaddr `yiaddr`, and no
+    /// options yet.
+    static func reply(xid: UInt32, yiaddr: UInt32) -> Msg {
+        var m = Msg(bytes: [0; MSG_BYTES], len: 240)
+        m.bytes[0] = 2
+        m.bytes[1] = 1
+        m.bytes[2] = 6
+        m.put32(4, xid)
+        m.put32(16, yiaddr)
+        m.bytes[28] = 0x02
+        m.bytes[33] = 0x0A
+        m.put32(236, 0x6382_5363)
+        m
+    }
+
+    /// An OFFER or ACK as the golden ones are.
+    static func grant(kind: UInt8, xid: UInt32) -> Msg {
+        Msg.grant_for(kind, xid, 3600)
+    }
+
+    /// `grant`, for a lease of `secs`.
+    static func grant_for(kind: UInt8, xid: UInt32, secs: UInt32) -> Msg {
+        var m = Msg.reply(xid, 0x0A00_0001)
+        m.opt_u8(53, kind)
+        m.opt_u32(54, 0x0A00_0002)
+        m.opt_u32(51, secs)
+        m.opt_u32(1, 0xFFFF_FF00)
+        m.opt_u32(3, 0x0A00_00FE)
+        m.opt_u32(6, 0x0A00_0035)
+        m.end()
+        m
+    }
+
+    func put32(&var self, at: Int, v: UInt32) {
+        self.bytes[at] = ((v >> 24) & 0xFF) as UInt8
+        self.bytes[at + 1] = ((v >> 16) & 0xFF) as UInt8
+        self.bytes[at + 2] = ((v >> 8) & 0xFF) as UInt8
+        self.bytes[at + 3] = (v & 0xFF) as UInt8
+    }
+
+    func opt_u8(&var self, code: UInt8, v: UInt8) {
+        self.bytes[self.len] = code
+        self.bytes[self.len + 1] = 1
+        self.bytes[self.len + 2] = v
+        self.len = self.len + 3
+    }
+
+    func opt_u32(&var self, code: UInt8, v: UInt32) {
+        self.bytes[self.len] = code
+        self.bytes[self.len + 1] = 4
+        self.put32(self.len + 2, v)
+        self.len = self.len + 6
+    }
+
+    /// An option of `code` whose length byte says `len`, its value bytes all
+    /// 0x0A.
+    func opt_len(&var self, code: UInt8, len: Int) {
+        self.bytes[self.len] = code
+        self.bytes[self.len + 1] = len as UInt8
+        var i = 0
+        while i < len {
+            self.bytes[self.len + 2 + i] = 0x0A
+            i = i + 1
+        }
+        self.len = self.len + 2 + len
+    }
+
+    func pad(&var self) {
+        self.bytes[self.len] = 0
+        self.len = self.len + 1
+    }
+
+    func end(&var self) {
+        self.bytes[self.len] = 255
+        self.len = self.len + 1
+    }
+}
+
+func parse(m: &Msg) -> Result<Reply, Refusal> {
+    dhcp.parse_reply(&m.bytes[..m.len], mac_a(), XID)
+}
+
+/// The reply `m` holds, which the test says is well formed.
+func parsed(m: &Msg) -> Reply {
+    try! parse(&m)
+}
+
+func refused(m: &Msg, why: Refusal, what: String) {
+    let r = parse(&m)
+    match r {
+        case Ok(_) -> check(false, what),
+        case Err(e) -> check(e == why, what),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Messages
+// -----------------------------------------------------------------------------
+
+func building() {
+    var out: [UInt8; 300] = [0xEE; 300]
+    // The first DISCOVER, byte for byte, over a buffer that held other bytes.
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let s = c.poll(0, &var out)
+    check(s == Step.Send(300, bcast()), "the DISCOVER is 300 bytes to the broadcast")
+    let expected = golden(&DISCOVER_HEAD, &DISCOVER_OPTIONS)
+    check(same(&out, &expected), "the DISCOVER, byte for byte")
+
+    // The REQUEST of the selecting state.
+    let offer = Msg.grant(2, XID)
+    let r = try! c.receive(5, &offer.bytes[..offer.len], ip_server())
+    check(r == Step.Idle, "an OFFER is taken")
+    let s2 = c.poll(5, &var out)
+    check(s2 == Step.Send(300, bcast()), "the REQUEST is broadcast")
+    let expected2 = golden(&DISCOVER_HEAD, &REQUEST_OPTIONS)
+    check(same(&out, &expected2), "the REQUEST, byte for byte")
+}
+
+func parsing() {
+    let offer = parse_static(&OFFER_OPTIONS)
+    check(offer == Reply.Offer(the_lease(HOUR)), "the golden OFFER")
+    let ack = parse_static(&ACK_OPTIONS)
+    check(ack == Reply.Ack(the_lease(HOUR)), "the golden ACK")
+    let nak = parse_static(&NAK_OPTIONS)
+    check(nak == Reply.Nak(ip_server()), "the golden NAK")
+
+    // Pad options anywhere, an option of no interest, and the end before the
+    // bytes do: all accepted.
+    var m = Msg.reply(XID, 0x0A00_0001)
+    m.pad()
+    m.opt_u8(53, 2)
+    m.pad()
+    m.pad()
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_len(15, 7)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.opt_u32(3, 0x0A00_00FE)
+    m.end()
+    m.pad()
+    m.pad()
+    let want = Lease(config: the_lease(HOUR).config, server: ip_server(),
+                     dns: Ipv4Addr.unspecified(), lease_secs: HOUR)
+    check(parsed(&m) == Reply.Offer(want), "pads, an unknown option, and bytes after the end")
+
+    // With no router, no DNS server: the lease says so.
+    var n = Msg.reply(XID, 0x0A00_0001)
+    n.opt_u8(53, 5)
+    n.opt_u32(54, 0x0A00_0002)
+    n.opt_u32(51, 0xFFFF_FFFF)
+    n.opt_u32(1, 0xFFFF_FF00)
+    n.end()
+    let bare = Lease(config: try! Config(addr: ip_lease(), netmask: mask24(),
+                                         gateway: Ipv4Addr.unspecified()),
+                     server: ip_server(), dns: Ipv4Addr.unspecified(),
+                     lease_secs: dhcp.INFINITE_SECS)
+    check(parsed(&n) == Reply.Ack(bare), "an ACK with no router or DNS server")
+
+    // The first of several routers, and of several DNS servers.
+    var many = Msg.reply(XID, 0x0A00_0001)
+    many.opt_u8(53, 2)
+    many.opt_u32(54, 0x0A00_0002)
+    many.opt_u32(51, 60)
+    many.opt_u32(1, 0xFFFF_FF00)
+    many.bytes[many.len] = 3
+    many.bytes[many.len + 1] = 8
+    many.put32(many.len + 2, 0x0A00_00FE)
+    many.put32(many.len + 6, 0x0A00_0003)
+    many.len = many.len + 10
+    many.bytes[many.len] = 6
+    many.bytes[many.len + 1] = 8
+    many.put32(many.len + 2, 0x0A00_0035)
+    many.put32(many.len + 6, 0x0A00_0036)
+    many.len = many.len + 10
+    many.end()
+    check(parsed(&many) == Reply.Offer(Lease(config: the_lease(60).config,
+                                            server: ip_server(), dns: ip_dns(),
+                                            lease_secs: 60)),
+          "the first router and the first DNS server")
+}
+
+/// A reply of `options` after the golden reply head.
+func parse_static(options: &[UInt8]) -> Reply {
+    let m = golden(&REPLY_HEAD, &options)
+    try! dhcp.parse_reply(&m[..(240 + options.len())], mac_a(), XID)
+}
+
+func refusals() {
+    // The length: the fixed header and the cookie.
+    let whole = Msg.grant(2, XID)
+    refused_slice(&whole, 0, Refusal.Truncated, "an empty datagram")
+    refused_slice(&whole, 239, Refusal.Truncated, "a datagram a byte short of the cookie")
+    refused_slice(&whole, 240, Refusal.BadOption, "no options at all")
+
+    var m = Msg.grant(2, XID)
+    m.bytes[0] = 1
+    refused(&m, Refusal.NotReply, "a request, not a reply")
+    m = Msg.grant(2, XID)
+    m.bytes[1] = 6
+    refused(&m, Refusal.BadHardware, "another hardware type")
+    m = Msg.grant(2, XID)
+    m.bytes[2] = 8
+    refused(&m, Refusal.BadHardware, "another hardware address length")
+    m = Msg.grant(2, XID + 1)
+    refused(&m, Refusal.WrongXid, "another transaction")
+    m = Msg.grant(2, XID)
+    m.bytes[33] = 0x0B
+    refused(&m, Refusal.NotOurs, "an OFFER for another client")
+    m = Msg.grant(2, XID)
+    m.bytes[236] = 0x00
+    refused(&m, Refusal.BadCookie, "no cookie")
+}
+
+func refused_slice(m: &Msg, len: Int, why: Refusal, what: String) {
+    let r = dhcp.parse_reply(&m.bytes[..len], mac_a(), XID)
+    match r {
+        case Ok(_) -> check(false, what),
+        case Err(e) -> check(e == why, what),
+    }
+}
+
+func option_refusals() {
+    // An option whose length runs past the datagram.
+    var m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.bytes[m.len] = 54
+    m.bytes[m.len + 1] = 4
+    m.len = m.len + 4
+    refused(&m, Refusal.BadOption, "an option past the datagram")
+
+    // An option code as the last byte: no length byte.
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.bytes[m.len] = 54
+    m.len = m.len + 1
+    refused(&m, Refusal.BadOption, "an option with no length")
+
+    // Options with no END.
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    refused(&m, Refusal.BadOption, "options with no end")
+
+    // Each option held to the lengths it may have.
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_len(53, 2)
+    m.end()
+    refused(&m, Refusal.BadLength(53), "a message type of two bytes")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(54, 3)
+    m.end()
+    refused(&m, Refusal.BadLength(54), "a server id of three bytes")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(51, 5)
+    m.end()
+    refused(&m, Refusal.BadLength(51), "a lease time of five bytes")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(1, 2)
+    m.end()
+    refused(&m, Refusal.BadLength(1), "a mask of two bytes")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(3, 6)
+    m.end()
+    refused(&m, Refusal.BadLength(3), "a router list of a word and a half")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(3, 0)
+    m.end()
+    refused(&m, Refusal.BadLength(3), "an empty router list")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(6, 5)
+    m.end()
+    refused(&m, Refusal.BadLength(6), "a DNS list of a word and a bit")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_len(6, 0)
+    m.end()
+    refused(&m, Refusal.BadLength(6), "an empty DNS list")
+}
+
+func required_options() {
+    var m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.MissingType, "no message type")
+
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 1)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.BadType(1), "a DISCOVER is not received")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 3)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.BadType(3), "a REQUEST is not received")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 99)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.BadType(99), "a message type that does not exist")
+
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.end()
+    refused(&m, Refusal.MissingOption(54), "an OFFER with no server id")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 6)
+    m.end()
+    refused(&m, Refusal.MissingOption(54), "a NAK with no server id")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 5)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.end()
+    refused(&m, Refusal.MissingOption(51), "an ACK with no lease time")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 5)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(51, 3600)
+    m.end()
+    refused(&m, Refusal.MissingOption(1), "an ACK with no mask")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 5)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(51, 0)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.end()
+    refused(&m, Refusal.BadLease, "a lease of no time")
+
+    // The address, mask and router must be an interface's configuration.
+    m = Msg.reply(XID, 0)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.end()
+    refused(&m, Refusal.BadConfig(ConfigError.Address), "an offer of 0.0.0.0")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFF00_FF00)
+    m.end()
+    refused(&m, Refusal.BadConfig(ConfigError.Netmask),
+            "a mask that is not contiguous")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.opt_u32(3, 0x0A00_0101)
+    m.end()
+    refused(&m, Refusal.BadConfig(ConfigError.Gateway),
+            "a router off the subnet")
+}
+
+// -----------------------------------------------------------------------------
+// The state machine
+// -----------------------------------------------------------------------------
+
+/// The reply of `options` after the golden head, but for transaction `xid`.
+func reply_to(c: &Client, kind: UInt8) -> Msg {
+    Msg.grant(kind, c.transaction())
+}
+
+func receive_refused(c: &var Client, m: &Msg, now: UInt64, why: Refusal,
+                     what: String) {
+    let before = c.state()
+    let r = c.receive(now, &m.bytes[..m.len], ip_server())
+    match r {
+        case Ok(_) -> check(false, what),
+        case Err(e) -> check(e == why, what),
+    }
+    check(c.state() == before, "a refused reply moves nothing")
+}
+
+/// A client taken to `Bound`: DISCOVER at 0, OFFER, the REQUEST at 10, the
+/// ACK at 20. A lease of 3600 s begins at 10 ms.
+func bound() -> Client {
+    bound_for(HOUR)
+}
+
+/// `bound`, for a lease of `secs`.
+func bound_for(secs: UInt32) -> Client {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let _ = c.poll(0, &var out)
+    let offer = Msg.grant_for(2, c.transaction(), secs)
+    let _ = try! c.receive(5, &offer.bytes[..offer.len], ip_server())
+    let _ = c.poll(10, &var out)
+    let ack = Msg.grant_for(5, c.transaction(), secs)
+    let s = try! c.receive(20, &ack.bytes[..ack.len], ip_server())
+    check(s == Step.Leased(the_lease(secs)), "the ACK is a lease")
+    c
+}
+
+/// Whether the client holds exactly `lease`.
+func holds(c: &Client, lease: Lease) -> Bool {
+    if let held = c.lease() {
+        held == lease
+    } else {
+        false
+    }
+}
+
+func discovering() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    check(c.state() == State.Init && c.due() == 0 && c.lease() == None,
+          "a new client is in Init, due at once, with no lease")
+
+    // Nothing but a DISCOVER is sent from Init, and a reply is not expected.
+    let early = Msg.grant(2, c.transaction())
+    receive_refused(&var c, &early, 0, Refusal.Unexpected, "an OFFER in Init")
+
+    check(c.poll(1000, &var out) == Step.Send(300, bcast()), "Init sends")
+    check(c.state() == State.Selecting && c.attempts() == 1 &&
+              c.transaction() == XID, "a DISCOVER, the next transaction")
+    check(c.due() == 1100, "the retry is due the interval later")
+
+    // Not before it is due: one millisecond short, and a clock gone back.
+    check(c.poll(1099, &var out) == Step.Idle, "not yet due")
+    check(c.poll(0, &var out) == Step.Idle, "the clock ran backwards")
+    // At the interval: the same DISCOVER again, its interval doubled.
+    out = [0; 300]
+    check(c.poll(1100, &var out) == Step.Send(300, bcast()), "the retry")
+    check(same(&out, &golden(&DISCOVER_HEAD, &DISCOVER_OPTIONS)),
+          "the retry is the same DISCOVER, the same transaction")
+    check(c.attempts() == 2 && c.transaction() == XID, "attempts counted")
+    check(c.due() == 1300, "the interval doubled")
+    check(c.poll(1299, &var out) == Step.Idle, "the doubled interval holds")
+    check(c.poll(1300, &var out) == Step.Send(300, bcast()), "the next retry")
+    check(c.due() == 1700, "and doubled again")
+
+    // Replies that are not an OFFER, or not for this exchange.
+    let ack = Msg.grant(5, XID)
+    receive_refused(&var c, &ack, 1400, Refusal.Unexpected, "an ACK while selecting")
+    let nak = Msg.reply(XID, 0)
+    var nakm = nak
+    nakm.opt_u8(53, 6)
+    nakm.opt_u32(54, 0x0A00_0002)
+    nakm.end()
+    receive_refused(&var c, &nakm, 1400, Refusal.Unexpected, "a NAK while selecting")
+    let stale = Msg.grant(2, XID + 1)
+    receive_refused(&var c, &stale, 1400, Refusal.WrongXid, "an OFFER of another transaction")
+    var other = Msg.grant(2, XID)
+    other.bytes[33] = 0x0B
+    receive_refused(&var c, &other, 1400, Refusal.NotOurs, "an OFFER for another client")
+    check(c.attempts() == 3 && c.due() == 1700, "the refusals changed nothing")
+}
+
+func interval_cap() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0, first_retry_ms: dhcp.DEFAULT_RETRY_MS)
+    let _ = c.poll(0, &var out)
+    check(c.due() == 4000, "the first interval is 4 s")
+    var now: UInt64 = 4000
+    var expect: UInt64 = 8000
+    var k = 0
+    // 4, 8, 16, 32, then 64 s, then 64 s again.
+    while k < 6 {
+        let _ = c.poll(now, &var out)
+        check(c.due() == now + expect, "the interval doubles up to its cap")
+        now = c.due()
+        expect = if expect >= 32000 { 64000 } else { expect * 2 }
+        k = k + 1
+    }
+    // A first interval of nothing is one millisecond, and one past the cap
+    // is the cap.
+    var tiny = Client(mac: mac_a(), xid: 0, first_retry_ms: 0)
+    let _ = tiny.poll(7, &var out)
+    check(tiny.due() == 8, "a first interval of zero is clamped to one")
+    var huge = Client(mac: mac_a(), xid: 0, first_retry_ms: 0xFFFF_FFFF_FFFF_FFFF)
+    let _ = huge.poll(0, &var out)
+    check(huge.due() == dhcp.RETRY_MAX_MS, "a first interval is clamped to the cap")
+    // Time at the clock's top does not wrap the due time.
+    var late = Client(mac: mac_a(), xid: 0, first_retry_ms: 100)
+    let _ = late.poll(0xFFFF_FFFF_FFFF_FFFF, &var out)
+    check(late.due() == 0xFFFF_FFFF_FFFF_FFFF, "the due time holds at the top")
+}
+
+func requesting() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let _ = c.poll(0, &var out)
+    let offer = Msg.grant(2, XID)
+    check(try! c.receive(50, &offer.bytes[..offer.len], ip_server()) == Step.Idle, "the OFFER")
+    check(c.state() == State.Requesting && c.due() == 50, "Requesting, due at once")
+    check(c.lease() == None, "an offer is not a lease")
+
+    // A second OFFER is not what the state waits for.
+    receive_refused(&var c, &offer, 50, Refusal.Unexpected, "an OFFER while requesting")
+
+    check(c.poll(50, &var out) == Step.Send(300, bcast()), "the REQUEST")
+    check(same(&out, &golden(&DISCOVER_HEAD, &REQUEST_OPTIONS)), "its bytes")
+    check(c.attempts() == 1 && c.due() == 150, "one sent, the next due")
+    check(c.poll(149, &var out) == Step.Idle, "not before it is due")
+    check(c.poll(150, &var out) == Step.Send(300, bcast()), "the REQUEST again")
+    check(c.transaction() == XID, "the same transaction")
+
+    // An ACK from another server, for another address, a NAK from another
+    // server: each refused, the state unchanged.
+    var ack = Msg.grant(5, XID)
+    ack.bytes[240 + 3 + 5] = 0x03
+    receive_refused(&var c, &ack, 160, Refusal.WrongServer, "an ACK from another server")
+    var moved = Msg.grant(5, XID)
+    moved.bytes[19] = 0x05
+    receive_refused(&var c, &moved, 160, Refusal.WrongAddress, "an ACK for another address")
+    var nak = Msg.reply(XID, 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0x0A00_0003)
+    nak.end()
+    receive_refused(&var c, &nak, 160, Refusal.WrongServer, "a NAK from another server")
+
+    // Five REQUESTs unanswered, and the sixth turn starts over.
+    let _ = c.poll(350, &var out)
+    let _ = c.poll(750, &var out)
+    let _ = c.poll(1550, &var out)
+    check(c.attempts() == 5 && c.state() == State.Requesting, "five REQUESTs")
+    check(c.poll(1550 + 1600, &var out) == Step.Send(300, bcast()),
+          "a DISCOVER after the REQUESTs")
+    check(c.state() == State.Selecting && c.transaction() == XID + 1,
+          "starting over, the next transaction")
+    check(c.attempts() == 1, "the count starts again")
+}
+
+func nak_in_requesting() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let _ = c.poll(0, &var out)
+    let offer = Msg.grant(2, XID)
+    let _ = try! c.receive(10, &offer.bytes[..offer.len], ip_server())
+    let _ = c.poll(10, &var out)
+    var nak = Msg.reply(XID, 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0x0A00_0002)
+    nak.end()
+    check(try! c.receive(20, &nak.bytes[..nak.len], ip_server()) == Step.Idle, "a NAK is taken")
+    check(c.state() == State.Init && c.lease() == None, "a NAK starts over")
+    check(c.poll(20, &var out) == Step.Send(300, bcast()), "a new DISCOVER")
+    check(c.transaction() == XID + 1 && c.state() == State.Selecting,
+          "of the next transaction")
+}
+
+func leasing() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = bound()
+    check(c.state() == State.Bound, "Bound")
+    check(holds(&c, the_lease(HOUR)), "the lease is held")
+    // T1 is half the lease from the first REQUEST (10 ms).
+    check(c.due() == 10 + 1_800_000, "T1 is half the lease from the REQUEST")
+    // Replies in Bound are not expected.
+    let late = Msg.grant(5, c.transaction())
+    receive_refused(&var c, &late, 30, Refusal.Unexpected, "an ACK while bound")
+    check(c.poll(1_800_009, &var out) == Step.Idle, "nothing before T1")
+
+    // At T1, a unicast REQUEST to the server naming the held address.
+    check(c.poll(1_800_010, &var out) == Step.Send(300, ip_server()),
+          "the renewal goes to the server alone")
+    check(same(&out, &golden(&RENEW_HEAD, &RENEW_OPTIONS)), "the renewal's bytes")
+    check(c.state() == State.Renewing && c.transaction() == XID + 1,
+          "Renewing, the next transaction")
+    check(holds(&c, the_lease(HOUR)), "the lease is held while renewing")
+    check(c.due() == 1_800_010 + dhcp.RENEW_RETRY_MS, "retried each minute")
+    check(c.poll(1_860_009, &var out) == Step.Idle, "not before the retry")
+    check(c.poll(1_860_010, &var out) == Step.Send(300, ip_server()),
+          "the renewal again")
+    check(c.transaction() == XID + 1, "the same transaction")
+
+    // An ACK for another address is refused; for the held one, the lease is
+    // renewed from the renewal's first REQUEST.
+    var moved = Msg.grant(5, c.transaction())
+    moved.bytes[19] = 0x05
+    receive_refused(&var c, &moved, 1_880_000, Refusal.WrongAddress,
+                    "an ACK for another address while renewing")
+    let offer = Msg.grant(2, c.transaction())
+    receive_refused(&var c, &offer, 1_880_000, Refusal.Unexpected,
+                    "an OFFER while renewing")
+    let ack = Msg.grant(5, c.transaction())
+    check(try! c.receive(1_880_000, &ack.bytes[..ack.len], ip_server()) == Step.Leased(the_lease(HOUR)),
+          "the renewal's ACK")
+    check(c.state() == State.Bound, "Bound again")
+    check(c.due() == 1_800_010 + 1_800_000, "T1 counts from the renewal's first REQUEST")
+}
+
+func rebinding() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = bound()
+    // T2 is seven eighths of the lease: 3,150,000 ms after 10.
+    let t1: UInt64 = 1_800_010
+    let t2: UInt64 = 3_150_010
+    let end: UInt64 = 3_600_010
+    let _ = c.poll(t1, &var out)
+    check(c.state() == State.Renewing, "Renewing")
+    // The retries stop at T2, where the broadcast begins.
+    var now = t1
+    while now + dhcp.RENEW_RETRY_MS < t2 {
+        now = now + dhcp.RENEW_RETRY_MS
+        check(c.poll(now, &var out) == Step.Send(300, ip_server()),
+              "the renewal's retries go to the server")
+    }
+    check(c.due() == t2, "the last retry waits for T2")
+    check(c.poll(t2 - 1, &var out) == Step.Idle, "not before T2")
+    check(c.poll(t2, &var out) == Step.Send(300, bcast()), "at T2 the REQUEST is broadcast")
+    check(c.state() == State.Rebinding, "Rebinding")
+    check(c.transaction() == XID + 1, "in the renewal's transaction")
+    check(same(&out, &golden(&RENEW_HEAD, &RENEW_OPTIONS)), "its bytes")
+    // A reply from any server, for the held address, renews.
+    var ack = Msg.grant(5, c.transaction())
+    ack.bytes[240 + 3 + 5] = 0x03
+    check(try! c.receive(t2 + 1, &ack.bytes[..ack.len], ip_other()) == Step.Leased(
+              Lease(config: the_lease(HOUR).config, server: ip_other(),
+                    dns: ip_dns(), lease_secs: HOUR)),
+          "any server's ACK renews while rebinding")
+    check(c.state() == State.Bound, "Bound")
+    check(c.due() == t1 + 1_800_000, "from the exchange's first REQUEST, not the broadcast")
+
+    // The lease ends, unanswered.
+    var d = bound()
+    let _ = d.poll(t1, &var out)
+    let _ = d.poll(t2, &var out)
+    check(d.state() == State.Rebinding, "Rebinding again")
+    check(d.poll(end - 1, &var out) == Step.Send(300, bcast()), "retries until the end")
+    check(d.due() == end, "the last retry waits for the lease's end")
+    check(d.poll(end, &var out) == Step.Lost, "the lease ends")
+    check(d.state() == State.Init && d.lease() == None, "and the client starts over")
+    check(d.poll(end, &var out) == Step.Send(300, bcast()), "with a DISCOVER")
+    check(d.transaction() == XID + 2, "of the next transaction")
+
+    // A poll long after the lease's end, from Renewing, is the end too.
+    var e = bound()
+    let _ = e.poll(t1, &var out)
+    check(e.poll(end + 5_000_000, &var out) == Step.Lost, "late, the lease is lost")
+}
+
+func nak_while_renewing() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = bound()
+    let _ = c.poll(1_800_010, &var out)
+    var nak = Msg.reply(c.transaction(), 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0x0A00_0002)
+    nak.end()
+    check(try! c.receive(1_800_110, &nak.bytes[..nak.len], ip_server()) == Step.Lost,
+          "a NAK while renewing loses the lease")
+    check(c.state() == State.Init && c.lease() == None, "starting over")
+
+    var d = bound()
+    let _ = d.poll(1_800_010, &var out)
+    let _ = d.poll(3_150_010, &var out)
+    var nak2 = Msg.reply(d.transaction(), 0)
+    nak2.opt_u8(53, 6)
+    nak2.opt_u32(54, 0x0A00_0009)
+    nak2.end()
+    check(try! d.receive(3_150_011, &nak2.bytes[..nak2.len], ip_server()) == Step.Lost,
+          "a NAK while rebinding loses the lease")
+}
+
+func infinite_lease() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let _ = c.poll(0, &var out)
+    var offer = Msg.reply(XID, 0x0A00_0001)
+    offer.opt_u8(53, 2)
+    offer.opt_u32(54, 0x0A00_0002)
+    offer.opt_u32(51, 0xFFFF_FFFF)
+    offer.opt_u32(1, 0xFFFF_FF00)
+    offer.end()
+    let _ = try! c.receive(1, &offer.bytes[..offer.len], ip_server())
+    let _ = c.poll(1, &var out)
+    var ack = Msg.reply(XID, 0x0A00_0001)
+    ack.opt_u8(53, 5)
+    ack.opt_u32(54, 0x0A00_0002)
+    ack.opt_u32(51, 0xFFFF_FFFF)
+    ack.opt_u32(1, 0xFFFF_FF00)
+    ack.end()
+    let _ = try! c.receive(2, &ack.bytes[..ack.len], ip_server())
+    check(c.state() == State.Bound && c.due() == 0xFFFF_FFFF_FFFF_FFFF,
+          "a lease that does not end is never renewed")
+    check(c.poll(0xFFFF_FFFF_FFFF_FFFE, &var out) == Step.Idle, "so nothing is due")
+}
+
+/// A grant of `kind` whose server identifier is `server` and whose DNS server
+/// is `dns` (none for 0), for the address 10.0.0.1.
+func grant_naming(kind: UInt8, server: UInt32, dns: UInt32) -> Msg {
+    var m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, kind)
+    m.opt_u32(54, server)
+    m.opt_u32(51, 3600)
+    m.opt_u32(1, 0xFFFF_FF00)
+    m.opt_u32(3, 0x0A00_00FE)
+    if dns != 0 {
+        m.opt_u32(6, dns)
+    }
+    m.end()
+    m
+}
+
+func addresses() {
+    // The server identifier must be a host one can send to.
+    var m = grant_naming(2, 0, 0)
+    refused(&m, Refusal.BadAddress(54), "a server of 0.0.0.0")
+    m = grant_naming(2, 0xFFFF_FFFF, 0)
+    refused(&m, Refusal.BadAddress(54), "a server that is the broadcast")
+    m = grant_naming(2, 0xE000_0001, 0)
+    refused(&m, Refusal.BadAddress(54), "a server that is a multicast group")
+    m = grant_naming(2, 0x7F00_0001, 0)
+    refused(&m, Refusal.BadAddress(54), "a server that is loopback")
+    m = grant_naming(5, 0x0A00_0001, 0)
+    refused(&m, Refusal.BadAddress(54), "a server that is the leased address")
+    // A NAK's server too.
+    var nak = Msg.reply(XID, 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0)
+    nak.end()
+    refused(&nak, Refusal.BadAddress(54), "a NAK from 0.0.0.0")
+    // The DNS server too.
+    m = grant_naming(2, 0x0A00_0002, 0xFFFF_FFFF)
+    refused(&m, Refusal.BadAddress(6), "a DNS server that is the broadcast")
+    m = grant_naming(2, 0x0A00_0002, 0xE000_0001)
+    refused(&m, Refusal.BadAddress(6), "a DNS server that is a multicast group")
+    m = grant_naming(2, 0x0A00_0002, 0x0A00_0001)
+    refused(&m, Refusal.BadAddress(6), "a DNS server that is the leased address")
+    m = grant_naming(2, 0x0A00_0002, 0x7F00_0001)
+    refused(&m, Refusal.BadAddress(6), "a DNS server that is loopback")
+    var zero = Msg.reply(XID, 0x0A00_0001)
+    zero.opt_u8(53, 2)
+    zero.opt_u32(54, 0x0A00_0002)
+    zero.opt_u32(51, 3600)
+    zero.opt_u32(1, 0xFFFF_FF00)
+    zero.opt_u32(6, 0)
+    zero.end()
+    refused(&zero, Refusal.BadAddress(6), "a DNS server of 0.0.0.0")
+    // And an ordinary one passes.
+    m = grant_naming(2, 0x0A00_0002, 0x0A00_0035)
+    check(parsed(&m) == Reply.Offer(the_lease(HOUR)), "a good grant")
+}
+
+func repeats() {
+    // A message type given twice is refused, whatever the two say.
+    var m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 2)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.RepeatedType, "a message type twice")
+    m = Msg.reply(XID, 0x0A00_0001)
+    m.opt_u8(53, 5)
+    m.opt_u8(53, 2)
+    m.opt_u32(54, 0x0A00_0002)
+    m.end()
+    refused(&m, Refusal.RepeatedType, "two different message types")
+    // Any other option repeated is read as its last appearance says.
+    var r = Msg.reply(XID, 0x0A00_0001)
+    r.opt_u8(53, 2)
+    r.opt_u32(54, 0x0A00_0003)
+    r.opt_u32(54, 0x0A00_0002)
+    r.opt_u32(51, 10)
+    r.opt_u32(51, 3600)
+    r.opt_u32(1, 0xFFFF_FF00)
+    r.end()
+    let config = try! Config(addr: ip_lease(), netmask: mask24(),
+                             gateway: Ipv4Addr.unspecified())
+    let want = Lease(config: config, server: ip_server(),
+                     dns: Ipv4Addr.unspecified(), lease_secs: HOUR)
+    check(parsed(&r) == Reply.Offer(want), "the last of a repeated option")
+}
+
+func hostile_renewal() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = bound()
+    let _ = c.poll(1_800_010, &var out)
+    check(c.state() == State.Renewing, "Renewing")
+    // A NAK or an ACK from another address than the lease's server, however
+    // well it matches the exchange, is refused: the lease stays, the state
+    // stays.
+    var nak = Msg.reply(c.transaction(), 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0x0A00_0002)
+    nak.end()
+    let forged = c.receive(1_800_020, &nak.bytes[..nak.len], ip_other())
+    match forged {
+        case Ok(_) -> check(false, "a NAK from another address"),
+        case Err(e) -> check(e == Refusal.WrongServer, "a NAK from another address"),
+    }
+    check(c.state() == State.Renewing && holds(&c, the_lease(HOUR)), "the lease is kept")
+    let ack = Msg.grant(5, c.transaction())
+    let forged_ack = c.receive(1_800_020, &ack.bytes[..ack.len], ip_other())
+    match forged_ack {
+        case Ok(_) -> check(false, "an ACK from another address"),
+        case Err(e) -> check(e == Refusal.WrongServer, "an ACK from another address"),
+    }
+    check(c.state() == State.Renewing, "and renewing still")
+    // The server itself is heard.
+    check(try! c.receive(1_800_030, &nak.bytes[..nak.len], ip_server()) == Step.Lost,
+          "a NAK from the server")
+
+    // While rebinding any server may answer, and a NAK from any does.
+    var d = bound()
+    let _ = d.poll(1_800_010, &var out)
+    let _ = d.poll(3_150_010, &var out)
+    var nak2 = Msg.reply(d.transaction(), 0)
+    nak2.opt_u8(53, 6)
+    nak2.opt_u32(54, 0x0A00_0003)
+    nak2.end()
+    check(try! d.receive(3_150_011, &nak2.bytes[..nak2.len], ip_other()) == Step.Lost,
+          "a NAK from another server while rebinding")
+}
+
+func early_answers() {
+    var out: [UInt8; 300] = [0; 300]
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+    let _ = c.poll(0, &var out)
+    let offer = Msg.grant(2, XID)
+    let _ = try! c.receive(5, &offer.bytes[..offer.len], ip_server())
+    check(c.state() == State.Requesting && c.attempts() == 0, "no REQUEST sent yet")
+    // An ACK or NAK now answers nothing.
+    let ack = Msg.grant(5, XID)
+    receive_refused(&var c, &ack, 5, Refusal.Unexpected, "an ACK before any REQUEST")
+    var nak = Msg.reply(XID, 0)
+    nak.opt_u8(53, 6)
+    nak.opt_u32(54, 0x0A00_0002)
+    nak.end()
+    receive_refused(&var c, &nak, 5, Refusal.Unexpected, "a NAK before any REQUEST")
+    // After the REQUEST it is taken.
+    let _ = c.poll(5, &var out)
+    check(try! c.receive(6, &ack.bytes[..ack.len], ip_server()) ==
+              Step.Leased(the_lease(HOUR)), "an ACK after the REQUEST")
+}
+
+func large_lease() {
+    // 4,294,967,294 s is the longest finite lease: its milliseconds do not
+    // fit in 32 bits.
+    var out: [UInt8; 300] = [0; 300]
+    let secs: UInt32 = 0xFFFF_FFFE
+    var c = bound_for(secs)
+    let t1: UInt64 = 10 + 2_147_483_647_000
+    let t2: UInt64 = 10 + 3_758_096_382_250
+    check(c.due() == t1, "T1 of a lease past 32 bits of milliseconds")
+    check(c.poll(t1 - 1, &var out) == Step.Idle, "not before T1")
+    check(c.poll(t1, &var out) == Step.Send(300, ip_server()), "the renewal at T1")
+    check(c.poll(t2 - 1, &var out) == Step.Send(300, ip_server()), "still renewing")
+    check(c.state() == State.Renewing, "Renewing before T2")
+    check(c.poll(t2, &var out) == Step.Send(300, bcast()), "the broadcast at T2")
+    check(c.state() == State.Rebinding, "Rebinding at T2")
+    check(c.poll(10 + 4_294_967_293_999, &var out) == Step.Send(300, bcast()),
+          "and until the lease's end")
+    check(c.poll(10 + 4_294_967_294_000, &var out) == Step.Lost, "the end of the lease")
+}
+
+func xid_wraps() {
+    var out: [UInt8; 300] = [0; 300]
+    var top = Client(mac: mac_a(), xid: 0xFFFF_FFFE, first_retry_ms: 100)
+    let _ = top.poll(0, &var out)
+    check(top.transaction() == 0xFFFF_FFFF, "the id before the top")
+    var wrap = Client(mac: mac_a(), xid: 0xFFFF_FFFF, first_retry_ms: 100)
+    let _ = wrap.poll(0, &var out)
+    check(wrap.transaction() == 0, "the id wraps to zero")
+}
+
+func main() {
+    addresses()
+    repeats()
+    hostile_renewal()
+    early_answers()
+    large_lease()
+    xid_wraps()
+    building()
+    parsing()
+    refusals()
+    option_refusals()
+    required_options()
+    discovering()
+    interval_cap()
+    requesting()
+    nak_in_requesting()
+    leasing()
+    rebinding()
+    nak_while_renewing()
+    infinite_lease()
+}

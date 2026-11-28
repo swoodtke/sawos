@@ -13,6 +13,12 @@
 //!     silent   nothing, but a line for every frame's length
 //!     greet    `ping`, and one broadcast frame sent once the harness says
 //!              the guest is ready, before the guest has said anything
+//!     dhcp     `ping`, and a DHCP server (port 67, broadcast or to the
+//!              peer): one lease, `LEASE_IP`, for `LEASE_SECS`
+//!     dhcp_retry
+//!              `dhcp`, but the first DISCOVER it hears is not answered
+//!     dns      `ping`, and a DNS server (port 53 on the peer) with a table
+//!              of two names (`dns_answer`) and NXDOMAIN for any other
 //!
 //! Anything else a script handles is logged as `peer: unexpected: ...`,
 //! naming what was wrong. Frames are written and checked with this file's
@@ -43,6 +49,21 @@ static ETHER_GREETING: UInt = 0x88B5
 static PROTO_ICMP: UInt = 1
 static PROTO_UDP: UInt = 17
 static ECHO_PORT: UInt = 7
+static DHCP_SERVER_PORT: UInt = 67
+static DHCP_CLIENT_PORT: UInt = 68
+static DNS_PORT: UInt = 53
+
+/// The one address the DHCP server leases, with the mask, router and DNS
+/// server it names, and the lease's seconds.
+public static LEASE_IP: UInt = 0x0A00_020F
+static LEASE_MASK: UInt = 0xFFFF_FF00
+static LEASE_ROUTER: UInt = 0x0A00_0202
+static LEASE_DNS: UInt = 0x0A00_0203
+public static LEASE_SECS: UInt = 3600
+
+/// The address the name table answers with, for each of its names.
+public static NAME_IP: UInt = 0x0A00_0207
+public static NAME_TTL: UInt = 300
 
 /// The most datagrams one `burst` may ask for.
 public static BURST_MAX: UInt = 64
@@ -52,7 +73,10 @@ public enum Script {
     case Burst,
     case Log,
     case Silent,
-    case Greet
+    case Greet,
+    case Dhcp,
+    case DhcpRetry,
+    case Dns
 }
 
 extension Script {
@@ -63,7 +87,35 @@ extension Script {
         if name.equals("log") { return Script.Log }
         if name.equals("silent") { return Script.Silent }
         if name.equals("greet") { return Script.Greet }
+        if name.equals("dhcp") { return Script.Dhcp }
+        if name.equals("dhcp_retry") { return Script.DhcpRetry }
+        if name.equals("dns") { return Script.Dns }
         None
+    }
+
+    /// Whether the script is a DHCP server.
+    func serves_dhcp(&self) -> Bool {
+        match self {
+            case Dhcp -> true,
+            case DhcpRetry -> true,
+            case _ -> false,
+        }
+    }
+
+    /// Whether the script drops the first DISCOVER it hears.
+    func drops_first_discover(&self) -> Bool {
+        match self {
+            case DhcpRetry -> true,
+            case _ -> false,
+        }
+    }
+
+    /// Whether the script is a DNS server.
+    func serves_dns(&self) -> Bool {
+        match self {
+            case Dns -> true,
+            case _ -> false,
+        }
     }
 
     /// Whether the script speaks before it has been spoken to.
@@ -126,11 +178,13 @@ extension Handled {
 public struct Peer {
     script: Script,
     frames: Int,
+    /// The DISCOVERs heard.
+    discovers: Int,
 }
 
 extension Peer {
     public init(script: Script) -> Peer {
-        Peer(script: script, frames: 0)
+        Peer(script: script, frames: 0, discovers: 0)
     }
 
     /// The frames received so far.
@@ -232,14 +286,17 @@ extension Peer {
         out.line("arp request for {ip_text(PEER_IP)} from {who}, answered")
     }
 
-    func ipv4(&self, frame: &Data, out: &var Handled) {
+    func ipv4(&var self, frame: &Data, out: &var Handled) {
         let n = frame.len()
         if n < ETHER_BYTES + IPV4_BYTES {
             out.unexpected("an IPv4 frame of {n} bytes")
             return
         }
         let dst_mac = mac_at(&frame, 0)
-        if dst_mac != PEER_MAC {
+        // A DHCP client with no address broadcasts: to every station, and to
+        // 255.255.255.255.
+        let to_all = self.script.serves_dhcp() && dst_mac == BROADCAST
+        if dst_mac != PEER_MAC && not to_all {
             out.unexpected("an IPv4 frame to {mac_text(dst_mac)}")
             return
         }
@@ -262,17 +319,23 @@ extension Peer {
             return
         }
         let dst = be32(&frame, 30)
-        if dst != PEER_IP {
+        if to_all {
+            if dst != 0xFFFF_FFFF {
+                let to = ip_text(dst)
+                out.unexpected("an IPv4 packet to {to} in a broadcast frame")
+                return
+            }
+        } else if dst != PEER_IP {
             out.unexpected("an IPv4 packet to {ip_text(dst)}")
             return
         }
         let src = be32(&frame, 26)
         let proto = byte_at(&frame, 23)
         let body = total - IPV4_BYTES
-        if proto == PROTO_ICMP {
+        if proto == PROTO_ICMP && not to_all {
             self.icmp(&frame, src, body, &var out)
         } else if proto == PROTO_UDP {
-            self.udp(&frame, src, body, &var out)
+            self.udp(&frame, src, dst, body, &var out)
         } else {
             out.unexpected("IPv4 protocol {proto}")
         }
@@ -311,7 +374,8 @@ extension Peer {
         out.line("echo request {seq} from {from}, {data} bytes, answered")
     }
 
-    func udp(&self, frame: &Data, src: UInt, body: Int, out: &var Handled) {
+    func udp(&var self, frame: &Data, src: UInt, dst: UInt, body: Int,
+             out: &var Handled) {
         let at = ETHER_BYTES + IPV4_BYTES
         if body < 8 {
             out.unexpected("a UDP datagram of {body} bytes")
@@ -325,8 +389,16 @@ extension Peer {
             return
         }
         if be16(&frame, at + 6) != 0 &&
-           udp_sum(&frame, at, body, src, PEER_IP) != 0xFFFF {
+           udp_sum(&frame, at, body, src, dst) != 0xFFFF {
             out.unexpected("a UDP checksum")
+            return
+        }
+        if dport == DHCP_SERVER_PORT && self.script.serves_dhcp() {
+            self.dhcp(&frame, at + 8, body - 8, sport, &var out)
+            return
+        }
+        if dport == DNS_PORT && self.script.serves_dns() {
+            self.dns(&frame, at + 8, body - 8, src, sport, &var out)
             return
         }
         if not self.script.bursts() || dport != ECHO_PORT {
@@ -348,6 +420,255 @@ extension Peer {
         }
         out.line("burst of {count} to {ip_text(src)}:{sport}")
     }
+}
+
+extension Peer {
+    /// A DHCP message of `len` bytes at `at` in `frame`, from `sport`.
+    func dhcp(&var self, frame: &Data, at: Int, len: Int, sport: UInt,
+              out: &var Handled) {
+        if sport != DHCP_CLIENT_PORT {
+            out.unexpected("a DHCP message from port {sport}")
+            return
+        }
+        // A message shorter than its cookie reads zeros there, and is refused
+        // with the rest.
+        if byte_at(&frame, at) != 1 || byte_at(&frame, at + 1) != 1 ||
+           byte_at(&frame, at + 2) != 6 ||
+           be32(&frame, at + 236) != 0x6382_5363 {
+            out.unexpected("a datagram to port 67 that is no DHCP request")
+            return
+        }
+        let xid = be32(&frame, at + 4)
+        let flags = be16(&frame, at + 10)
+        let ciaddr = be32(&frame, at + 12)
+        let mac = mac_at(&frame, at + 28)
+        var kind: UInt = 0
+        var requested: UInt = 0
+        var server: UInt = 0
+        var i = at + 240
+        let end = at + len
+        var ended = false
+        while i < end {
+            let code = byte_at(&frame, i)
+            if code == 0 {
+                i = i + 1
+            } else if code == 255 {
+                ended = true
+                break
+            } else {
+                let n = byte_at(&frame, i + 1) as Int
+                if code == 53 && n == 1 {
+                    kind = byte_at(&frame, i + 2)
+                } else if code == 50 && n == 4 {
+                    requested = be32(&frame, i + 2)
+                } else if code == 54 && n == 4 {
+                    server = be32(&frame, i + 2)
+                }
+                i = i + 2 + n
+            }
+        }
+        if not ended {
+            out.unexpected("DHCP options with no end")
+            return
+        }
+        let who = mac_text(mac)
+        if kind == 1 {
+            self.discovers = self.discovers + 1
+            if self.script.drops_first_discover() && self.discovers == 1 {
+                out.line("dhcp discover from {who}, dropped")
+                return
+            }
+            out.reply(dhcp_frame(mac, xid, flags, ciaddr, 2))
+            out.line("dhcp discover from {who}, offered {ip_text(LEASE_IP)}")
+        } else if kind == 3 {
+            if server != 0 && server != PEER_IP {
+                out.line("dhcp request from {who} for another server")
+                return
+            }
+            let wanted = if requested != 0 { requested } else { ciaddr }
+            if wanted == LEASE_IP {
+                out.reply(dhcp_frame(mac, xid, flags, ciaddr, 5))
+                out.line("dhcp request for {ip_text(wanted)} from {who}, acked")
+            } else {
+                out.reply(dhcp_frame(mac, xid, flags, ciaddr, 6))
+                let ip = ip_text(wanted)
+                out.line("dhcp request for {ip} from {who}, refused")
+            }
+        } else {
+            out.unexpected("a DHCP message of type {kind}")
+        }
+    }
+
+    /// A DNS query of `len` bytes at `at` in `frame`, from `src`:`sport`.
+    func dns(&self, frame: &Data, at: Int, len: Int, src: UInt, sport: UInt,
+             out: &var Handled) {
+        if (be16(&frame, at + 2) & 0xF800) != 0 ||
+           be16(&frame, at + 4) != 1 || be16(&frame, at + 6) != 0 {
+            out.unexpected("a datagram to port 53 that is no DNS query")
+            return
+        }
+        // The question's name, as labels with no compression.
+        var name = ""
+        var i = at + 12
+        let end = at + len
+        var labels = 0
+        while true {
+            if i >= end {
+                out.unexpected("a DNS name that does not end")
+                return
+            }
+            let n = byte_at(&frame, i) as Int
+            if n == 0 {
+                i = i + 1
+                break
+            }
+            if n > 63 || i + 1 + n > end {
+                out.unexpected("a DNS label of {n} bytes")
+                return
+            }
+            if labels > 0 {
+                name = "{name}."
+            }
+            var k = 0
+            while k < n {
+                name = "{name}{char_text(byte_at(&frame, i + 1 + k))}"
+                k = k + 1
+            }
+            labels = labels + 1
+            i = i + 1 + n
+        }
+        if i + 4 != end || be16(&frame, i) != 1 || be16(&frame, i + 2) != 1 {
+            out.unexpected("a DNS question that is not an A query for one name")
+            return
+        }
+        let id = be16(&frame, at)
+        let flags = be16(&frame, at + 2)
+        let who = ip_text(src)
+        var r = Data()
+        put16(&var r, id)
+        // The query's recursion-desired bit comes back, with recursion
+        // available.
+        let known = name.equals("sawos.test") || name.equals("alias.sawos.test")
+        let rcode: UInt = if known { 0 } else { 3 }
+        put16(&var r, 0x8080 | (flags & 0x0100) | rcode)
+        put16(&var r, 1)
+        let records: UInt = if name.equals("alias.sawos.test") {
+            2
+        } else if known {
+            1
+        } else {
+            0
+        }
+        put16(&var r, records)
+        put16(&var r, 0)
+        put16(&var r, 0)
+        put_from(&var r, &frame, at + 12, end - (at + 12))
+        if name.equals("sawos.test") {
+            // The A record: its owner is the question's name.
+            put16(&var r, 0xC00C)
+            put_a_record(&var r)
+            out.line("dns query {name} from {who}, answered {ip_text(NAME_IP)}")
+        } else if name.equals("alias.sawos.test") {
+            // The alias is a CNAME to `sawos.test`, the question's name past
+            // its first label (offset 18), and the A record is that name's.
+            put16(&var r, 0xC00C)
+            put16(&var r, 5)
+            put16(&var r, 1)
+            put32(&var r, NAME_TTL)
+            put16(&var r, 2)
+            put16(&var r, 0xC012)
+            put16(&var r, 0xC012)
+            put_a_record(&var r)
+            let ip = ip_text(NAME_IP)
+            out.line("dns query {name} from {who}, answered {ip} via sawos.test")
+        } else {
+            out.line("dns query {name} from {who}, no such name")
+        }
+        out.reply(udp_datagram(mac_at(&frame, 6), src, DNS_PORT, sport, &r))
+    }
+}
+
+/// The type, class, time to live and data of an A record for `NAME_IP`.
+func put_a_record(out: &var Data) {
+    put16(&var out, 1)
+    put16(&var out, 1)
+    put32(&var out, NAME_TTL)
+    put16(&var out, 4)
+    put32(&var out, NAME_IP)
+}
+
+/// One printable character of a DNS name, as text; `?` for a byte a name
+/// does not have.
+func char_text(b: UInt) -> String {
+    let chars = "abcdefghijklmnopqrstuvwxyz0123456789-_?"
+    if b >= 0x61 && b <= 0x7A {
+        let i = (b - 0x61) as Int
+        return chars.substring(i, i + 1)
+    }
+    if b >= 0x41 && b <= 0x5A {
+        let i = (b - 0x41) as Int
+        return chars.substring(i, i + 1)
+    }
+    if b >= 0x30 && b <= 0x39 {
+        let i = (b - 0x30) as Int + 26
+        return chars.substring(i, i + 1)
+    }
+    if b == 0x2D { return "-" }
+    if b == 0x5F { return "_" }
+    "?"
+}
+
+/// A frame carrying the server's DHCP reply of `kind` (2 offer, 5 ack, 6 nak)
+/// to the client `mac`'s exchange `xid`: broadcast when the client asked for
+/// it or has no address, else to its `ciaddr`.
+func dhcp_frame(mac: UInt, xid: UInt, flags: UInt, ciaddr: UInt,
+                kind: UInt) -> Data {
+    var m = Data()
+    put8(&var m, 2)
+    put8(&var m, 1)
+    put8(&var m, 6)
+    put8(&var m, 0)
+    put32(&var m, xid)
+    put16(&var m, 0)
+    put16(&var m, flags)
+    put32(&var m, 0)
+    put32(&var m, if kind == 6 { 0 } else { LEASE_IP })
+    put32(&var m, 0)
+    put32(&var m, 0)
+    put_mac(&var m, mac)
+    var pad_bytes = 0
+    while pad_bytes < 10 + 64 + 128 {
+        put8(&var m, 0)
+        pad_bytes = pad_bytes + 1
+    }
+    put32(&var m, 0x6382_5363)
+    put8(&var m, 53)
+    put8(&var m, 1)
+    put8(&var m, kind)
+    put8(&var m, 54)
+    put8(&var m, 4)
+    put32(&var m, PEER_IP)
+    if kind != 6 {
+        put8(&var m, 51)
+        put8(&var m, 4)
+        put32(&var m, LEASE_SECS)
+        put8(&var m, 1)
+        put8(&var m, 4)
+        put32(&var m, LEASE_MASK)
+        put8(&var m, 3)
+        put8(&var m, 4)
+        put32(&var m, LEASE_ROUTER)
+        put8(&var m, 6)
+        put8(&var m, 4)
+        put32(&var m, LEASE_DNS)
+    }
+    put8(&var m, 255)
+    let to_all = (flags & 0x8000) != 0 || ciaddr == 0
+    if to_all {
+        return udp_datagram(BROADCAST, 0xFFFF_FFFF, DHCP_SERVER_PORT,
+                            DHCP_CLIENT_PORT, &m)
+    }
+    udp_datagram(mac, ciaddr, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, &m)
 }
 
 /// The `N` of a payload `burst N`: decimal digits only, 1 to `BURST_MAX`.
@@ -445,9 +766,16 @@ func ip_header(out: &var Data, total: Int, proto: UInt, dst: UInt, sum: UInt) {
 /// A frame to `dst_mac` carrying a UDP datagram from the peer's port 7 to
 /// `dst`:`dport`.
 func udp_frame(dst_mac: UInt, dst: UInt, dport: UInt, payload: &Data) -> Data {
+    udp_datagram(dst_mac, dst, ECHO_PORT, dport, &payload)
+}
+
+/// A frame to `dst_mac` carrying a UDP datagram from the peer's `sport` to
+/// `dst`:`dport`.
+func udp_datagram(dst_mac: UInt, dst: UInt, sport: UInt, dport: UInt,
+                  payload: &Data) -> Data {
     let length = 8 + payload.len()
     var datagram = Data()
-    put16(&var datagram, ECHO_PORT)
+    put16(&var datagram, sport)
     put16(&var datagram, dport)
     put16(&var datagram, length as UInt)
     put16(&var datagram, 0)
@@ -457,7 +785,7 @@ func udp_frame(dst_mac: UInt, dst: UInt, dport: UInt, payload: &Data) -> Data {
         sum = 0xFFFF
     }
     var sealed = Data()
-    put16(&var sealed, ECHO_PORT)
+    put16(&var sealed, sport)
     put16(&var sealed, dport)
     put16(&var sealed, length as UInt)
     put16(&var sealed, sum)

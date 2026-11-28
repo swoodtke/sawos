@@ -1128,6 +1128,21 @@ NET_ONE_PING_PEER = [
     "peer: closed after 3 frames",
 ]
 
+# The client's line for the lease the peer's DHCP server grants, and the
+# peer's log for a client that takes it and pings the router: the DISCOVER and
+# the REQUEST, then the announcement, the ARP request and the echo request.
+NET_DHCP_LEASE = ("SOS netclient: dhcp lease 10.0.2.15 netmask 255.255.255.0 "
+                  "router 10.0.2.2 dns 10.0.2.3 server 10.0.2.2 for 3600 s")
+NET_DHCP_PEER = [
+    "peer: dhcp discover from 52:54:00:12:34:56, offered 10.0.2.15",
+    "peer: dhcp request for 10.0.2.15 from 52:54:00:12:34:56, acked",
+    "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+    "peer: arp request for 10.0.2.2 from 10.0.2.15 at 52:54:00:12:34:56, "
+    "answered",
+    "peer: echo request 1 from 10.0.2.15, 56 bytes, answered",
+    "peer: closed after 5 frames",
+]
+
 # How long the harness waits before each byte it types.
 #
 # The delay is the test. Handed the whole string up front, the emulator buffers
@@ -17077,6 +17092,130 @@ TEST_CASES = [
                        "SOS: process exit: code={zero} process={one}",
                        "root: net ended status=65536"],
         "expect_peer": ["peer: greeted with 60 bytes", "peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A DHCP client with no address (`tests/net-client`, `dhcp`): the
+        # stack sends the DISCOVER from 0.0.0.0 to the broadcast, takes the
+        # peer's OFFER, sends the REQUEST naming it and takes the ACK, and the
+        # lease configures the stack, which announces the address. The client
+        # then pings the router the lease names, which shows the lease is
+        # what the stack runs on. The client's time is 0 throughout, so
+        # nothing is ever retransmitted and no line depends on a clock; each
+        # line follows the peer's answer to the frame before it.
+        #
+        # TX is the DISCOVER, the REQUEST, the announcement, the ARP request
+        # for the router and the echo request; RX the OFFER, the ACK, the ARP
+        # reply and the echo reply.
+        "name": "net_dhcp",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_dhcp.toml",
+                       "riscv32-flat": "net_dhcp_flat.toml",
+                       "arm64": "net_dhcp_arm64.toml"},
+        "net": {"script": "dhcp"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       NET_DHCP_LEASE,
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=4 tx=5 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_DHCP_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # `net_dhcp` against a peer that does not answer the first DISCOVER
+        # it hears. The client reads the clock and sends another DISCOVER once
+        # its retry interval has passed; that it did is all the case holds of
+        # time: the peer's log has the dropped DISCOVER and then one it
+        # offers to, and the client says it sent another. After the second
+        # DISCOVER the client stops reading the clock, so no later message
+        # can be retransmitted however long the host stalls, and the rest is
+        # `net_dhcp`'s.
+        #
+        # TX is one DISCOVER more than `net_dhcp`'s.
+        "name": "net_dhcp_retry",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_dhcp_retry.toml",
+                       "riscv32-flat": "net_dhcp_retry_flat.toml",
+                       "arm64": "net_dhcp_retry_arm64.toml"},
+        "net": {"script": "dhcp_retry"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: dhcp: no offer, discover sent again",
+                       NET_DHCP_LEASE,
+                       *NET_ONE_PING,
+                       "SOS netclient: driver rx=4 rx_dropped=0 tx=6 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=4 tx=6 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": ["peer: dhcp discover from 52:54:00:12:34:56, dropped",
+                        *NET_DHCP_PEER[:-1],
+                        "peer: closed after 6 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Name resolution (`tests/net-client`, `dns`): the client asks the
+        # peer's DNS server three names from an ephemeral port: `sawos.test`,
+        # which it has, `alias.sawos.test`, which it has by a CNAME to the
+        # first (the answer's names are compressed pointers, and the CNAME's
+        # data points into the question), and `nope.test`, which it does not
+        # (NXDOMAIN). The first query waits for the router's address to be
+        # resolved, and goes when the ARP reply comes. Each line follows the
+        # peer's response.
+        #
+        # TX is the announcement, the ARP request and the three queries; RX the
+        # ARP reply and the three responses.
+        "name": "net_dns",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_dns.toml",
+                       "riscv32-flat": "net_dns_flat.toml",
+                       "arm64": "net_dns_arm64.toml"},
+        "net": {"script": "dns"},
+        "expect_out": ["{banner}",
+                       *NET_DRIVER_UP,
+                       NET_CLIENT_ATTACHED,
+                       "SOS netclient: link up",
+                       "SOS netclient: dns sawos.test is 10.0.2.7, ttl 300",
+                       "SOS netclient: dns alias.sawos.test is 10.0.2.7, "
+                       "ttl 300",
+                       "SOS netclient: dns nope.test: no such name",
+                       "SOS netclient: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netclient: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       NET_DRIVER_GONE,
+                       "SOS netdrv: rx=4 tx=5 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": [
+            "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+            "peer: arp request for 10.0.2.2 from 10.0.2.15 at "
+            "52:54:00:12:34:56, answered",
+            "peer: dns query sawos.test from 10.0.2.15, answered 10.0.2.7",
+            "peer: dns query alias.sawos.test from 10.0.2.15, answered "
+            "10.0.2.7 via sawos.test",
+            "peer: dns query nope.test from 10.0.2.15, no such name",
+            "peer: closed after 5 frames"],
         "expect_clean_exit": True,
     },
     {

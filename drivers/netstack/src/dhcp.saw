@@ -1,0 +1,845 @@
+//! A DHCP client (RFC 2131, with the options of RFC 2132): the messages it
+//! builds and parses, and the state machine that drives them.
+//!
+//! DHCP rides on UDP, a client on port 68 and a server on port 67, in the
+//! BOOTP message of RFC 951:
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       1      op: 1 request, 2 reply
+//! 1       1      hardware type: 1, Ethernet
+//! 2       1      hardware address length: 6
+//! 3       1      hops
+//! 4       4      transaction id (xid)
+//! 8       2      seconds since the client began
+//! 10      2      flags: the high bit asks for a broadcast reply
+//! 12      4      ciaddr: the client's address, when it holds one
+//! 16      4      yiaddr: "your" address, what the server offers
+//! 20      4      siaddr
+//! 24      4      giaddr
+//! 28      16     chaddr: the client's hardware address
+//! 44      64     sname
+//! 108     128    file
+//! 236     4      the magic cookie, 0x63825363
+//! 240            options: code, length, value; 0 pads and 255 ends
+//! ```
+//!
+//! # The client
+//!
+//! A `Client` has no clock, no device and no socket. The caller gives it the
+//! time and the datagrams it received, and sends the datagrams it asks for
+//! from a UDP socket bound to `CLIENT_PORT`, to `SERVER_PORT`:
+//!
+//!   - `poll(now, out)` writes the next message due into `out` and answers
+//!     `Step.Send(len, to)`, the message's length and the address to send
+//!     it to, or `Step.Idle` when nothing is due. Retransmission, renewal and
+//!     the lease's end are all decided here, from `now`;
+//!   - `receive(now, payload, from)` takes a datagram that arrived for the
+//!     port, from the address `from`. A reply that is not one the client is
+//!     waiting for is refused with its reason and changes nothing. The
+//!     message a reply calls for is not sent by `receive`: it is due at once,
+//!     and the caller's next `poll` writes it;
+//!   - `due()` is the time `poll` next has something to do.
+//!
+//! The states and what moves between them:
+//!
+//! ```text
+//! Init        poll: DISCOVER (broadcast)                     -> Selecting
+//! Selecting   OFFER                                          -> Requesting
+//!             poll, after the retry interval: DISCOVER again
+//! Requesting  ACK: the lease begins                          -> Bound
+//!             NAK                                            -> Init
+//!             poll, after the retry interval: REQUEST again;
+//!             after `REQUEST_TRIES` unanswered                -> Init
+//! Bound       poll, at T1, half the lease                    -> Renewing
+//! Renewing    ACK                                            -> Bound
+//!             NAK: the lease is lost                         -> Init
+//!             poll: REQUEST to the server; at T2, 7/8 of the
+//!             lease                                          -> Rebinding
+//! Rebinding   ACK                                            -> Bound
+//!             NAK: the lease is lost                         -> Init
+//!             poll: REQUEST (broadcast); at the lease's end:
+//!             the lease is lost                              -> Init
+//! ```
+//!
+//! Retransmission of a DISCOVER or REQUEST starts at the first retry
+//! interval and doubles to `RETRY_MAX_MS`, the transaction id unchanged, and
+//! a DISCOVER is retried for ever. A renewal's REQUEST is retried every
+//! `RENEW_RETRY_MS`. Every new exchange (a first DISCOVER after `Init`, the
+//! first renewal REQUEST) takes the next transaction id, so a late reply to
+//! the last one is not taken for an answer. The caller picks the first id,
+//! and it must be unpredictable (random, from a source the network cannot
+//! see): the id and the client's hardware address are all that tie a reply to
+//! an exchange, so a guessable first id lets a host on the link forge an OFFER.
+//! Constants are for tests only.
+//!
+//! While renewing, the client has the server's address and asks it alone, so
+//! an ACK or a NAK is taken only from `from` equal to the lease's server.
+//! While rebinding the request is broadcast and any server may answer.
+//! An ACK or NAK is also refused until a REQUEST of the exchange has gone out.
+//!
+//! The client asks for the broadcast reply (the flags' high bit) while it
+//! holds no address, since a server cannot unicast to an address the client
+//! has not configured. The lease time is T1 and T2's basis: options 58 and 59
+//! (the server's own T1 and T2) are not read, nor is option 52, the overload
+//! of `sname` and `file` with options. A renewal's retry is the fixed
+//! `RENEW_RETRY_MS`, not RFC 2131's half of the time left.
+//!
+//! # Refusals
+//!
+//! A reply is checked as input, in the order of `Refusal`'s cases: its
+//! length, its op, its hardware type and length, its transaction id, its
+//! client hardware address (an OFFER for another client), the cookie, and
+//! each option's length against the bytes received, down to an END option.
+//! The options the reply must carry are then held to the message type's:
+//! the server's identifier, and an OFFER's or ACK's lease time and subnet
+//! mask, whose address, mask and router must make a valid interface
+//! configuration (`ipv4.Config`). The server's identifier and the first DNS
+//! server must be hosts one can send to: not 0.0.0.0, a loopback address, a
+//! multicast group or above, or the leased address itself.
+//!
+//! An option that appears twice is read as its last appearance says, except
+//! the message type, whose repetition is refused.
+
+import netstack.addr.{Ipv4Addr, MacAddr}
+import netstack.bytes.{be16, be32, count_up, put16, put32}
+import netstack.ipv4.{Config, ConfigError}
+
+/// The port a server listens on, and the port a client binds.
+public static SERVER_PORT: UInt16 = 67
+public static CLIENT_PORT: UInt16 = 68
+
+/// The bytes of a message the client builds, and so the least `out` that
+/// `Client.poll` is given. A message is padded to the 300 bytes a BOOTP
+/// server may expect (RFC 951).
+public static MESSAGE_BYTES: Int = 300
+
+/// The first retry interval of RFC 2131 §4.1, and the longest one.
+public static DEFAULT_RETRY_MS: UInt64 = 4_000
+public static RETRY_MAX_MS: UInt64 = 64_000
+
+/// How often a renewal's REQUEST is sent again.
+public static RENEW_RETRY_MS: UInt64 = 60_000
+
+/// How many REQUESTs go unanswered before the client starts over with a
+/// DISCOVER.
+public static REQUEST_TRIES: UInt32 = 5
+
+/// A lease of this many seconds does not end (RFC 2131 §3.3).
+public static INFINITE_SECS: UInt32 = 0xFFFF_FFFF
+
+/// A time that never comes.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+static FIXED_BYTES: Int = 236
+static OPTIONS_AT: Int = 240
+static COOKIE: UInt32 = 0x6382_5363
+
+static OP_REQUEST: UInt8 = 1
+static OP_REPLY: UInt8 = 2
+static HTYPE_ETHERNET: UInt8 = 1
+static HLEN_ETHERNET: UInt8 = 6
+static FLAG_BROADCAST: UInt16 = 0x8000
+
+static OPT_PAD: UInt8 = 0
+static OPT_MASK: UInt8 = 1
+static OPT_ROUTER: UInt8 = 3
+static OPT_DNS: UInt8 = 6
+static OPT_REQUESTED: UInt8 = 50
+static OPT_LEASE: UInt8 = 51
+static OPT_TYPE: UInt8 = 53
+static OPT_SERVER: UInt8 = 54
+static OPT_PARAMETERS: UInt8 = 55
+static OPT_END: UInt8 = 255
+
+/// The DHCP message types (option 53).
+public enum MessageType: UInt8 {
+    case Discover = 1,
+    case Offer = 2,
+    case Request = 3,
+    case Ack = 5,
+    case Nak = 6,
+}
+
+@synthesize
+extension MessageType: Equatable {}
+
+// =============================================================================
+// Refusals
+// =============================================================================
+
+/// Why a reply is refused.
+public enum Refusal {
+    /// Shorter than the fixed header and the cookie.
+    case Truncated,
+    /// An op other than a reply.
+    case NotReply,
+    /// A hardware type or address length other than Ethernet's.
+    case BadHardware,
+    /// A transaction id other than the exchange's.
+    case WrongXid,
+    /// A client hardware address that is not ours: a reply for another
+    /// client.
+    case NotOurs,
+    /// A magic cookie other than DHCP's.
+    case BadCookie,
+    /// An option whose length runs past the message, or options with no
+    /// END.
+    case BadOption,
+    /// An option of the given code whose length its value cannot have.
+    case BadLength(code: UInt8),
+    /// No message type.
+    case MissingType,
+    /// A message type a client does not receive.
+    case BadType(raw: UInt8),
+    /// An option the message type requires, absent.
+    case MissingOption(code: UInt8),
+    /// A message type given twice.
+    case RepeatedType,
+    /// The server identifier (54) or the DNS server (6) is not a host one can
+    /// send to.
+    case BadAddress(code: UInt8),
+    /// A lease of no time.
+    case BadLease,
+    /// An address, mask and router that are not an interface's
+    /// configuration.
+    case BadConfig(error: ConfigError),
+    /// A reply that is well formed and not what the client waits for in its
+    /// state.
+    case Unexpected,
+    /// An ACK or NAK from a server other than the one the client chose.
+    case WrongServer,
+    /// An ACK for an address other than the one asked for.
+    case WrongAddress,
+}
+
+@synthesize
+extension Refusal: Equatable {}
+
+extension Refusal {
+    /// What a transcript should call this refusal.
+    public func describe(&self) -> String {
+        match self {
+            case Truncated -> "truncated",
+            case NotReply -> "not a reply",
+            case BadHardware -> "not an Ethernet client",
+            case WrongXid -> "another transaction",
+            case NotOurs -> "for another client",
+            case BadCookie -> "no DHCP cookie",
+            case BadOption -> "a malformed option",
+            case BadLength(_) -> "an option of an impossible length",
+            case MissingType -> "no message type",
+            case BadType(_) -> "a message type a client does not receive",
+            case MissingOption(_) -> "a required option is missing",
+            case RepeatedType -> "a message type given twice",
+            case BadAddress(_) -> "an address that is no host's",
+            case BadLease -> "a lease of no time",
+            case BadConfig(_) -> "not a configuration an interface can have",
+            case Unexpected -> "not the reply the client waits for",
+            case WrongServer -> "from another server",
+            case WrongAddress -> "for another address",
+        }
+    }
+}
+
+extension Refusal: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension Refusal: Error {}
+
+// =============================================================================
+// Messages
+// =============================================================================
+
+/// What a server grants: the interface's configuration, who granted it, the
+/// DNS server it names (0.0.0.0 for none) and for how long.
+public struct Lease {
+    public config: Config,
+    public server: Ipv4Addr,
+    public dns: Ipv4Addr,
+    /// `INFINITE_SECS` for a lease that does not end.
+    public lease_secs: UInt32,
+}
+
+@synthesize
+extension Lease: Equatable {}
+
+extension Lease {
+    /// The address the lease grants.
+    public func address(&self) -> Ipv4Addr {
+        self.config.addr()
+    }
+
+    /// The lease's whole length in milliseconds, or `NEVER`.
+    func total_ms(&self) -> UInt64 {
+        if self.lease_secs == INFINITE_SECS {
+            NEVER
+        } else {
+            (self.lease_secs as UInt64) * 1000
+        }
+    }
+
+    /// T1: when renewing starts, half the lease.
+    func t1_ms(&self) -> UInt64 {
+        let total = self.total_ms()
+        if total == NEVER { NEVER } else { total / 2 }
+    }
+
+    /// T2: when rebinding starts, seven eighths of the lease.
+    func t2_ms(&self) -> UInt64 {
+        let total = self.total_ms()
+        if total == NEVER { NEVER } else { (total / 8) * 7 }
+    }
+}
+
+/// A reply, checked.
+public enum Reply {
+    case Offer(lease: Lease),
+    case Ack(lease: Lease),
+    case Nak(server: Ipv4Addr),
+}
+
+@synthesize
+extension Reply: Equatable {}
+
+/// Writes a message of `kind` from `mac` into `out`, which holds at least
+/// `MESSAGE_BYTES`, and answers its length. `requested` and `server` are
+/// options left out when they are 0.0.0.0, and `ciaddr` is the client's
+/// address when it holds one.
+public func write_message(out: &var [UInt8], mac: MacAddr, xid: UInt32,
+                          kind: MessageType, broadcast: Bool,
+                          ciaddr: Ipv4Addr, requested: Ipv4Addr,
+                          server: Ipv4Addr) -> Int {
+    var i = 0
+    while i < MESSAGE_BYTES {
+        out[i] = 0
+        i = i + 1
+    }
+    out[0] = OP_REQUEST
+    out[1] = HTYPE_ETHERNET
+    out[2] = HLEN_ETHERNET
+    put32(&var out, 4, xid)
+    put16(&var out, 10, if broadcast { FLAG_BROADCAST } else { 0 })
+    ciaddr.write(&var out, 12)
+    mac.write(&var out, 28)
+    put32(&var out, FIXED_BYTES, COOKIE)
+    var at = OPTIONS_AT
+    out[at] = OPT_TYPE
+    out[at + 1] = 1
+    out[at + 2] = kind as UInt8
+    at = at + 3
+    if not requested.is_unspecified() {
+        out[at] = OPT_REQUESTED
+        out[at + 1] = 4
+        requested.write(&var out, at + 2)
+        at = at + 6
+    }
+    if not server.is_unspecified() {
+        out[at] = OPT_SERVER
+        out[at + 1] = 4
+        server.write(&var out, at + 2)
+        at = at + 6
+    }
+    out[at] = OPT_PARAMETERS
+    out[at + 1] = 3
+    out[at + 2] = OPT_MASK
+    out[at + 3] = OPT_ROUTER
+    out[at + 4] = OPT_DNS
+    at = at + 5
+    out[at] = OPT_END
+    MESSAGE_BYTES
+}
+
+/// Whether `a` is a host one can send to: not 0.0.0.0, loopback, multicast or
+/// above (which holds the limited broadcast).
+func usable(a: Ipv4Addr) -> Bool {
+    not a.is_unspecified() && (a.value >> 24) != 127 && a.value < 0xE000_0000
+}
+
+/// The reply in `payload`, the data of a UDP datagram to the client's port,
+/// for the exchange `xid` of the client `mac`, or why it is refused.
+public func parse_reply(payload: &[UInt8], mac: MacAddr,
+                        xid: UInt32) -> Result<Reply, Refusal> {
+    let n = payload.len()
+    if n < OPTIONS_AT {
+        return Refusal.Truncated
+    }
+    if payload[0] != OP_REPLY {
+        return Refusal.NotReply
+    }
+    if payload[1] != HTYPE_ETHERNET || payload[2] != HLEN_ETHERNET {
+        return Refusal.BadHardware
+    }
+    if be32(&payload, 4) != xid {
+        return Refusal.WrongXid
+    }
+    if MacAddr(bytes: &payload, at: 28) != mac {
+        return Refusal.NotOurs
+    }
+    if be32(&payload, FIXED_BYTES) != COOKIE {
+        return Refusal.BadCookie
+    }
+    var kind: UInt8 = 0
+    var server = Ipv4Addr.unspecified()
+    var mask = Ipv4Addr.unspecified()
+    var router = Ipv4Addr.unspecified()
+    var dns = Ipv4Addr.unspecified()
+    var lease_secs: UInt32 = 0
+    var has_type = false
+    var has_server = false
+    var has_mask = false
+    var has_dns = false
+    var has_lease = false
+    var ended = false
+    var i = OPTIONS_AT
+    while i < n {
+        let code = payload[i]
+        if code == OPT_PAD {
+            i = i + 1
+            continue
+        }
+        if code == OPT_END {
+            ended = true
+            break
+        }
+        if i + 1 >= n {
+            return Refusal.BadOption
+        }
+        let len = payload[i + 1] as Int
+        let at = i + 2
+        if at + len > n {
+            return Refusal.BadOption
+        }
+        if code == OPT_TYPE {
+            if len != 1 {
+                return Refusal.BadLength(code)
+            }
+            if has_type {
+                return Refusal.RepeatedType
+            }
+            kind = payload[at]
+            has_type = true
+        } else if code == OPT_SERVER {
+            if len != 4 {
+                return Refusal.BadLength(code)
+            }
+            server = Ipv4Addr(bytes: &payload, at: at)
+            has_server = true
+        } else if code == OPT_LEASE {
+            if len != 4 {
+                return Refusal.BadLength(code)
+            }
+            lease_secs = be32(&payload, at)
+            has_lease = true
+        } else if code == OPT_MASK {
+            if len != 4 {
+                return Refusal.BadLength(code)
+            }
+            mask = Ipv4Addr(bytes: &payload, at: at)
+            has_mask = true
+        } else if code == OPT_ROUTER {
+            if len < 4 || (len % 4) != 0 {
+                return Refusal.BadLength(code)
+            }
+            router = Ipv4Addr(bytes: &payload, at: at)
+        } else if code == OPT_DNS {
+            if len < 4 || (len % 4) != 0 {
+                return Refusal.BadLength(code)
+            }
+            dns = Ipv4Addr(bytes: &payload, at: at)
+            has_dns = true
+        }
+        i = at + len
+    }
+    if not ended {
+        return Refusal.BadOption
+    }
+    if kind == 0 {
+        return Refusal.MissingType
+    }
+    guard let known = MessageType.from(raw: kind) else {
+        return Refusal.BadType(kind)
+    }
+    if known == MessageType.Discover || known == MessageType.Request {
+        return Refusal.BadType(kind)
+    }
+    if not has_server {
+        return Refusal.MissingOption(OPT_SERVER)
+    }
+    if not usable(server) {
+        return Refusal.BadAddress(OPT_SERVER)
+    }
+    if known == MessageType.Nak {
+        return Reply.Nak(server)
+    }
+    if not has_lease {
+        return Refusal.MissingOption(OPT_LEASE)
+    }
+    if lease_secs == 0 {
+        return Refusal.BadLease
+    }
+    if not has_mask {
+        return Refusal.MissingOption(OPT_MASK)
+    }
+    let config = try Config(addr: Ipv4Addr(bytes: &payload, at: 16),
+                            netmask: mask, gateway: router) catch {
+        return Refusal.BadConfig(error)
+    }
+    if server == config.addr() {
+        return Refusal.BadAddress(OPT_SERVER)
+    }
+    if has_dns && (not usable(dns) || dns == config.addr()) {
+        return Refusal.BadAddress(OPT_DNS)
+    }
+    let lease = Lease(config: config, server: server, dns: dns,
+                      lease_secs: lease_secs)
+    if known == MessageType.Offer {
+        return Reply.Offer(lease)
+    }
+    return Reply.Ack(lease)
+}
+
+// =============================================================================
+// The client
+// =============================================================================
+
+/// Where the client is in the exchange.
+public enum State {
+    case Init,
+    case Selecting,
+    case Requesting,
+    case Bound,
+    case Renewing,
+    case Rebinding,
+}
+
+@synthesize
+extension State: Equatable {}
+
+/// What the client asks of its caller.
+public enum Step {
+    /// Nothing is due.
+    case Idle,
+    /// A message of `len` bytes is in `out`, for the address `to`.
+    case Send(len: Int, to: Ipv4Addr),
+    /// A lease began or was renewed.
+    case Leased(lease: Lease),
+    /// The lease the client held is gone, ended or refused: the interface
+    /// has no address now, and the client starts over.
+    case Lost,
+}
+
+@synthesize
+extension Step: Equatable {}
+
+/// A time `delay` after `time`, held at the clock's top.
+func after(time: UInt64, delay: UInt64) -> UInt64 {
+    if delay > NEVER - time { NEVER } else { time + delay }
+}
+
+func least(a: UInt64, b: UInt64) -> UInt64 {
+    if a < b { a } else { b }
+}
+
+func next_xid(xid: UInt32) -> UInt32 {
+    if xid == 0xFFFF_FFFF { 0 } else { xid + 1 }
+}
+
+/// One interface's DHCP client.
+public struct Client {
+    mac: MacAddr,
+    xid: UInt32,
+    first_retry_ms: UInt64,
+    phase: State,
+    /// The wait after the last message of the state's, which doubles with
+    /// each retransmission.
+    interval: UInt64,
+    /// The messages sent in the state.
+    tries: UInt32,
+    /// When `poll` next has something to do.
+    next: UInt64,
+    /// When the exchange in progress sent its first message: the lease it
+    /// brings begins then.
+    exchange_from: UInt64,
+    /// When the lease held began.
+    lease_from: UInt64,
+    offered: Lease?,
+    leased: Lease?,
+}
+
+extension Client {
+    /// A client for the interface `mac`, whose first transaction id is
+    /// `xid`, retrying after `first_retry_ms` (clamped to 1 and
+    /// `RETRY_MAX_MS`). It is in `Init`: its first `poll` sends a DISCOVER.
+    public init(mac: MacAddr, xid: UInt32, first_retry_ms: UInt64) -> Client {
+        let first = if first_retry_ms == 0 {
+            1
+        } else {
+            least(first_retry_ms, RETRY_MAX_MS)
+        }
+        Client(mac: mac, xid: xid, first_retry_ms: first, phase: State.Init,
+               interval: first, tries: 0, next: 0, exchange_from: 0,
+               lease_from: 0, offered: None, leased: None)
+    }
+
+    public func state(&self) -> State {
+        self.phase
+    }
+
+    /// The transaction id of the exchange in progress.
+    public func transaction(&self) -> UInt32 {
+        self.xid
+    }
+
+    /// The messages sent in the current state.
+    public func attempts(&self) -> UInt32 {
+        self.tries
+    }
+
+    /// The lease held, or `None` when there is none.
+    public func lease(&self) -> Lease? {
+        self.leased
+    }
+
+    /// The time `poll` next has something to send or decide: 0 in `Init`.
+    public func due(&self) -> UInt64 {
+        match self.phase {
+            case Init -> 0,
+            case _ -> self.next,
+        }
+    }
+
+    /// Takes a datagram the port received at `now` from `from`: the step it
+    /// brings, or why it is refused.
+    public func receive(&var self, now: UInt64, payload: &[UInt8],
+                        from: Ipv4Addr) -> Result<Step, Refusal> {
+        let reply = try parse_reply(&payload, self.mac, self.xid)
+        match self.phase {
+            case Selecting -> { return self.reply_selecting(reply, now) },
+            case Requesting -> { return self.reply_requesting(reply, now) },
+            case Renewing -> { return self.reply_renewing(reply, from, true) },
+            case Rebinding -> { return self.reply_renewing(reply, from, false) },
+            case _ -> { return Refusal.Unexpected },
+        }
+    }
+
+    /// The next message due at `now`, written into `out` (`MESSAGE_BYTES`
+    /// at least), or the lease's end.
+    public func poll(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        match self.phase {
+            case Init -> self.poll_init(now, &var out),
+            case Selecting -> self.poll_selecting(now, &var out),
+            case Requesting -> self.poll_requesting(now, &var out),
+            case Bound -> self.poll_bound(now, &var out),
+            case Renewing -> self.poll_renewing(now, &var out),
+            case Rebinding -> self.poll_rebinding(now, &var out),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Replies
+    // -------------------------------------------------------------------------
+
+    func reply_selecting(&var self, reply: Reply,
+                         now: UInt64) -> Result<Step, Refusal> {
+        match reply {
+            case Offer(lease) -> {
+                self.phase = State.Requesting
+                self.offered = lease
+                self.tries = 0
+                self.interval = self.first_retry_ms
+                self.next = now
+                return Step.Idle
+            },
+            case _ -> { return Refusal.Unexpected },
+        }
+    }
+
+    func reply_requesting(&var self, reply: Reply,
+                          now: UInt64) -> Result<Step, Refusal> {
+        guard let offer = self.offered else { return Refusal.Unexpected }
+        // No answer to a REQUEST that has not been sent.
+        if self.tries == 0 {
+            return Refusal.Unexpected
+        }
+        match reply {
+            case Ack(lease) -> {
+                if lease.server != offer.server {
+                    return Refusal.WrongServer
+                }
+                if lease.address() != offer.address() {
+                    return Refusal.WrongAddress
+                }
+                return self.bind(lease)
+            },
+            case Nak(server) -> {
+                if server != offer.server {
+                    return Refusal.WrongServer
+                }
+                self.restart()
+                return Step.Idle
+            },
+            case Offer(_) -> { return Refusal.Unexpected },
+        }
+    }
+
+    func reply_renewing(&var self, reply: Reply, from: Ipv4Addr,
+                        unicast: Bool) -> Result<Step, Refusal> {
+        guard let held = self.leased else { return Refusal.Unexpected }
+        if unicast && from != held.server {
+            return Refusal.WrongServer
+        }
+        match reply {
+            case Ack(lease) -> {
+                if lease.address() != held.address() {
+                    return Refusal.WrongAddress
+                }
+                return self.bind(lease)
+            },
+            case Nak(_) -> {
+                self.restart()
+                return Step.Lost
+            },
+            case Offer(_) -> { return Refusal.Unexpected },
+        }
+    }
+
+    /// The lease begins, from the exchange's first message.
+    func bind(&var self, lease: Lease) -> Result<Step, Refusal> {
+        self.phase = State.Bound
+        self.leased = lease
+        self.offered = None
+        self.lease_from = self.exchange_from
+        self.next = after(self.lease_from, lease.t1_ms())
+        return Step.Leased(lease)
+    }
+
+    /// Starts over from `Init`, holding nothing.
+    func restart(&var self) {
+        self.phase = State.Init
+        self.offered = None
+        self.leased = None
+    }
+
+    // -------------------------------------------------------------------------
+    // What is due
+    // -------------------------------------------------------------------------
+
+    func poll_init(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        self.xid = next_xid(self.xid)
+        self.phase = State.Selecting
+        self.tries = 0
+        self.interval = self.first_retry_ms
+        self.send_discover(now, &var out)
+    }
+
+    func poll_selecting(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        if now < self.next {
+            return Step.Idle
+        }
+        self.back_off()
+        self.send_discover(now, &var out)
+    }
+
+    func poll_requesting(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        if now < self.next {
+            return Step.Idle
+        }
+        guard let offer = self.offered else {
+            self.restart()
+            return self.poll_init(now, &var out)
+        }
+        if self.tries >= REQUEST_TRIES {
+            self.restart()
+            return self.poll_init(now, &var out)
+        }
+        if self.tries == 0 {
+            self.exchange_from = now
+        } else {
+            self.back_off()
+        }
+        let n = write_message(&var out, self.mac, self.xid,
+                              MessageType.Request, true,
+                              Ipv4Addr.unspecified(), offer.address(),
+                              offer.server)
+        self.tries = count_up(self.tries)
+        self.next = after(now, self.interval)
+        return Step.Send(n, Ipv4Addr.broadcast())
+    }
+
+    func poll_bound(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        if now < self.next {
+            return Step.Idle
+        }
+        self.xid = next_xid(self.xid)
+        self.phase = State.Renewing
+        self.tries = 0
+        self.exchange_from = now
+        self.next = now
+        self.poll_renewing(now, &var out)
+    }
+
+    func poll_renewing(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        guard let held = self.leased else {
+            self.restart()
+            return Step.Lost
+        }
+        if now >= after(self.lease_from, held.t2_ms()) {
+            self.phase = State.Rebinding
+            self.next = now
+            return self.poll_rebinding(now, &var out)
+        }
+        if now < self.next {
+            return Step.Idle
+        }
+        let n = write_message(&var out, self.mac, self.xid,
+                              MessageType.Request, false, held.address(),
+                              Ipv4Addr.unspecified(),
+                              Ipv4Addr.unspecified())
+        self.tries = count_up(self.tries)
+        self.next = least(after(now, RENEW_RETRY_MS),
+                          after(self.lease_from, held.t2_ms()))
+        return Step.Send(n, held.server)
+    }
+
+    func poll_rebinding(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        guard let held = self.leased else {
+            self.restart()
+            return Step.Lost
+        }
+        let end = after(self.lease_from, held.total_ms())
+        if now >= end {
+            self.restart()
+            return Step.Lost
+        }
+        if now < self.next {
+            return Step.Idle
+        }
+        let n = write_message(&var out, self.mac, self.xid,
+                              MessageType.Request, false, held.address(),
+                              Ipv4Addr.unspecified(),
+                              Ipv4Addr.unspecified())
+        self.tries = count_up(self.tries)
+        self.next = least(after(now, RENEW_RETRY_MS), end)
+        return Step.Send(n, Ipv4Addr.broadcast())
+    }
+
+    /// Doubles the retry interval, up to `RETRY_MAX_MS`.
+    func back_off(&var self) {
+        self.interval = least(self.interval * 2, RETRY_MAX_MS)
+    }
+
+    func send_discover(&var self, now: UInt64, out: &var [UInt8]) -> Step {
+        let n = write_message(&var out, self.mac, self.xid,
+                              MessageType.Discover, true,
+                              Ipv4Addr.unspecified(),
+                              Ipv4Addr.unspecified(),
+                              Ipv4Addr.unspecified())
+        self.tries = count_up(self.tries)
+        self.next = after(now, self.interval)
+        return Step.Send(n, Ipv4Addr.broadcast())
+    }
+}

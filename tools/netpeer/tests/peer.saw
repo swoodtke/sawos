@@ -606,6 +606,9 @@ func script_tests() {
     check(known("burst"), "burst")
     check(known("log"), "log")
     check(known("silent"), "silent")
+    check(known("dhcp"), "dhcp")
+    check(known("dhcp_retry"), "dhcp_retry")
+    check(known("dns"), "dns")
     check(not known("loud"), "no other")
 }
 
@@ -645,6 +648,610 @@ func greeting_tests() {
     check(h.replies.len() == 1, "greet answers ARP with one frame")
 }
 
+// ---- DHCP ------------------------------------------------------------------
+
+static LEASE_IP: UInt = 0x0A00_020F
+static LEASE_MASK: UInt = 0xFFFF_FF00
+static ROUTER_IP: UInt = 0x0A00_0202
+static DNS_SERVER_IP: UInt = 0x0A00_0203
+static LIMITED: UInt = 0xFFFF_FFFF
+
+/// `n` zero bytes.
+func zeros(d: &var Data, n: Int) {
+    var i = 0
+    while i < n {
+        put(&var d, 0, 1)
+        i = i + 1
+    }
+}
+
+func append(d: &var Data, more: &Data) {
+    var i = 0
+    while i < more.len() {
+        put(&var d, (more.get(i) ?? Byte(0)) as UInt, 1)
+        i = i + 1
+    }
+}
+
+/// A UDP datagram of `payload` from `sport` to `dport` with the checksum of a
+/// datagram from `src` to `dst`, broken when `broken`.
+func udp_of(sport: UInt, dport: UInt, payload: &Data, src: UInt, dst: UInt,
+            broken: Bool) -> Data {
+    let length = 8 + payload.len()
+    var u = Data()
+    put(&var u, sport, 2)
+    put(&var u, dport, 2)
+    put(&var u, length as UInt, 2)
+    put(&var u, 0, 2)
+    append(&var u, &payload)
+    let seed = (src >> 16) + (src & 0xFFFF) + (dst >> 16) + (dst & 0xFFFF) +
+               17 + (length as UInt)
+    var field = inet(&u, 0, u.len(), seed)
+    if field == 0 {
+        field = 0xFFFF
+    }
+    if broken {
+        field = field ^ 0x0100
+    }
+    var out = Data()
+    put(&var out, sport, 2)
+    put(&var out, dport, 2)
+    put(&var out, length as UInt, 2)
+    put(&var out, field, 2)
+    append(&var out, &payload)
+    out
+}
+
+/// The client's DHCP message, field by field.
+struct DhcpSpec {
+    op: UInt,
+    htype: UInt,
+    hlen: UInt,
+    cookie: UInt,
+    xid: UInt,
+    flags: UInt,
+    ciaddr: UInt,
+    /// The message type option, or 0 for none.
+    kind: UInt,
+    /// The requested address and server identifier options, or 0 for none.
+    requested: UInt,
+    server: UInt,
+    /// Whether the options end with an END.
+    end: Bool,
+}
+
+extension DhcpSpec {
+    static func discover() -> DhcpSpec {
+        DhcpSpec(op: 1, htype: 1, hlen: 6, cookie: 0x6382_5363, xid: 0x1234_5679,
+                 flags: 0x8000, ciaddr: 0, kind: 1, requested: 0, server: 0,
+                 end: true)
+    }
+
+    /// The REQUEST that answers an offer from the peer.
+    static func request() -> DhcpSpec {
+        var s = DhcpSpec.discover()
+        s.kind = 3
+        s.requested = LEASE_IP
+        s.server = PEER_IP
+        s
+    }
+
+    func message(&self) -> Data {
+        var m = Data()
+        put(&var m, self.op, 1)
+        put(&var m, self.htype, 1)
+        put(&var m, self.hlen, 1)
+        put(&var m, 0, 1)
+        put(&var m, self.xid, 4)
+        put(&var m, 0, 2)
+        put(&var m, self.flags, 2)
+        put(&var m, self.ciaddr, 4)
+        zeros(&var m, 12)
+        put(&var m, GUEST_MAC, 6)
+        var pad = 0
+        while pad < 10 + 64 + 128 {
+            put(&var m, 0, 1)
+            pad = pad + 1
+        }
+        put(&var m, self.cookie, 4)
+        // A pad and an option of no interest ride before the ones that count.
+        put(&var m, 0, 1)
+        put(&var m, 12, 1)
+        put(&var m, 3, 1)
+        put_text(&var m, "box")
+        if self.kind != 0 {
+            put(&var m, 53, 1)
+            put(&var m, 1, 1)
+            put(&var m, self.kind, 1)
+        }
+        if self.requested != 0 {
+            put(&var m, 50, 1)
+            put(&var m, 4, 1)
+            put(&var m, self.requested, 4)
+        }
+        if self.server != 0 {
+            put(&var m, 54, 1)
+            put(&var m, 4, 1)
+            put(&var m, self.server, 4)
+        }
+        if self.end {
+            put(&var m, 255, 1)
+        }
+        m
+    }
+}
+
+/// The frame a client with no address sends: broadcast, from 0.0.0.0 to
+/// 255.255.255.255, port 68 to port 67.
+func broadcast_frame(payload: &Data) -> Data {
+    let u = udp_of(68, 67, &payload, 0, LIMITED, false)
+    let spec = IpSpec(dst_mac: BROADCAST, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                      break_sum: false, src: 0, dst: LIMITED, proto: 17)
+    spec.frame(&u)
+}
+
+/// The client's frame to the peer alone, from the address it holds.
+func renewing_frame(payload: &Data) -> Data {
+    let u = udp_of(68, 67, &payload, LEASE_IP, PEER_IP, false)
+    let spec = IpSpec(dst_mac: PEER_MAC, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                      break_sum: false, src: LEASE_IP, dst: PEER_IP, proto: 17)
+    spec.frame(&u)
+}
+
+func ip_name(ip: UInt) -> String {
+    "{(ip >> 24) & 0xFF}.{(ip >> 16) & 0xFF}.{(ip >> 8) & 0xFF}.{ip & 0xFF}"
+}
+
+/// The server's reply `r`: a frame to `dst_mac` and `dst_ip` from the peer's
+/// port 67 to port 68, whose BOOTP message is a reply of `kind` to exchange
+/// `xid`, `flags` echoed, `ciaddr` echoed as zero, with the lease when it
+/// grants one.
+func check_reply(r: &Data, dst_mac: UInt, dst_ip: UInt, kind: UInt, xid: UInt,
+                 flags: UInt, what: String) {
+    let granted = kind != 6
+    let bootp = if granted { 240 + 3 + 6 + 6 + 6 + 6 + 6 + 1 } else { 240 + 3 + 6 + 1 }
+    check(r.len() == 14 + 20 + 8 + bootp, "{what}: the frame's length")
+    check(at(&r, 0, 6) == dst_mac, "{what}: link destination")
+    check(at(&r, 6, 6) == PEER_MAC, "{what}: from the peer")
+    check(at(&r, 12, 2) == IPV4, "{what}: IPv4")
+    check(at(&r, 14, 2) == 0x4500, "{what}: version and header length")
+    check(at(&r, 16, 2) == ((20 + 8 + bootp) as UInt), "{what}: IP length")
+    check(at(&r, 23, 1) == 17, "{what}: UDP")
+    check(inet(&r, 14, 20, 0) == 0, "{what}: a good header checksum")
+    check(at(&r, 26, 4) == PEER_IP, "{what}: from the peer's IP")
+    check(at(&r, 30, 4) == dst_ip, "{what}: IP destination")
+    check(at(&r, 34, 2) == 67 && at(&r, 36, 2) == 68, "{what}: ports 67 to 68")
+    check(at(&r, 38, 2) == ((8 + bootp) as UInt), "{what}: UDP length")
+    let seed = (PEER_IP >> 16) + (PEER_IP & 0xFFFF) + (dst_ip >> 16) +
+               (dst_ip & 0xFFFF) + 17 + ((8 + bootp) as UInt)
+    check(inet(&r, 34, 8 + bootp, seed) == 0, "{what}: a good UDP checksum")
+    check(at(&r, 42, 4) == 0x0201_0600, "{what}: reply, Ethernet, six, no hops")
+    check(at(&r, 46, 4) == xid, "{what}: the transaction")
+    check(at(&r, 50, 2) == 0 && at(&r, 52, 2) == flags, "{what}: no seconds, flags echoed")
+    check(at(&r, 54, 4) == 0, "{what}: no ciaddr")
+    check(at(&r, 58, 4) == (if granted { LEASE_IP } else { 0 }), "{what}: yiaddr")
+    check(at(&r, 62, 4) == 0 && at(&r, 66, 4) == 0, "{what}: no siaddr or giaddr")
+    check(at(&r, 70, 6) == GUEST_MAC, "{what}: the client's address")
+    check(at(&r, 42 + 236, 4) == 0x6382_5363, "{what}: the cookie")
+    let o = 42 + 240
+    check(at(&r, o, 3) == 0x350100 + kind, "{what}: the message type")
+    check(at(&r, o + 3, 2) == 0x3604 && at(&r, o + 5, 4) == PEER_IP, "{what}: the server")
+    if granted {
+        check(at(&r, o + 9, 2) == 0x3304 && at(&r, o + 11, 4) == 3600, "{what}: the lease")
+        check(at(&r, o + 15, 2) == 0x0104 && at(&r, o + 17, 4) == LEASE_MASK, "{what}: the mask")
+        check(at(&r, o + 21, 2) == 0x0304 && at(&r, o + 23, 4) == ROUTER_IP, "{what}: the router")
+        check(at(&r, o + 27, 2) == 0x0604 && at(&r, o + 29, 4) == DNS_SERVER_IP,
+              "{what}: the DNS server")
+        check(at(&r, o + 33, 1) == 255, "{what}: the end")
+    } else {
+        check(at(&r, o + 9, 1) == 255, "{what}: the end")
+    }
+}
+
+func dhcp_tests() {
+    let who = "52:54:00:12:34:56"
+    let discover = DhcpSpec.discover().message()
+    let df = broadcast_frame(&discover)
+
+    // DISCOVER: an OFFER, to everyone.
+    let h = run(Script.Dhcp, &df)
+    lines_are(&h, &one("peer: dhcp discover from {who}, offered 10.0.2.15"), "discover")
+    check(h.replies.len() == 1, "one OFFER")
+    check_reply(&(h.replies.get(0) ?? Data()), BROADCAST, LIMITED, 2, 0x1234_5679,
+                0x8000, "the OFFER")
+
+    // REQUEST naming the offer and its server: an ACK, to everyone.
+    let request = DhcpSpec.request().message()
+    let rf = broadcast_frame(&request)
+    let a = run(Script.Dhcp, &rf)
+    lines_are(&a, &one("peer: dhcp request for 10.0.2.15 from {who}, acked"), "request")
+    check(a.replies.len() == 1, "one ACK")
+    check_reply(&(a.replies.get(0) ?? Data()), BROADCAST, LIMITED, 5, 0x1234_5679,
+                0x8000, "the ACK")
+
+    // A REQUEST for another address is refused with a NAK.
+    var other = DhcpSpec.request()
+    other.requested = 0x0A00_0210
+    let of = broadcast_frame(&other.message())
+    let n = run(Script.Dhcp, &of)
+    lines_are(&n, &one("peer: dhcp request for 10.0.2.16 from {who}, refused"), "nak")
+    check(n.replies.len() == 1, "one NAK")
+    check_reply(&(n.replies.get(0) ?? Data()), BROADCAST, LIMITED, 6, 0x1234_5679,
+                0x8000, "the NAK")
+
+    // A REQUEST that chose another server is not for the peer.
+    var chose = DhcpSpec.request()
+    chose.server = 0x0A00_0209
+    let cf = broadcast_frame(&chose.message())
+    let c = run(Script.Dhcp, &cf)
+    lines_are(&c, &one("peer: dhcp request from {who} for another server"), "other server")
+    check(c.replies.len() == 0, "and not answered")
+
+    // A renewal: ciaddr and no broadcast, to the peer; the ACK goes to the
+    // client's address, not to everyone.
+    var renew = DhcpSpec.request()
+    renew.flags = 0
+    renew.ciaddr = LEASE_IP
+    renew.requested = 0
+    renew.server = 0
+    renew.xid = 0x1234_567A
+    let nf = renewing_frame(&renew.message())
+    let r = run(Script.Dhcp, &nf)
+    lines_are(&r, &one("peer: dhcp request for 10.0.2.15 from {who}, acked"), "renewal")
+    check(r.replies.len() == 1, "one ACK to the renewal")
+    let ack = r.replies.get(0) ?? Data()
+    check(at(&ack, 0, 6) == GUEST_MAC && at(&ack, 30, 4) == LEASE_IP,
+          "to the client alone")
+    check(at(&ack, 46, 4) == 0x1234_567A && at(&ack, 52, 2) == 0, "of its exchange")
+    check(inet(&ack, 14, 20, 0) == 0, "a good header")
+
+    // The retrying script says nothing to the first DISCOVER, and offers to
+    // the second.
+    var peer = Peer(script: Script.DhcpRetry)
+    let first = peer.handle(&df)
+    lines_are(&first, &one("peer: dhcp discover from {who}, dropped"), "dropped")
+    check(first.replies.len() == 0, "the first is not answered")
+    let second = peer.handle(&df)
+    lines_are(&second, &one("peer: dhcp discover from {who}, offered 10.0.2.15"), "retried")
+    check(second.replies.len() == 1, "the second is")
+    let third = peer.handle(&df)
+    check(third.replies.len() == 1, "and so is every one after")
+    // `dhcp` drops nothing.
+    var plain = Peer(script: Script.Dhcp)
+    check(plain.handle(&df).replies.len() == 1, "the first, for `dhcp`")
+    // A REQUEST is not a DISCOVER: the retrying script answers it.
+    var fresh = Peer(script: Script.DhcpRetry)
+    check(fresh.handle(&rf).replies.len() == 1, "a REQUEST is answered at once")
+
+    // The DHCP script still answers ARP.
+    let ask = ArpSpec.request(PEER_IP).frame()
+    check(run(Script.Dhcp, &ask).replies.len() == 1, "dhcp answers ARP")
+    check(run(Script.DhcpRetry, &ask).replies.len() == 1, "dhcp_retry answers ARP")
+}
+
+func dhcp_refusals() {
+    let bad = "a datagram to port 67 that is no DHCP request"
+    let discover = DhcpSpec.discover().message()
+    let df = broadcast_frame(&discover)
+
+    // A broadcast frame is the DHCP server's alone.
+    refused(Script.Ping, &df, "an IPv4 frame to ff:ff:ff:ff:ff:ff", "broadcast, no server")
+    // And so is a datagram to the port.
+    let unicast = renewing_frame(&discover)
+    refused(Script.Ping, &unicast, "a UDP datagram to port 67", "port 67, no server")
+
+    // Only UDP to 255.255.255.255 in a broadcast frame.
+    let pinged = IpSpec(dst_mac: BROADCAST, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                        break_sum: false, src: 0, dst: LIMITED, proto: 1)
+    let echo = icmp(8, 0, 1, 1, 8, false)
+    refuse(Script.Dhcp, pinged.frame(&echo), "IPv4 protocol 1", "a broadcast echo")
+    let directed = IpSpec(dst_mac: BROADCAST, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                          break_sum: false, src: 0, dst: 0x0A00_02FF, proto: 17)
+    let u = udp_of(68, 67, &discover, 0, 0x0A00_02FF, false)
+    refuse(Script.Dhcp, directed.frame(&u),
+            "an IPv4 packet to 10.0.2.255 in a broadcast frame", "a directed broadcast")
+
+    // The datagram's checksum is held to the broadcast address it names.
+    let broken = udp_of(68, 67, &discover, 0, LIMITED, true)
+    let spec = IpSpec(dst_mac: BROADCAST, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                      break_sum: false, src: 0, dst: LIMITED, proto: 17)
+    refuse(Script.Dhcp, spec.frame(&broken), "a UDP checksum", "a UDP checksum on DHCP")
+
+    // From a port that is not the client's.
+    let wrong_port = udp_of(1234, 67, &discover, 0, LIMITED, false)
+    refuse(Script.Dhcp, spec.frame(&wrong_port), "a DHCP message from port 1234", "source port")
+
+    // Each field of the message, one at a time.
+    var op = DhcpSpec.discover()
+    op.op = 2
+    refuse(Script.Dhcp, bcast(&op), bad, "op")
+    var htype = DhcpSpec.discover()
+    htype.htype = 6
+    refuse(Script.Dhcp, bcast(&htype), bad, "hardware type")
+    var hlen = DhcpSpec.discover()
+    hlen.hlen = 8
+    refuse(Script.Dhcp, bcast(&hlen), bad, "hardware length")
+    var cookie = DhcpSpec.discover()
+    cookie.cookie = 0x6382_5364
+    refuse(Script.Dhcp, bcast(&cookie), bad, "cookie")
+    let short = trimmed(&discover, 239)
+    refuse(Script.Dhcp, broadcast_frame(&short), bad, "a message of 239 bytes")
+
+    // The options.
+    var open = DhcpSpec.discover()
+    open.end = false
+    refuse(Script.Dhcp, bcast(&open), "DHCP options with no end",
+            "no END")
+    var past = DhcpSpec.discover()
+    past.end = false
+    var pm = past.message()
+    put(&var pm, 54, 1)
+    put(&var pm, 9, 1)
+    put(&var pm, 0, 2)
+    refuse(Script.Dhcp, broadcast_frame(&pm), "DHCP options with no end",
+            "an option past the message")
+    var decline = DhcpSpec.discover()
+    decline.kind = 4
+    refuse(Script.Dhcp, bcast(&decline), "a DHCP message of type 4",
+            "a DECLINE")
+    var none = DhcpSpec.discover()
+    none.kind = 0
+    refuse(Script.Dhcp, bcast(&none), "a DHCP message of type 0",
+            "no message type")
+
+    // A frame that is not DHCP at all, to the port, under the DHCP script.
+    var tiny = Data()
+    put(&var tiny, 0, 6)
+    let tf = renewing_frame(&tiny)
+    refused(Script.Dhcp, &tf, bad, "a datagram of six bytes")
+}
+
+// ---- DNS -------------------------------------------------------------------
+
+/// A query with `id` and `flags` for `labels` (each a text, in order) of
+/// `qtype` and `qclass`, with `questions` and `answers` counts, `extra` bytes
+/// of nothing after it.
+struct DnsSpec {
+    id: UInt,
+    flags: UInt,
+    questions: UInt,
+    answers: UInt,
+    qtype: UInt,
+    qclass: UInt,
+    name: Data,
+    extra: Int,
+}
+
+extension DnsSpec: NoCopy {}
+
+extension DnsSpec {
+    /// The query for a name given as dotted text.
+    static func asking(text: String) -> DnsSpec {
+        var name = Data()
+        var label = Data()
+        var i = 0
+        while i <= text.len() {
+            let dot = i == text.len() || (text.byte_at(i) as UInt) == 0x2E
+            if dot {
+                put(&var name, label.len() as UInt, 1)
+                append(&var name, &label)
+                label = Data()
+            } else {
+                put(&var label, text.byte_at(i) as UInt, 1)
+            }
+            i = i + 1
+        }
+        put(&var name, 0, 1)
+        DnsSpec(id: 0x4321, flags: 0x0100, questions: 1, answers: 0, qtype: 1,
+                qclass: 1, name: name, extra: 0)
+    }
+
+    func message(&self) -> Data {
+        var m = Data()
+        put(&var m, self.id, 2)
+        put(&var m, self.flags, 2)
+        put(&var m, self.questions, 2)
+        put(&var m, self.answers, 2)
+        put(&var m, 0, 4)
+        append(&var m, &self.name)
+        put(&var m, self.qtype, 2)
+        put(&var m, self.qclass, 2)
+        var i = 0
+        while i < self.extra {
+            put(&var m, 0, 1)
+            i = i + 1
+        }
+        m
+    }
+}
+
+/// A frame from the guest to the peer carrying `payload` from port 4000 to
+/// port 53.
+func dns_frame(payload: &Data) -> Data {
+    let u = udp_of(4000, 53, &payload, GUEST_IP, PEER_IP, false)
+    IpSpec.to_peer(17).frame(&u)
+}
+
+/// The peer's response in `r`: to the guest, from port 53 to 4000, its DNS
+/// message `dns_len` bytes, the header's flags and counts as given.
+func check_response(r: &Data, dns_len: Int, flags: UInt, answers: UInt, what: String) {
+    check(r.len() == ether_padded(14 + 20 + 8 + dns_len), "{what}: the frame's length")
+    check(at(&r, 0, 6) == GUEST_MAC, "{what}: to the asker")
+    check(at(&r, 6, 6) == PEER_MAC, "{what}: from the peer")
+    check(at(&r, 16, 2) == ((20 + 8 + dns_len) as UInt), "{what}: IP length")
+    check(inet(&r, 14, 20, 0) == 0, "{what}: a good header checksum")
+    check(at(&r, 26, 4) == PEER_IP && at(&r, 30, 4) == GUEST_IP, "{what}: addresses")
+    check(at(&r, 34, 2) == 53 && at(&r, 36, 2) == 4000, "{what}: ports 53 to 4000")
+    check(at(&r, 38, 2) == ((8 + dns_len) as UInt), "{what}: UDP length")
+    let seed = (PEER_IP >> 16) + (PEER_IP & 0xFFFF) + (GUEST_IP >> 16) +
+               (GUEST_IP & 0xFFFF) + 17 + ((8 + dns_len) as UInt)
+    check(inet(&r, 34, 8 + dns_len, seed) == 0, "{what}: a good UDP checksum")
+    check(at(&r, 42, 2) == 0x4321, "{what}: the id")
+    check(at(&r, 44, 2) == flags, "{what}: the flags")
+    check(at(&r, 46, 2) == 1 && at(&r, 48, 2) == answers, "{what}: the counts")
+    check(at(&r, 50, 4) == 0, "{what}: no authority or additional")
+}
+
+func ether_padded(n: Int) -> Int {
+    if n < 60 { 60 } else { n }
+}
+
+func dns_tests() {
+    let who = "10.0.2.15"
+
+    // A name in the table: one A record, its owner a pointer to the question.
+    let known = DnsSpec.asking("sawos.test").message()
+    let h = run(Script.Dns, &dns_frame(&known))
+    lines_are(&h, &one("peer: dns query sawos.test from {who}, answered 10.0.2.7"), "known")
+    check(h.replies.len() == 1, "one response")
+    let r = h.replies.get(0) ?? Data()
+    // The question is 12 + 12 + 4 bytes, the answer 2 + 10 + 4.
+    check_response(&r, 12 + 12 + 4 + 16, 0x8180, 1, "sawos.test")
+    let a = 42 + 12 + 12 + 4
+    check(at(&r, a, 2) == 0xC00C, "the owner points at the question's name")
+    check(at(&r, a + 2, 4) == 0x0001_0001, "type A, class IN")
+    check(at(&r, a + 6, 4) == 300, "the time to live")
+    check(at(&r, a + 10, 2) == 4 && at(&r, a + 12, 4) == 0x0A00_0207, "the address")
+    var q = 0
+    while q < 12 + 4 {
+        check(at(&r, 54 + q, 1) == at(&known, 12 + q, 1), "the question repeats")
+        q = q + 1
+    }
+
+    // The alias: a CNAME to `sawos.test`, and its A record.
+    let alias = DnsSpec.asking("alias.sawos.test").message()
+    let al = run(Script.Dns, &dns_frame(&alias))
+    lines_are(&al, &one("peer: dns query alias.sawos.test from {who}, answered 10.0.2.7 via sawos.test"),
+              "alias")
+    let ar = al.replies.get(0) ?? Data()
+    // The question is 12 + 18 + 4 bytes; the answers 2 + 10 + 2 and 2 + 10 + 4.
+    check_response(&ar, 12 + 18 + 4 + 14 + 16, 0x8180, 2, "alias.sawos.test")
+    let c = 42 + 12 + 18 + 4
+    check(at(&ar, c, 2) == 0xC00C, "the CNAME's owner is the question's name")
+    check(at(&ar, c + 2, 4) == 0x0005_0001, "type CNAME, class IN")
+    check(at(&ar, c + 6, 4) == 300 && at(&ar, c + 10, 2) == 2, "its time and length")
+    check(at(&ar, c + 12, 2) == 0xC012, "its data points at `sawos.test`")
+    check(at(&ar, c + 14, 2) == 0xC012, "the A record's owner is that name")
+    check(at(&ar, c + 16, 4) == 0x0001_0001, "type A, class IN")
+    check(at(&ar, c + 26, 4) == 0x0A00_0207, "its address")
+
+    // A name that is not in the table.
+    let nope = DnsSpec.asking("nope.test").message()
+    let nx = run(Script.Dns, &dns_frame(&nope))
+    lines_are(&nx, &one("peer: dns query nope.test from {who}, no such name"), "unknown")
+    check_response(&(nx.replies.get(0) ?? Data()), 12 + 11 + 4, 0x8183, 0, "nope.test")
+
+    // Without the recursion-desired bit it is not echoed; names are matched
+    // as they are sent.
+    var plain = DnsSpec.asking("sawos.test")
+    plain.flags = 0
+    let pf = run(Script.Dns, &dnsf(&plain))
+    check_response(&(pf.replies.get(0) ?? Data()), 12 + 12 + 4 + 16, 0x8080, 1, "no RD")
+    let upper = DnsSpec.asking("SAWOS.test").message()
+    let uf = run(Script.Dns, &dns_frame(&upper))
+    lines_are(&uf, &one("peer: dns query sawos.test from {who}, answered 10.0.2.7"),
+              "the name is logged in lower case")
+
+    // The DNS script still answers ARP, and others do not serve DNS.
+    let ask = ArpSpec.request(PEER_IP).frame()
+    check(run(Script.Dns, &ask).replies.len() == 1, "dns answers ARP")
+    refuse(Script.Ping, dns_frame(&known), "a UDP datagram to port 53", "no DNS under ping")
+}
+
+func dns_refusals() {
+    let bad = "a datagram to port 53 that is no DNS query"
+    let plain_query = DnsSpec.asking("sawos.test").message()
+
+    var opcode = DnsSpec.asking("sawos.test")
+    opcode.flags = 0x0900
+    refuse(Script.Dns, dnsf(&opcode), bad, "an opcode")
+    var two = DnsSpec.asking("sawos.test")
+    two.questions = 2
+    refuse(Script.Dns, dnsf(&two), bad, "two questions")
+    var answered = DnsSpec.asking("sawos.test")
+    answered.answers = 1
+    refuse(Script.Dns, dnsf(&answered), bad, "an answer in a query")
+    var tiny = Data()
+    zeros(&var tiny, 11)
+    refuse(Script.Dns, dns_frame(&tiny), bad, "a message of 11 bytes")
+
+    var aaaa = DnsSpec.asking("sawos.test")
+    aaaa.qtype = 28
+    refuse(Script.Dns, dnsf(&aaaa),
+            "a DNS question that is not an A query for one name", "type")
+    var chaos = DnsSpec.asking("sawos.test")
+    chaos.qclass = 3
+    refuse(Script.Dns, dnsf(&chaos),
+            "a DNS question that is not an A query for one name", "class")
+    var extra = DnsSpec.asking("sawos.test")
+    extra.extra = 1
+    refuse(Script.Dns, dnsf(&extra),
+            "a DNS question that is not an A query for one name", "bytes after the question")
+
+    // The name: a label past the message, a pointer, no end.
+    var m = Data()
+    put(&var m, 0x4321, 2)
+    put(&var m, 0x0100, 2)
+    put(&var m, 1, 2)
+    put(&var m, 0, 6)
+    put(&var m, 30, 1)
+    put_text(&var m, "abc")
+    refuse(Script.Dns, dns_frame(&m), "a DNS label of 30 bytes", "a label past the message")
+    var p = Data()
+    put(&var p, 0x4321, 2)
+    put(&var p, 0x0100, 2)
+    put(&var p, 1, 2)
+    put(&var p, 0, 6)
+    put(&var p, 0xC0, 1)
+    put(&var p, 0x0C, 1)
+    put(&var p, 1, 4)
+    refuse(Script.Dns, dns_frame(&p), "a DNS label of 192 bytes", "a pointer in a query")
+    // A label of 64 bytes, inside the message: past what a label may be.
+    var big = Data()
+    put(&var big, 0x4321, 2)
+    put(&var big, 0x0100, 2)
+    put(&var big, 1, 2)
+    put(&var big, 0, 6)
+    put(&var big, 64, 1)
+    zeros(&var big, 64)
+    put(&var big, 0, 1)
+    put(&var big, 0x0001_0001, 4)
+    refuse(Script.Dns, dns_frame(&big), "a DNS label of 64 bytes", "a label of 64")
+    var e = Data()
+    put(&var e, 0x4321, 2)
+    put(&var e, 0x0100, 2)
+    put(&var e, 1, 2)
+    put(&var e, 0, 6)
+    put(&var e, 3, 1)
+    put_text(&var e, "abc")
+    refuse(Script.Dns, dns_frame(&e), "a DNS name that does not end", "no end")
+
+    // Only to the peer's address.
+    let broadcast = IpSpec(dst_mac: BROADCAST, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                           break_sum: false, src: GUEST_IP, dst: LIMITED, proto: 17)
+    let u = udp_of(4000, 53, &plain_query, GUEST_IP, LIMITED, false)
+    refuse(Script.Dns, broadcast.frame(&u), "an IPv4 frame to ff:ff:ff:ff:ff:ff", "a broadcast")
+    let elsewhere = IpSpec(dst_mac: PEER_MAC, vihl: 0x45, length_delta: 0, flags: 0x4000,
+                           break_sum: false, src: GUEST_IP, dst: 0x0A00_0203, proto: 17)
+    let eu = udp_of(4000, 53, &plain_query, GUEST_IP, 0x0A00_0203, false)
+    refuse(Script.Dns, elsewhere.frame(&eu), "an IPv4 packet to 10.0.2.3", "another address")
+}
+
+/// `refused`, for a frame made in the call.
+func refuse(script: Script, frame: Data, line: String, what: String) {
+    refused(script, &frame, line, what)
+}
+
+func bcast(spec: &DhcpSpec) -> Data {
+    let m = spec.message()
+    broadcast_frame(&m)
+}
+
+func dnsf(spec: &DnsSpec) -> Data {
+    let m = spec.message()
+    dns_frame(&m)
+}
+
 func main() {
     greeting_tests()
     arp_tests()
@@ -652,4 +1259,8 @@ func main() {
     ip_tests()
     udp_tests()
     script_tests()
+    dhcp_tests()
+    dhcp_refusals()
+    dns_tests()
+    dns_refusals()
 }

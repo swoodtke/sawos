@@ -49,6 +49,11 @@
 //!
 //! # What the layer answers
 //!
+//! A stack with no address (before `configure`, and after `deconfigure`)
+//! takes only UDP datagrams sent to the limited broadcast, and sends only
+//! UDP datagrams to it, from 0.0.0.0: what a DHCP client needs to get an
+//! address (`dhcp`). Everything else is refused until it has one.
+//!
 //! An echo request to our address is answered with an echo reply, unless it
 //! came from 0.0.0.0. A UDP datagram to a closed port is answered with a port
 //! unreachable, at most one each `icmp.UNREACHABLE_INTERVAL_MS` that goes out,
@@ -301,6 +306,18 @@ extension Stack {
         }
     }
 
+    /// Takes the interface's address away, as a lease that ended does: what
+    /// waited on a resolution is dropped (`Drop.ArpReaddressed`) and the ARP
+    /// table forgotten, since the next address may be on another network.
+    public func deconfigure(&var self) {
+        self.settings = None
+        while self.pending.len() != 0 {
+            self.pending.remove(0)
+            self.tally.add_drop(Drop.ArpReaddressed)
+        }
+        self.cache = arp.Cache.empty()
+    }
+
     /// Takes a frame the device received at `now`. Whatever it calls for
     /// (an ARP reply, an echo reply, a port unreachable, a datagram handed up,
     /// frames that waited on the sender's address) goes to `sink` before this
@@ -351,20 +368,27 @@ extension Stack {
     public func udp_send<S: Sink>(&var self, id: UInt8, to: SocketAddr,
                                   data: &[UInt8], now: UInt64,
                                   sink: &var S) -> Result<Void, SendError> {
-        guard let cfg = self.settings else { return SendError.NotConfigured }
         guard let port = self.ports.port_of(id) else {
             return SendError.NoSocket
         }
         if data.len() > MAX_UDP_DATA {
             return SendError.TooLong
         }
-        if to.port == 0 || not cfg.sends_to(to.addr) {
-            return SendError.BadAddress
+        if let cfg = self.settings {
+            if to.port == 0 || not cfg.sends_to(to.addr) {
+                return SendError.BadAddress
+            }
+        } else {
+            // With no address a datagram can only be broadcast, from 0.0.0.0
+            // (`send_ipv4` refuses any other).
+            if to.port == 0 {
+                return SendError.BadAddress
+            }
         }
         var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
         put_bytes(&var frame, PAYLOAD_AT + udp.HEADER_BYTES, &data)
-        let n = udp.write_header(&var frame[PAYLOAD_AT..], cfg.addr(), to.addr,
-                                 port, to.port, data.len())
+        let n = udp.write_header(&var frame[PAYLOAD_AT..], self.address(),
+                                 to.addr, port, to.port, data.len())
         try self.send_ipv4(&var frame, to.addr, ipv4.Protocol.Udp, n, false,
                            now, &var sink)
         self.tally.add(Count.DatagramsSent)
@@ -482,23 +506,34 @@ extension Stack {
             self.tally.add_drop(error)
             return
         }
-        guard let cfg = self.settings else {
-            self.tally.add_drop(Drop.IpNotOurs)
-            return
-        }
-        let broadcast = cfg.is_broadcast(header.dst)
-        if header.dst != cfg.addr() && not broadcast {
-            self.tally.add_drop(Drop.IpNotOurs)
-            return
-        }
         // RFC 1122 §3.2.1.3: a broadcast or multicast source is discarded. So
         // is our own address: there is no loopback, so a datagram that names
         // it came off the link from a station claiming to be us, and nothing
         // is answered to it.
-        if cfg.is_broadcast(header.src) || header.src.is_multicast() ||
-           header.src == cfg.addr() {
-            self.tally.add_drop(Drop.IpBadSource)
-            return
+        var broadcast = header.dst.is_broadcast()
+        if let cfg = self.settings {
+            broadcast = cfg.is_broadcast(header.dst)
+            if header.dst != cfg.addr() && not broadcast {
+                self.tally.add_drop(Drop.IpNotOurs)
+                return
+            }
+            if cfg.is_broadcast(header.src) || header.src.is_multicast() ||
+               header.src == cfg.addr() {
+                self.tally.add_drop(Drop.IpBadSource)
+                return
+            }
+        } else {
+            // With no address only a limited broadcast is ours, and only a
+            // UDP datagram of it is taken.
+            let udp_kind = ipv4.Protocol.Udp as UInt8
+            if not broadcast || header.protocol != udp_kind {
+                self.tally.add_drop(Drop.IpNotOurs)
+                return
+            }
+            if header.src.is_broadcast() || header.src.is_multicast() {
+                self.tally.add_drop(Drop.IpBadSource)
+                return
+            }
         }
         guard let protocol = ipv4.Protocol.from(raw: header.protocol) else {
             self.tally.add_drop(Drop.IpProtocol)
@@ -631,11 +666,16 @@ extension Stack {
                             protocol: ipv4.Protocol, payload_bytes: Int,
                             reply: Bool, now: UInt64,
                             sink: &var S) -> Result<Void, SendError> {
-        guard let cfg = self.settings else { return SendError.NotConfigured }
-        let broadcast = cfg.is_broadcast(dst)
+        var broadcast = dst.is_broadcast()
+        if let cfg = self.settings {
+            broadcast = cfg.is_broadcast(dst)
+        }
         // A broadcast goes to every station and has no next hop to resolve.
         var hop = dst
         if not broadcast {
+            guard let cfg = self.settings else {
+                return SendError.NotConfigured
+            }
             guard let next = cfg.next_hop(dst) else {
                 self.tally.add_drop(Drop.IpNoRoute)
                 return SendError.NoRoute
@@ -643,7 +683,7 @@ extension Stack {
             hop = next
         }
         let ident = self.next_ident()
-        ipv4.write_header(&var frame[ether.HEADER_BYTES..], cfg.addr(), dst,
+        ipv4.write_header(&var frame[ether.HEADER_BYTES..], self.address(), dst,
                           protocol, ident, ipv4.DEFAULT_TTL, payload_bytes)
         let header = ether.Header(dst: MacAddr.broadcast(), src: self.link_addr,
                                   ether_type: ether.EtherType.Ipv4 as UInt16)

@@ -1367,6 +1367,136 @@ func readdressed() {
     check(r.sent_only(1), "and is announced")
 }
 
+/// What a DHCP client needs of a stack with no address: it takes UDP
+/// datagrams to the limited broadcast and sends them from 0.0.0.0, and
+/// refuses anything else until it has an address.
+func unaddressed() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let limited = Ipv4Addr.broadcast()
+    let server = SocketAddr(addr: ip_b(), port: 67)
+    var r = Recorder.fresh()
+    var s = Stack(mac: mac_a())
+    let client = try! s.udp_open(68)
+
+    // A datagram to the limited broadcast, from a host, reaches the port.
+    let offer = udp_from(server, MacAddr.broadcast(),
+                         SocketAddr(addr: limited, port: 68), &data)
+    feed(&var s, &offer, 0, &var r)
+    check(r.got.len() == 1 && r.frames.len() == 0,
+          "a broadcast datagram is delivered")
+    check(r.got[0].delivery == Delivery.Datagram(client.id, server) &&
+          same(&r.got[0].data.bytes[..r.got[0].data.len], &data),
+          "to the socket bound to the port, from the sender")
+    check(no_drops(&s) && s.count(Count.DatagramsDelivered) == 1, "and counted")
+
+    // To a port nobody holds: dropped, and no unreachable goes back to a
+    // broadcast.
+    r.clear()
+    let closed = udp_from(server, MacAddr.broadcast(),
+                          SocketAddr(addr: limited, port: 9), &data)
+    feed(&var s, &closed, 0, &var r)
+    check(dropped(&s, Drop.UdpNoPort, 1) && r.sent_only(0),
+          "a broadcast to a closed port is dropped and not answered")
+
+    // Everything else is refused: the subnet's broadcast, other protocols,
+    // and a source that is no host.
+    var t = Stack(mac: mac_a())
+    let _ = try! t.udp_open(68)
+    let directed = udp_from(server, MacAddr.broadcast(),
+                            SocketAddr(addr: subnet_broadcast(), port: 68), &data)
+    feed(&var t, &directed, 0, &var r)
+    check(dropped(&t, Drop.IpNotOurs, 1) && r.sent_only(0),
+          "a subnet broadcast is not ours without a subnet")
+    var u = Stack(mac: mac_a())
+    let _ = try! u.udp_open(68)
+    let ping = echo_from(ip_b(), MacAddr.broadcast(), limited)
+    feed(&var u, &ping, 0, &var r)
+    check(dropped(&u, Drop.IpNotOurs, 1) && r.sent_only(0),
+          "an echo request to the broadcast is not answered without an address")
+    var v = Stack(mac: mac_a())
+    let _ = try! v.udp_open(68)
+    let from_all = udp_from(SocketAddr(addr: limited, port: 67),
+                            MacAddr.broadcast(),
+                            SocketAddr(addr: limited, port: 68), &data)
+    feed(&var v, &from_all, 0, &var r)
+    check(dropped(&v, Drop.IpBadSource, 1) && r.sent_only(0),
+          "a datagram from the broadcast address")
+    var w = Stack(mac: mac_a())
+    let _ = try! w.udp_open(68)
+    let from_group = udp_from(SocketAddr(addr: Ipv4Addr(a: 224, b: 0, c: 0, d: 9),
+                                         port: 67), MacAddr.broadcast(),
+                              SocketAddr(addr: limited, port: 68), &data)
+    feed(&var w, &from_group, 0, &var r)
+    check(dropped(&w, Drop.IpBadSource, 1) && r.sent_only(0),
+          "a datagram from a multicast group")
+
+    // It sends a datagram to the limited broadcast from 0.0.0.0, with no
+    // address to resolve it with.
+    r.clear()
+    var x = Stack(mac: mac_a())
+    let c2 = try! x.udp_open(68)
+    check(fails(x.udp_send(c2.id, server, &data, 0, &var r),
+                SendError.NotConfigured), "a host needs an address to reach")
+    check(r.frames.len() == 0, "and nothing is sent")
+    let to_all = SocketAddr(addr: limited, port: 67)
+    try! x.udp_send(c2.id, to_all, &data, 0, &var r)
+    check(r.sent_only(1) && x.count(Count.DatagramsSent) == 1, "one frame")
+    let f = r.frames[0]
+    check(f.len == 60 && f.bytes[0] == 0xFF && f.bytes[5] == 0xFF &&
+          f.bytes[11] == 0x0A && f.bytes[12] == 0x08 && f.bytes[13] == 0x00,
+          "broadcast from A, IPv4")
+    check(f.bytes[26] == 0 && f.bytes[27] == 0 && f.bytes[28] == 0 &&
+          f.bytes[29] == 0 && f.bytes[30] == 0xFF && f.bytes[31] == 0xFF &&
+          f.bytes[32] == 0xFF && f.bytes[33] == 0xFF,
+          "from 0.0.0.0 to 255.255.255.255")
+    check(f.bytes[34] == 0 && f.bytes[35] == 68 && f.bytes[36] == 0 &&
+          f.bytes[37] == 67 && f.bytes[42] == 0x68 && f.bytes[43] == 0x69,
+          "from port 68 to port 67, with the data")
+    let ip = try! ipv4.Header(packet: &f.bytes[14..f.len])
+    let dg = try! udp.Header(datagram: &f.bytes[34..(14 + ip.total())],
+                             src: Ipv4Addr.unspecified(), dst: limited)
+    check(ip.src == Ipv4Addr.unspecified() && dg.length() == 10,
+          "its checksums verify")
+
+    // Not a datagram to a port 0, and not an echo.
+    check(fails(x.udp_send(c2.id, SocketAddr(addr: limited, port: 0), &data, 0,
+                           &var r), SendError.BadAddress), "port 0")
+    check(fails(x.ping(limited, 1, 1, &data, 0, &var r), SendError.NotConfigured),
+          "an echo needs an address")
+    check(fails(x.udp_send(c2.id, SocketAddr(addr: subnet_broadcast(), port: 67),
+                           &data, 0, &var r), SendError.NotConfigured),
+          "only the limited broadcast without an address")
+}
+
+/// Taking the address away: what waited on it is dropped, what was learned
+/// is forgotten, and the stack is as one with no address.
+func deconfigured() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    check(s.resolved(ip_b(), 0) != None, "B is known")
+    let socket = try! s.udp_open(7)
+    try! s.udp_send(socket.id, SocketAddr(addr: ip_c(), port: 9), &data, 0, &var r)
+    try! s.udp_send(socket.id, SocketAddr(addr: ip_c(), port: 9), &data, 0, &var r)
+    check(s.pending_frames() == 2, "two frames wait for C")
+    s.deconfigure()
+    check(s.config() == None, "no configuration")
+    check(s.pending_frames() == 0 && dropped(&s, Drop.ArpReaddressed, 2),
+          "what waited was built with the old address")
+    check(s.resolved(ip_b(), 0) == None, "the ARP table is forgotten")
+    r.clear()
+    let to_a = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &data)
+    feed(&var s, &to_a, 0, &var r)
+    check(s.drops(Drop.IpNotOurs) == 1 && r.sent_only(0),
+          "a datagram to the old address is not ours")
+    check(fails(s.udp_send(socket.id, SocketAddr(addr: ip_b(), port: 9), &data, 0,
+                           &var r), SendError.NotConfigured),
+          "nothing is sent to a host")
+    // And it takes an address again, announcing it.
+    s.configure(config_a(), &var r)
+    check(r.sent_only(1) && s.config() == config_a(), "configured again")
+}
+
 func main() {
     announcements()
     arp_answers()
@@ -1386,4 +1516,6 @@ func main() {
     options()
     reply_bound()
     readdressed()
+    unaddressed()
+    deconfigured()
 }

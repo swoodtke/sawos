@@ -1,0 +1,285 @@
+// The DHCP client over the stack: the datagrams it asks for leave as frames
+// from 0.0.0.0, a server's replies arrive as broadcast and unicast frames,
+// the lease configures the stack, a renewal is resolved and sent from the
+// leased address, and a lease lost takes the address away.
+//
+// A is the client, 02:00:00:00:00:0a; S is the server, 02:00:00:00:00:0c at
+// 10.0.0.2, offering 10.0.0.1/24 for an hour with 10.0.0.254 as the router.
+
+import netstack.{Delivery, Drop, Ipv4Addr, MacAddr, Sink, SinkError, SocketAddr, Stack}
+import netstack.arp
+import netstack.bytes.{put_bytes}
+import netstack.dhcp
+import netstack.dhcp.{Client, Lease, Step}
+import netstack.ether
+import netstack.ipv4
+import netstack.udp
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func mac_s() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0C]) }
+func ip_server() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func ip_lease() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func limited() -> Ipv4Addr { Ipv4Addr.broadcast() }
+
+static FRAME_BYTES: Int = 1514
+
+struct Frame {
+    len: Int,
+    bytes: [UInt8; FRAME_BYTES],
+}
+
+extension Frame {
+    init(copying: &[UInt8]) -> Frame {
+        var f = Frame(len: copying.len(), bytes: [0; FRAME_BYTES])
+        put_bytes(&var f.bytes, 0, &copying)
+        f
+    }
+}
+
+/// The wire, as the stack sees it: the frames it sent, and the last datagram
+/// it handed up.
+struct Wire {
+    frames: Vector<Frame>,
+    datagram: Frame,
+    from: Ipv4Addr,
+    delivered: Int,
+}
+
+extension Wire: NoCopy {}
+
+extension Wire: Sink {
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError> {
+        try! self.frames.push(Frame(copying: &frame))
+        return
+    }
+
+    func deliver(&var self, delivery: Delivery,
+                 data: &[UInt8]) -> Result<Void, SinkError> {
+        self.datagram = Frame(copying: &data)
+        match delivery {
+            case Datagram(_, from) -> { self.from = from.addr },
+            case _ -> {},
+        }
+        self.delivered = self.delivered + 1
+        return
+    }
+}
+
+extension Wire {
+    static func fresh() -> Wire {
+        Wire(frames: Vector<Frame>(), datagram: Frame(len: 0, bytes: [0; FRAME_BYTES]),
+             from: Ipv4Addr.unspecified(), delivered: 0)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The server's frames
+// -----------------------------------------------------------------------------
+
+static REPLY_HEAD: [UInt8; 20] = [
+    0x02, 0x01, 0x06, 0x00, 0x12, 0x34, 0x56, 0x79,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0A, 0x00, 0x00, 0x01,
+]
+
+static OFFER_OPTIONS: [UInt8; 34] = [
+    0x35, 0x01, 0x02,
+    0x36, 0x04, 0x0A, 0x00, 0x00, 0x02,
+    0x33, 0x04, 0x00, 0x00, 0x0E, 0x10,
+    0x01, 0x04, 0xFF, 0xFF, 0xFF, 0x00,
+    0x03, 0x04, 0x0A, 0x00, 0x00, 0xFE,
+    0x06, 0x04, 0x0A, 0x00, 0x00, 0x35,
+    0xFF,
+]
+
+static ACK_OPTIONS: [UInt8; 34] = [
+    0x35, 0x01, 0x05,
+    0x36, 0x04, 0x0A, 0x00, 0x00, 0x02,
+    0x33, 0x04, 0x00, 0x00, 0x0E, 0x10,
+    0x01, 0x04, 0xFF, 0xFF, 0xFF, 0x00,
+    0x03, 0x04, 0x0A, 0x00, 0x00, 0xFE,
+    0x06, 0x04, 0x0A, 0x00, 0x00, 0x35,
+    0xFF,
+]
+
+static NAK_OPTIONS: [UInt8; 10] = [
+    0x35, 0x01, 0x06, 0x36, 0x04, 0x0A, 0x00, 0x00, 0x02, 0xFF,
+]
+
+/// A server's reply to the exchange `xid` carrying `options`: the BOOTP
+/// message in 300 bytes.
+func message(xid: UInt32, options: &[UInt8]) -> Frame {
+    var m = Frame(len: 300, bytes: [0; FRAME_BYTES])
+    var i = 0
+    while i < REPLY_HEAD.len() {
+        m.bytes[i] = REPLY_HEAD[i]
+        i = i + 1
+    }
+    m.bytes[4] = ((xid >> 24) & 0xFF) as UInt8
+    m.bytes[5] = ((xid >> 16) & 0xFF) as UInt8
+    m.bytes[6] = ((xid >> 8) & 0xFF) as UInt8
+    m.bytes[7] = (xid & 0xFF) as UInt8
+    m.bytes[28] = 0x02
+    m.bytes[33] = 0x0A
+    m.bytes[236] = 0x63
+    m.bytes[237] = 0x82
+    m.bytes[238] = 0x53
+    m.bytes[239] = 0x63
+    put_bytes(&var m.bytes, 240, &options)
+    m
+}
+
+/// The frame carrying `payload` from the server's port 67 to `dst_ip`'s port
+/// 68, link to `dst_mac`.
+func from_server(dst_mac: MacAddr, dst_ip: Ipv4Addr, payload: &Frame) -> Frame {
+    var f = Frame(len: 0, bytes: [0; FRAME_BYTES])
+    put_bytes(&var f.bytes, 42, &payload.bytes[..payload.len])
+    let n = udp.write_header(&var f.bytes[34..], ip_server(), dst_ip, 67, 68,
+                             payload.len)
+    ipv4.write_header(&var f.bytes[14..], ip_server(), dst_ip,
+                      ipv4.Protocol.Udp, 1, 64, n)
+    ether.Header(dst: dst_mac, src: mac_s(), ether_type: 0x0800).write(&var f.bytes)
+    f.len = 14 + 20 + n
+    f
+}
+
+/// The reply to the server's ARP request for the lease: the server's own.
+func arp_reply_from_server() -> Frame {
+    var p: [UInt8; 28] = [0; 28]
+    arp.Packet(op: arp.ArpOp.Reply, sender_mac: mac_s(), sender_ip: ip_server(),
+               target_mac: mac_a(), target_ip: ip_lease()).write(&var p)
+    var f = Frame(len: 60, bytes: [0; FRAME_BYTES])
+    ether.Header(dst: mac_a(), src: mac_s(), ether_type: 0x0806).write(&var f.bytes)
+    put_bytes(&var f.bytes, 14, &p)
+    f
+}
+
+// -----------------------------------------------------------------------------
+// The client, driven
+// -----------------------------------------------------------------------------
+
+/// What `poll` asked for at `now`, sent as `udp_send` from the socket `id`.
+func send_due(c: &var Client, s: &var Stack, id: UInt8, now: UInt64,
+              w: &var Wire) -> Step {
+    var out: [UInt8; 300] = [0; 300]
+    let step = c.poll(now, &var out)
+    match step {
+        case Send(len, to) -> {
+            try! s.udp_send(id, SocketAddr(addr: to, port: dhcp.SERVER_PORT),
+                            &out[..len], now, &var w)
+        },
+        case _ -> {},
+    }
+    step
+}
+
+/// Feeds `f` to the stack, and what it delivers to the client; answers the
+/// client's step, or `Idle` when nothing was delivered.
+func hear(c: &var Client, s: &var Stack, f: &Frame, now: UInt64, w: &var Wire) -> Step {
+    let before = w.delivered
+    s.receive(&f.bytes[..f.len], now, &var w)
+    if w.delivered == before {
+        return Step.Idle
+    }
+    try! c.receive(now, &w.datagram.bytes[..w.datagram.len], w.from)
+}
+
+/// The lease a step grants, or `None`.
+func lease_of(step: Step) -> Lease? {
+    match step {
+        case Leased(lease) -> lease,
+        case _ -> None,
+    }
+}
+
+func lease_over_the_stack() {
+    var w = Wire.fresh()
+    var s = Stack(mac: mac_a())
+    let socket = try! s.udp_open(dhcp.CLIENT_PORT)
+    var c = Client(mac: mac_a(), xid: 0x1234_5678, first_retry_ms: 100)
+
+    // DISCOVER: a broadcast from 0.0.0.0, port 68 to port 67.
+    check(send_due(&var c, &var s, socket.id, 0, &var w) == Step.Send(300, limited()),
+          "the DISCOVER is due")
+    check(w.frames.len() == 1, "and sent")
+    let d = w.frames[0]
+    check(d.len == 14 + 20 + 8 + 300 && d.bytes[0] == 0xFF && d.bytes[11] == 0x0A &&
+          d.bytes[26] == 0 && d.bytes[29] == 0 && d.bytes[30] == 0xFF &&
+          d.bytes[33] == 0xFF && d.bytes[35] == 68 && d.bytes[37] == 67,
+          "from 0.0.0.0 to the broadcast, 68 to 67")
+    check(d.bytes[42] == 1 && d.bytes[46] == 0x12 && d.bytes[49] == 0x79 &&
+          d.bytes[42 + 240] == 0x35 && d.bytes[42 + 242] == 1,
+          "carrying the DISCOVER")
+
+    // OFFER, broadcast to us: then the REQUEST.
+    let offer = from_server(MacAddr.broadcast(), limited(),
+                            &message(0x1234_5679, &OFFER_OPTIONS))
+    check(hear(&var c, &var s, &offer, 5, &var w) == Step.Idle, "the OFFER is taken")
+    check(send_due(&var c, &var s, socket.id, 5, &var w) == Step.Send(300, limited()),
+          "the REQUEST is due")
+    check(w.frames.len() == 2 && w.frames[1].bytes[42 + 242] == 3, "and sent")
+
+    // ACK: the lease configures the stack, which announces its address.
+    let ack = from_server(MacAddr.broadcast(), limited(),
+                          &message(0x1234_5679, &ACK_OPTIONS))
+    let granted = lease_of(hear(&var c, &var s, &ack, 10, &var w))!
+    s.configure(granted.config, &var w)
+    check(s.config() == granted.config && s.config()!.addr() == ip_lease(),
+          "the stack holds the lease's configuration")
+    check(w.frames.len() == 3 && w.frames[2].bytes[12] == 0x08 &&
+          w.frames[2].bytes[13] == 0x06, "and announces it")
+    check(s.drops(Drop.IpNotOurs) == 0, "nothing was refused on the way")
+
+    // At T1 the renewal goes to the server alone, from the leased address:
+    // its next hop is resolved first, and the REQUEST waits for the answer.
+    let t1: UInt64 = 10 + 1_800_000
+    check(send_due(&var c, &var s, socket.id, t1, &var w) == Step.Send(300, ip_server()),
+          "the renewal is due at T1")
+    check(w.frames.len() == 4 && s.pending_frames() == 1 &&
+          w.frames[3].bytes[12] == 0x08 && w.frames[3].bytes[13] == 0x06,
+          "the server's address is asked for first")
+    let arp_reply = arp_reply_from_server()
+    s.receive(&arp_reply.bytes[..arp_reply.len], t1, &var w)
+    check(w.frames.len() == 5 && s.pending_frames() == 0, "then the renewal goes")
+    let r = w.frames[4]
+    check(r.bytes[0] == 0x02 && r.bytes[5] == 0x0C && r.bytes[26] == 10 &&
+          r.bytes[29] == 1 && r.bytes[30] == 10 && r.bytes[33] == 2 &&
+          r.bytes[35] == 68 && r.bytes[37] == 67,
+          "to the server's link address, from 10.0.0.1 to 10.0.0.2")
+    check(r.bytes[42 + 12] == 10 && r.bytes[42 + 15] == 1 &&
+          r.bytes[42 + 242] == 3, "its ciaddr is the leased address")
+
+    // The server answers by unicast: the renewal's ACK.
+    let renewed = from_server(mac_a(), ip_lease(),
+                              &message(0x1234_567A, &ACK_OPTIONS))
+    let again = hear(&var c, &var s, &renewed, t1 + 3, &var w)
+    check(again == Step.Leased(granted), "the renewal is a lease")
+
+    // Another exchange ends in a NAK at T1 on: the lease is lost, and the
+    // stack's address goes with it.
+    let t1_again: UInt64 = t1 + 1_800_000
+    check(send_due(&var c, &var s, socket.id, t1_again, &var w) == Step.Send(300, ip_server()),
+          "the next renewal")
+    let nak = from_server(mac_a(), ip_lease(), &message(0x1234_567B, &NAK_OPTIONS))
+    let lost = hear(&var c, &var s, &nak, t1_again + 1, &var w)
+    check(lost == Step.Lost, "the NAK loses the lease")
+    s.deconfigure()
+    check(s.config() == None, "and the address")
+    let before = w.frames.len()
+    check(send_due(&var c, &var s, socket.id, t1_again + 2, &var w) ==
+              Step.Send(300, limited()), "the client starts over")
+    check(w.frames.len() == before + 1 && w.frames[before].bytes[26] == 0,
+          "from 0.0.0.0 again")
+}
+
+func main() {
+    lease_over_the_stack()
+}
