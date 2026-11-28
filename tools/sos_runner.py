@@ -2033,6 +2033,7 @@ def expectations(arch):
         "eleven": f"0x{11:0{width}x}",
         "twelve": f"0x{12:0{width}x}",
         "thirteen": f"0x{13:0{width}x}",
+        "sixteen": f"0x{16:0{width}x}",
         "seventeen": f"0x{17:0{width}x}",
         "twenty_five": f"0x{25:0{width}x}",
         "twenty_nine": f"0x{29:0{width}x}",
@@ -2751,6 +2752,289 @@ _CONSOLE_PRINT_CASES = _console_print_cases(
                   "riscv32-flat": f"{name}_flat.toml",
                   "arm64": f"{name}_arm64.toml"})
 
+
+# What the console's watchdog prints, through the debug print, once it has
+# killed a stalled claimant, and the kill's status word: `Killed` with the
+# watchdog's code, `CONSOLE_STALLED` (root/src/main.saw).
+_CONSOLE_STALLED_LINE = "root: console stalled, killed"
+_CONSOLE_STALLED_STATUS = (3 << 16) | 0x5A
+
+# Root's two lines for a `tests/console-flood` that panicked with its text past
+# the kernel's bound (`long_panic`), named `name`: the text is the kernel's
+# cut, as the death record keeps it.
+_LONG_PANIC_TEXT = (
+    "panic at main.saw:80: SOS flood: a panic whose text runs past the bound "
+    "the kernel keeps of it, so that the line root prints for it is as long "
+    "as a line of root's gets: abcdefghijklmnopqrstuvwxyz "
+    "abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abc...")
+_LONG_PANIC_TEARDOWN = ("root: {name} teardown handles=5 threads=1 events=0 "
+                        "waiters=0 interrupts=0 timers=0\n")
+
+
+def _long_panic_lines(name):
+    return (f"root: {name} ended status=131086 text={_LONG_PANIC_TEXT}\n"
+            + _LONG_PANIC_TEARDOWN.format(name=name))
+
+
+# A stock root's line for `svc-console` ending with `EXIT_CLAIMED`.
+_AUX_CLAIMED_LINE = "root: aux ended status=65539"
+
+
+def _console_watchdog_cases(files):
+    """The cases of root's console under a claim, each on described images:
+    `files(name)` is a case's `image_file` for the images named `name`."""
+    stalled = [
+        "{banner}",
+        # The kill's teardown ends the claim, and the kernel says what it held
+        # back: the two children's ends, two lines each, and the two bytes
+        # refused, root's first and the aux driver's. The claimant's own
+        # teardown line follows.
+        "SOS: console returned, lines held={four}, debug bytes "
+        "refused={two}\n"
+        "SOS: process teardown ",
+        # Then root's lines, the ones the claimant took and held and the ones
+        # behind them, through the debug print, in order: `quick`'s fault,
+        # whose detail the kernel held back and the death record keeps, and
+        # `aux`'s exit, in the order root's Waiter delivers the two ends,
+        # which nothing in the image varies: the image arms no tick.
+        _CONSOLE_STALLED_LINE + "\n"
+        "root: quick ended status=131073\n"
+        "root: quick fault: bad handle\n"
+        "root: quick teardown handles=4 threads=1 events=0 waiters=0 "
+        "interrupts=0 timers=0\n"
+        + _AUX_CLAIMED_LINE + "\n"
+        f"root: console ended status={_CONSOLE_STALLED_STATUS}"]
+    return [
+        {
+            # A claimant that takes one message and stops taking, alive
+            # (`tests/images/console_stall*.toml`, `tests/console-staller` in
+            # its `stall` mode). `quick` tells a byte to `aux`, a second
+            # console driver, which the claim ends with `EXIT_CLAIMED`, and
+            # faults. Root's first line about `quick`'s end is refused by the
+            # debug print, so root's lines go to the claimant, which takes the
+            # first and holds it; the rest wait behind it. Root's watchdog
+            # sees neither the claimant's take count nor root's oldest line
+            # move for two wakes and kills it, and root writes what it held
+            # through the debug print. No duration is asserted: only that the
+            # kill happened.
+            "name": "console_stall",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_stall"),
+            "expect_out": stalled,
+            "expect_clean_exit": True,
+        },
+        {
+            # `console_stall` with a claimant that takes one message and then
+            # loops in syscalls without taking, a yield and a `stats` read a
+            # turn, on a thread at `Rt0`, above root's main thread: the
+            # watchdog runs at root's `Rt1`, above it, and kills it all the
+            # same, since it counts takes and not syscalls.
+            "name": "console_stall_looping",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_stall_looping"),
+            "expect_out": stalled,
+            "expect_clean_exit": True,
+        },
+        {
+            # A healthy claimant under a flood (`tests/console-staller` in its
+            # `slow` mode): it takes one message a period and answers each at
+            # its take. `flood` prints twelve lines and parks in its exit's
+            # `Sync`; `quick` tells `aux` a byte, which ends it with
+            # `EXIT_CLAIMED`, and panics, the text kept in its death record,
+            # so root's lines about those ends wait
+            # behind the flood for longer than two of the watchdog's periods,
+            # while the claimant goes on taking. The watchdog keeps it: once
+            # root's lines are answered and the claimant is the last child,
+            # root drops its inlet, and the claimant releases the console and
+            # prints what it took, in the order it took it, then exits.
+            "name": "console_backpressure_kept",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_backpressure_kept"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console returned, lines held={six}, debug bytes "
+                "refused={two}\n"
+                + "".join(f"SOS flood: line {i} of 12\n" for i in range(1, 13))
+                + "root: quick ended status=131086 text=panic at main.saw:77: "
+                "SOS flood: a panic\n"
+                "root: quick teardown handles=4 threads=1 events=0 waiters=0 "
+                "interrupts=0 timers=0\n"
+                + _AUX_CLAIMED_LINE + "\n"
+                "root: flood ended status=65536\n",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A starved root keeps a healthy console
+            # (`tests/images/console_starved_kept*.toml`). The claimant
+            # (`tests/console-staller` in its `late` mode) serves from `Rt0`
+            # and answers each request a period after its take. `trigger`
+            # exits at once; `hog` yields, so root posts its line about the
+            # end first, then computes on a thread at `High`, above root's
+            # main thread, for longer than two of the watchdog's periods. The
+            # claimant takes root's line and answers it while root cannot run
+            # to take the answer, and nothing more is posted: the take count
+            # stands still, and the watchdog keeps the claimant because root's
+            # claim is settled. Once `hog` ends, root's lines are answered, it
+            # drops its inlet, and the claimant releases the console and
+            # prints what it took.
+            "name": "console_starved_kept",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_starved_kept"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console returned, lines held={four}, debug bytes "
+                "refused={one}\n"
+                "root: trigger ended status=65536\n"
+                "root: hog ended status=65536\n",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Root posts at most four lines to the console
+            # (`tests/images/console_writer_limit*.toml`), whose claimant
+            # (`tests/console-staller` in its `slow` mode) is the image's
+            # second process. `first` and `second` fault at once, so root has
+            # six lines and posts four of them; `behind` yields until root has
+            # parked, then prints ten lines, posted behind root's four; and
+            # the claimant takes them in post order, root's last two only once
+            # it has answered root's first. The order is the claimant's take
+            # order, which it prints once root drops its inlet.
+            "name": "console_writer_limit",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_writer_limit"),
+            "expect_out": [
+                "{banner}",
+                # Root's Waiter delivers `first`'s end, then `second`'s, an
+                # order nothing in the image varies: it arms no tick.
+                "SOS: console returned, lines held={six}, debug bytes "
+                "refused={one}\n"
+                "root: first ended status=131073\n"
+                "root: first fault: bad handle\n"
+                "root: first teardown handles=5 threads=1 events=0 waiters=0 "
+                "interrupts=0 timers=0\n"
+                "root: second ended status=131073\n"
+                + "".join(f"SOS flood: line {i} of 10\n" for i in range(1, 11))
+                + "root: second fault: bad handle\n"
+                "root: second teardown handles=5 threads=1 events=0 waiters=0 "
+                "interrupts=0 timers=0\n"
+                "root: behind ended status=65536\n",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Root's post refused for room (`tests/images/console_room_kept*`).
+            # The claimant (`tests/console-staller` in its `late` mode, at a
+            # short period) takes each request at once from `Rt0` and answers
+            # it a period later. `full` prints seventeen lines: the claimant
+            # takes the first, the rest fill the ring, and the last waits in
+            # a call. `faulter` faults, and root's first post about it is
+            # refused for room: root attaches the inlet's room level once and
+            # posts again when it rises, and its lines arrive among `full`'s
+            # in the order the claimant took them.
+            "name": "console_room_kept",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_room_kept"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console returned, lines held={four}, debug bytes "
+                "refused={one}\n"
+                + "".join(f"SOS flood: line {n} of 17\n" for n in range(1, 18))
+                + "root: faulter ended status=131073\n"
+                "root: faulter fault: bad handle\n"
+                "root: faulter teardown handles=5 threads=1 events=0 waiters=0 "
+                "interrupts=0 timers=0\n"
+                "SOS flood: a line after computing\n"
+                "root: full ended status=65536\n",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # `console_room_kept` with a claimant that takes one message and
+            # stops (`tests/console-staller` in its `stall` mode): the ring
+            # stays full, root's post is refused for room with nothing of
+            # root's posted, and the watchdog's evidence is the refusal at a
+            # take count that still stands. It kills the claimant, and root
+            # writes what it held through the debug print. No duration is
+            # asserted: only that the kill happened.
+            "name": "console_room_stall",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_room_stall"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console returned, lines held={two}, debug bytes "
+                "refused={one}\n"
+                "SOS: process teardown ",
+                _CONSOLE_STALLED_LINE + "\n"
+                "root: faulter ended status=131073\n"
+                "root: faulter fault: bad handle\n"
+                "root: faulter teardown handles=5 threads=1 events=0 waiters=0 "
+                "interrupts=0 timers=0\n"
+                f"root: console ended status={_CONSOLE_STALLED_STATUS}",
+                "root: full ended status=65536"],
+            "expect_clean_exit": True,
+        },
+    ]
+
+
+_CONSOLE_WATCHDOG_CASES = _console_watchdog_cases(
+    lambda name: {"riscv32": f"{name}.toml",
+                  "riscv32-flat": f"{name}_flat.toml",
+                  "arm64": f"{name}_arm64.toml"}) + [
+    {
+        # Root's handles at its supervise step, in an image that names a
+        # console (`tests/images/console_root_handles*.toml`): `svc-console`
+        # as the console and twelve more, thirteen connections, whose
+        # inlets root holds until its release beside the console's inlet it
+        # keeps. The builder sizes root's handle table from the most root
+        # holds at any step, and root makes the console's Process sibling
+        # and its watchdog's kick after the release, which the builder's
+        # count covers there: the image boots to its end.
+        "name": "console_root_handles",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "console_root_handles.toml",
+                       "riscv32-flat": "console_root_handles_flat.toml",
+                       "arm64": "console_root_handles_arm64.toml"},
+        "expect_out": ["{banner}",
+                       "SOS console drv: served=36 refused=0 unsupported=0 "
+                       "printed=1200",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Root's backlog drops what does not fit
+        # (`tests/images/console_backlog_dropped*.toml`). The claimant takes
+        # one message and stops; eight clients panic at once with a text past
+        # the kernel's bound, so root's lines about their ends, each of a
+        # length the image fixes, pass `ROOT_CONSOLE_BACKLOG`. Root drops
+        # each line that does not fit and counts it, and once the watchdog
+        # has killed the claimant it writes what it held and then how many it
+        # dropped. The gate's boards alone: the ESP32-S3 has slots for four
+        # processes besides root.
+        "name": "console_backlog_dropped",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "console_backlog_dropped.toml",
+                       "riscv32-flat": "console_backlog_dropped_flat.toml",
+                       "arm64": "console_backlog_dropped_arm64.toml"},
+        "expect_out": [
+            "{banner}",
+            "SOS: console returned, lines held={sixteen}, debug bytes "
+            "refused={one}\n"
+            "SOS: process teardown ",
+            # What fits of root's lines, in order, and then the count of those
+            # that did not: the ended lines of `p4` and `p3` and the two
+            # lines of `p2`, each of the length the image fixes.
+            _CONSOLE_STALLED_LINE + "\n"
+            + "".join(_long_panic_lines(name) for name in
+                      ("p1", "p8", "p7", "p6", "p5"))
+            + _LONG_PANIC_TEARDOWN.format(name="p4")
+            + _LONG_PANIC_TEARDOWN.format(name="p3")
+            + "root: 4 lines dropped\n"
+            f"root: console ended status={_CONSOLE_STALLED_STATUS}"],
+        "expect_clean_exit": True,
+    },
+]
+
 # What a stock root's plan gives a child it only starts: its System record.
 _STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
                 "records": [{"tag": 1, "source": "system"}]}
@@ -3190,6 +3474,25 @@ TEST_CASES = [
         "asm": "payload_badband_background.S",
         "expect_out": "bad root image: band background is past the last "
                       "level ({eight})",
+        "expect_clean_exit": False,
+    },
+    {
+        # Root's header names its realtime bands in `rt_map` at version 4,
+        # each checked as a header band is: the last, here.
+        "name": "root_image_bad_rt_band",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_badrtband.S",
+        "expect_out": "bad root image: band rt3 is past the last level "
+                      "({eight})",
+        "expect_clean_exit": False,
+    },
+    {
+        # Version 3 is an image that names no realtime band, so a version-3
+        # header with a nonzero `rt_map` is refused at the version.
+        "name": "root_image_rt_map_v3",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_rtmap_v3.S",
+        "expect_out": "bad root image: unsupported version",
         "expect_clean_exit": False,
     },
     # --- a segment already where it is linked -------------------------------
@@ -12788,6 +13091,7 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     *_CONSOLE_PRINT_CASES,
+    *_CONSOLE_WATCHDOG_CASES,
     {
         # A UART driver answers a `Read` from bytes it holds, and the reader
         # has dropped its claim (`tests/images/uart_dropped_read*.toml`): the
@@ -14949,6 +15253,22 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": INPLACE_LAUNCH_PKG,
         "child_asm": "child_grant_past.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS inplacelaunch: create refused: not a loadable "
+                       "process image"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A child image that names realtime bands (`child_rt_map.S`, version
+        # 4): only root's header is read for them, so the create door refuses
+        # the image with `BadImage`, where it would otherwise drop the
+        # request, before anything is placed.
+        "name": "child_image_rt_map",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": INPLACE_LAUNCH_PKG,
+        "child_asm": "child_rt_map.S",
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
@@ -26082,6 +26402,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         },
         # The gate's console cases on this board (`*_s3.toml`).
         *_console_print_cases(lambda name: {arch["name"]: f"{name}_s3.toml"}),
+        *_console_watchdog_cases(lambda name: {arch["name"]: f"{name}_s3.toml"}),
         {
             # The GPIO driver stops on a configuration that names a pin the
             # chip holds, before it maps anything: its Mapping row is 0, so a

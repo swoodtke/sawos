@@ -113,6 +113,7 @@
 import toml.{TomlPosition}
 import bootplan.{FULL_BANDS, SIMPLE_BANDS, CHILD_WORDS, QUOTA_WORDS, CEILING_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
                  PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG,
+                 CONSOLE_WRITER_HANDLES,
                  HEAP_TAG, KEEP_ALL}
 import sosimage.board.{Board, Window, quota_keys}
 import sosimage.declaration.{Declaration, RecordKind, child_rights}
@@ -183,12 +184,13 @@ public func source_word(source: Source) -> String {
 }
 
 /// `bootplan.RightName`'s case for a right as a declaration names it, which
-/// is one of `child_rights()`.
+/// is one of `declared_rights()`.
 func right_word(name: String) -> String {
     if name.equals("debug") { return "Debug" }
     if name.equals("process-self") { return "ProcessSelf" }
     if name.equals("clock-get") { return "ClockGet" }
     if name.equals("transfer") { return "Transfer" }
+    if name.equals("console") { return "Console" }
     panic("`{name}` is not a right the declaration reader admits")
 }
 
@@ -292,6 +294,10 @@ public struct ImagePlan {
     children: Vector<PlanChild>
     setup: Vector<PlanSetup>
     connections: Int
+    /// The image's console: its connection, whose inlet root keeps, and the
+    /// child serving it; none when the image names none.
+    console: Int?
+    console_child: Int?
     /// The rows after the blobs and destinations, in order.
     rows: Vector<PlanRow>
     /// The count of windows a test plan states for root, unchecked; root is
@@ -568,7 +574,8 @@ public func plan_image(image: &ImageFile, board: &Board, declared: &Vector<Decla
                                          quota: move quota, ceilings: ceiling_rows(&d),
                                          bands: bands_word(&d),
                                          records: move records,
-                                         rights: d.system_rights_or(&image.system_rights),
+                                         rights: granted_rights(&d, &image,
+                                                                process.name.equals(console_server)),
                                          start: start,
                                          shutdown: process.on_exit.equals("shutdown"),
                                          floor: floor, windows: d.window_count(),
@@ -591,8 +598,35 @@ public func plan_image(image: &ImageFile, board: &Board, declared: &Vector<Decla
                                   offset: offset, len: window, at: at - offset, op: entry.op,
                                   value: entry.value))
     }
+    var console_child: Int? = None
+    if console != None {
+        console_child = process_index(&image, console_server)
+    }
     return ImagePlan(children: move children, setup: move setup,
-                     connections: connections.len(), rows: move rows, windows: None)
+                     connections: connections.len(), console: console,
+                     console_child: console_child, rows: move rows, windows: None)
+}
+
+/// The System rights the plan gives the process whose declaration is `d`:
+/// those it names, or `image`'s default, less `console` unless the process is
+/// the image's console (`is_console`). Binding refuses a declaration that
+/// names `console` elsewhere (`sosimage.imagefile.bind`); the grant holds the
+/// right to the console whatever reached it.
+func granted_rights(d: &Declaration, image: &ImageFile, is_console: Bool) -> Vector<String> {
+    let named = d.system_rights_or(&image.system_rights)
+    if is_console {
+        return move named
+    }
+    var out = Vector<String>()
+    var i = 0
+    while i < named.len() {
+        let right = named.get(i) ?? ""
+        if not right.equals("console") {
+            try! out.push(right)
+        }
+        i = i + 1
+    }
+    move out
 }
 
 /// The packed band map `d`'s mode gives.
@@ -853,6 +887,7 @@ public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<
                        slabs: &PlanSlabs, what: String) -> Result<PlanNeeds, BuildError> {
     var needs = PlanNeeds.none()
     needs.stock = true
+    needs.console = plan.console != None
     var k = 0
     while k < SLAB_KINDS {
         try! needs.summed.push(0)
@@ -978,6 +1013,9 @@ func has_console(child: &PlanChild) -> Bool {
 /// handle its start-up derives, each child created and its two rows released,
 /// each setup write's carve and mapping, each record made and given, and its
 /// Waiter, made before it releases what is left of the rows and connections.
+/// In an image that names a console root keeps the console's inlet past that
+/// release, and its console writer and watchdog hold
+/// `bootplan.CONSOLE_WRITER_HANDLES` more beside it, the `console` step.
 /// Refuses one at which the objects of a kind would number more than `slabs`
 /// holds: Process objects, root's and one for each child created; IoMemory
 /// objects, one per device row, made at boot, one for each setup write's carve
@@ -1036,6 +1074,10 @@ func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
         c = c + 1
     }
     try steps.within(1, table, what, "supervise")
+    if plan.console != None {
+        steps.held = ROOT_BOOT_HANDLES + ROOT_START_HANDLES + count + 2
+        try steps.within(CONSOLE_WRITER_HANDLES, table, what, "console")
+    }
     return Peak(held: steps.peak, step: steps.step)
 }
 
@@ -1178,7 +1220,8 @@ extension ImagePlan {
         }
         try fields.finish()
         return ImagePlan(children: move children, setup: move setup, connections: connections,
-                         rows: Vector<PlanRow>(), windows: windows)
+                         console: None, console_child: None, rows: Vector<PlanRow>(),
+                         windows: windows)
     }
 }
 
@@ -1251,6 +1294,14 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
                           shutdown: shutdown, floor: 0, windows: 0, heaps: 0)
     try f.finish()
     return move child
+}
+
+/// `value` as a Saw expression of an `Int?`.
+func optional(value: Int?) -> String {
+    if let v = value {
+        return "{v}"
+    }
+    "None"
 }
 
 /// `text` as a Saw string literal.
@@ -1402,7 +1453,8 @@ public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
         s = s + 1
     }
     try! out.push("    Plan(children: move children, setup: move setup, connections: {plan.connections},")
-    try! out.push("         windows: {root_windows(&plan)})")
+    try! out.push("         windows: {root_windows(&plan)}, console: {optional(plan.console)},")
+    try! out.push("         console_child: {optional(plan.console_child)})")
     try! out.push("\}")
     c = 0
     while c < plan.children.len() {

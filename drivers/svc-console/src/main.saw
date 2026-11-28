@@ -32,6 +32,14 @@
 // It needs `SystemRight.Debug`, and `main` checks for it before anything else.
 // Without it the driver can say nothing, so it exits with `EXIT_NO_DEBUG`
 // before it serves anyone, and its clients' calls answer `PeerClosed`.
+//
+// While another process holds the console claim the kernel's debug print
+// answers `SosStatus.Claimed`: the console is not the kernel's to write, so
+// it is not this driver's either, and it exits with `EXIT_CLAIMED` at the
+// first such answer, its clients' calls answering `PeerClosed`. A stock root
+// gives the claim only to the image's console, which is then not this
+// driver, so it meets this only in an image whose console is another
+// driver's, or under a root that gives the claim itself.
 
 import sos.{Waiter, WaitResult, BootSet, PipeOutlet, PipeRequest, AttachMode,
             SosStatus, SystemRight, PIPE_BODY_BYTES}
@@ -46,6 +54,8 @@ static EXIT_FAILED: Int = 1
 /// Its System handle has no `Debug`, so the console is not this process's to
 /// write.
 static EXIT_NO_DEBUG: Int = 2
+/// The debug print answered `Claimed`: another process holds the console.
+static EXIT_CLAIMED: Int = 3
 
 /// A status this driver can never legitimately produce, so meeting it means an
 /// assertion in this file failed rather than a call did.
@@ -78,6 +88,9 @@ func main() -> Int {
         return EXIT_FAILED
     }
     let done = try run(move outlet) catch {
+        if error == SosStatus.Claimed {
+            return EXIT_CLAIMED
+        }
         print("SOS console drv: failed: {}", error)
         return EXIT_FAILED
     }

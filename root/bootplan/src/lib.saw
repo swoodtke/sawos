@@ -36,7 +36,9 @@
 //! take, and no declaration may use one. In an image that names a console,
 //! every child but the console's server is given an inlet of the console's
 //! connection under `CONSOLE_TAG`, after its declared records. To root it is
-//! an inlet record like any other.
+//! an inlet record like any other. Root keeps an inlet of that connection
+//! itself (`Plan.console`), which it writes its own lines to once the console
+//! is claimed, and watches the child serving it (`Plan.console_child`).
 
 /// The first of the tags the runtime reserves.
 public static RESERVED_TAG_FIRST: UInt = 0xFFFF_FF00
@@ -131,6 +133,14 @@ public enum Source {
 @synthesize
 extension Source: Equatable {}
 
+/// The handles root holds for its console beside the console's inlet, in an
+/// image that names a console: from its supervise step, a sibling of the
+/// console's Process handle and the Event that wakes its watchdog; and once
+/// the console is claimed, the watchdog's Thread and the thread's own handle,
+/// its Waiter, its Clock and its Timer, and the claim of each line root has
+/// posted, `ROOT_CONSOLE_OUTSTANDING` of them at the most.
+public static CONSOLE_WRITER_HANDLES: Int = 11
+
 /// The band map every created process has until a launcher sets one: band
 /// `b`'s level in nibble `b`, the four application bands at levels 0 to 3 and
 /// each realtime band at 3 (spec §7). A plan that carries it makes root set
@@ -174,12 +184,14 @@ public enum QuotaName {
 }
 
 /// A System right root may give a child, by the name `sos.SystemRight` gives
-/// it: the launch convention's four (spec §12).
+/// it: the launch convention's four (spec §12), and `Console`, the console
+/// claim, which a plan gives only to the image's console.
 public enum RightName {
     case Debug,
     case ProcessSelf,
     case ClockGet,
-    case Transfer
+    case Transfer,
+    case Console
 }
 
 /// A handle kind whose rights ceiling a declaration may narrow, by the name
@@ -253,6 +265,12 @@ public struct Plan {
     /// How many device rows root holds as windows, at most: each row a
     /// sibling or carve record or a setup write names.
     windows: Int
+    /// The connection the image's console serves, whose inlet root keeps for
+    /// its own lines once the console is claimed; none when the image names
+    /// no console.
+    console: Int?
+    /// The child serving the console, by its index in `children`.
+    console_child: Int?
 }
 
 extension Plan: NoCopy {}
@@ -281,6 +299,7 @@ public static SETUP_WORDS: Int = 7
 public static PROCESS_WORDS: Int = 2
 /// A connection's two ends, one per connection.
 public static ENDS_WORDS: Int = 4
+
 /// A device row's tag, one per window.
 public static ROW_TAG_WORDS: Int = 1
 /// A device row's window, one per window: an `IoMemory?`.

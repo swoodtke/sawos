@@ -75,7 +75,7 @@ func needs_of(held: Int, step: String, names: &[String], rows: &[Int],
         try! n.push(names[i])
         i = i + 1
     }
-    PlanNeeds(stock: true, held: held, step: step, names: move n,
+    PlanNeeds(stock: true, console: false, held: held, step: step, names: move n,
               rows: ints(&rows), records: ints(&records),
               summed: Vector<Int>())
 }
@@ -372,6 +372,29 @@ func summed_rows() {
     expect_refusal_of(&facts, bodies, &summing(9, 2), 2,
                       below("threads", 8, 10,
                             "a main thread for each of 10 process bodies"))
+
+    // In an image that names a console, root's own objects hold its
+    // console's watchdog too: a thread, its Waiter and Timer and an Event.
+    var watched_waiters = summing(1, 10)
+    watched_waiters.console = true
+    assert(slots_in(none, &watched_waiters, 1) == 8, "waiters: 2 and 10 over 4")
+    expect_refusal_of(&facts, raising("waiters", 7), &watched_waiters, 2,
+                      below_own("waiters", 11, 2, 10))
+    var watched_events = summing(0, 20)
+    watched_events.console = true
+    assert(slots_in(none, &watched_events, 0) == 13, "events: 1 and 20 over 8")
+    expect_refusal_of(&facts, raising("events", 12), &watched_events, 2,
+                      below_own("events", 20, 1, 20))
+    var watched_timers = summing(4, 30)
+    watched_timers.console = true
+    expect_refusal_of(&facts, raising("timers", 22), &watched_timers, 2,
+                      below_own("timers", 30, 1, 30))
+    var watched_threads = summing(9, 9)
+    watched_threads.console = true
+    assert(slots_in(none, &watched_threads, 9) == 3, "threads: 2 and 9 over 8")
+    expect_refusal_of(&facts, raising("threads", 2), &watched_threads, 2,
+                      below("threads", 10, 11,
+                            "root's main thread, its console's watchdog and the processes' Thread rows"))
 
     // A root that is not the stock root has no plan to sum.
     var hand = summing(0, 20)

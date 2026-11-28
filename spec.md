@@ -4429,9 +4429,18 @@ arm their own.
   process's until its launcher says otherwise, puts `Background`, `Low`,
   `Normal` and `High` at 0 to 3 and each realtime band at 3, so its cap is 3;
   full access puts band `b` at level `b`, and only it reaches levels 4 to 7. Root's
-  map is its image header's, which carries `Background` to `High` (Blade
-  emits it from `[sos] priorities`), with `Rt0` to `Rt3` at `High`'s level,
-  and a level past 7 stops the boot naming the band. A launcher sets a
+  map is its image header's, which Blade emits from `[sos] priorities`: its
+  `prio_map` carries `Background` to `High`, and its `rt_map` `Rt0` to `Rt3`,
+  a byte each. Blade writes all four `rt_map` bytes when the manifest names
+  any realtime band, each unnamed one at `High`'s level; a word that comes to
+  zero is the version-3 header of an image that names none, and any other
+  word makes the image version 4. A zero `rt_map` puts `Rt0` to `Rt3` at
+  `High`'s level. A level past 7 stops the boot naming the band. Only the
+  boot reads `rt_map`: the create door refuses a version-4 image, since no
+  child's header is read, and the image builder refuses a child whose header
+  states a realtime band. The stock
+  root names all eight bands, at their own ranks, so its console's watchdog
+  (§12) runs at `Rt1`, above a driver's `Rt0`. A launcher sets a
   child's map with `ProcessOp.BandMap(map)`, on `ProcessRight.BandMap`,
   between the create and the start; the last map set wins. Its answers, in
   the order they are decided: a handle without the right is `AccessDenied`;
@@ -5959,12 +5968,14 @@ reserved.
   split is deferred until it is necessary): the kernel parses sosimg at boot and
   at `process_create` through the same phases — `validate_image` and
   `place_image` take the destination as a region parameter (`LoadRegion`) — and
-  the only thing that differs between the two doors is the failure vocabulary:
-  the boot door raises `fatal_image`, because a machine whose only image is
-  malformed has nothing else to run, and the create door returns `BadImage`,
-  because a launcher must be able to report what it was handed. "No second code
-  path" is therefore kept by construction: nowhere else in the tree reads a
-  segment record. **Root provides the memory and supplies no numbers.**
+  the two doors differ in three things. The failure vocabulary: the boot door
+  raises `fatal_image`, because a machine whose only image is malformed has
+  nothing else to run, and the create door returns `BadImage`, because a
+  launcher must be able to report what it was handed. The device windows: only
+  root's image may carry them. And the realtime bands: only root's header is
+  read for them (§7), so only the boot accepts a version-4 image. "No second
+  code path" is therefore kept by construction: nowhere else in the tree reads
+  a segment record. **Root provides the memory and supplies no numbers.**
   `process_create(image:memory:)` takes two allocations (`Memory`
   capabilities; a `Pool` in either place is the `BadHandle` fault),
   segments are
@@ -6038,8 +6049,9 @@ reserved.
   source, for a carve the offset and length, and the keep word it is given
   with), the System rights its System record keeps, by name, the tag it is
   started with and its exit policy;
-  the connections; and the setup writes. The stock root holds no device code,
-  address or line of its own: it creates every child, makes the setup writes (a
+  the connections; the setup writes; and in an image that names a console,
+  the console's connection and the child serving it. The stock root holds no
+  device code, address or line of its own: it creates every child, makes the setup writes (a
   carve of the register's grain from its device's row, mapped, written, unmapped
   and released; a `set` or a `clear` reads the register first and changes only
   its bits), sets each child's quota rows and band map, narrows its ceilings
@@ -6057,7 +6069,9 @@ reserved.
   are summed the same way: each total is at least root's own objects of the
   kind plus each child's row of it, whether its declaration or its image
   entry states the row. Root's own are its main thread, its one Waiter and
-  the Memory objects of the region table's rows. A kind a child states no
+  the Memory objects of the region table's rows, and in an image that names a
+  console its console's watchdog: a second thread, its Waiter and Timer and
+  the Event that wakes it. A kind a child states no
   row for counts nothing of it, except Thread, which counts its main thread,
   and Memory, which counts at least its heaps, each one once, since its
   `Memory` row covers them. The Mapping slab is the larger of the sum and
@@ -6251,18 +6265,25 @@ reserved.
   `Post | Transfer`, a server the outlet. It starts the child with its System
   record's tag, a sibling masked with the System rights the
   record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
-  `clock-get`, `transfer`), and keeps the child's Process handle. A record
+  `clock-get`, `transfer`, and `console` for the image's console, below),
+  and keeps the child's Process handle. A record
   that names none keeps the image's default, the `rights` of its image
   description's `[system]`. When the image states none, that is all four,
   or in an image that names a console (below) `process-self`, `clock-get`
   and `transfer`: there a program written with `main` prints through the
   console, so `debug` is for a process that writes through the debug print,
   the console's driver among them, and its record names it. An empty list,
-  in either place, keeps none. Those four are the ceiling: every right a
-  declaration or an image may name, so an image narrows the default and
-  never widens it, and the image builder refuses any other right by
-  name. `Shutdown`, process creation and the rest are the launcher's own to
-  give, never a declaration's or an image's. A child that knows its records
+  in either place, keeps none. Those four are the ceiling: every right an
+  image may name, so an image narrows the default and never widens it, and
+  with `console` every right a declaration may name; the image builder
+  refuses any other right by name. `console` is `SystemRight.Console`, the
+  console claim (§2.8), and the stock root gives it only to the image's
+  console, the process serving `[image] console`: the builder refuses it, by
+  name, in any other process's declaration, in an image that names no
+  console, in an image's `[system]`, and in any declaration of an image with
+  a hand-written root, which names no console. `Shutdown`, process creation
+  and the rest are the launcher's own to give, never a declaration's or an
+  image's. A child that knows its records
   by tag drains them all at once (`sos.BootSet`) and takes each by its tag.
   A set holds up to `BOOT_SET_CAPACITY` records (`sosabi`) inline, a few
   words each, so each copy of one is that much stack: a program written
@@ -6352,6 +6373,40 @@ reserved.
   printed comes before the kernel's exit or fault line. A process with no
   console record prints through the debug print when its System holds
   `Debug`, and its lines are dropped otherwise.
+
+  The stock root keeps an inlet of the console's connection for itself, past
+  the release of what else it holds. It prints through the debug print until
+  that answers `Claimed`, which it does once the console's driver has
+  claimed the console (§2.8), and from then on writes its lines to the
+  driver through its inlet without ever parking: each line is posted with
+  its claim kept and the claim attached to the Waiter root supervises on, so
+  an answer arrives beside the deaths; at most four lines are posted, and
+  behind them root keeps a backlog of 2 KiB; a post refused for room, quota
+  or a table row waits in the backlog for the inlet's room level; a line that
+  finds the backlog full is dropped and counted, and root says how many once
+  the console moves again. When the kernel did not print a death's lines
+  itself, because a claim held them back, root prints the death record's
+  detail after its `ended` line (§8). If the driver dies, root writes every
+  line it holds, in order, through the debug print, and goes on there. Once
+  the console's process is the only child left and every line root posted
+  is answered, root drops its inlet, so the driver sees its last client go.
+  Before a stop, root waits for its lines' answers and then sends the driver
+  a `Sync` and waits for its answer, so its last line has left the device
+  before the halt line. An error that ends root's supervision after its lines
+  went to the driver kills the console's process first and writes what root
+  holds through the debug print, so the error's own line is printed. A
+  watchdog thread of root's, at `Rt1` (§7), wakes a second after each of its
+  wakes while root has a message unanswered. At each wake it reads the
+  connection's take count (`PipeInlet.taken`, §2.1), and whether a message of
+  root's still waits on the driver: one of root's claims the driver has not
+  settled (`PipeReply.ready`), or, with none posted, root's last post refused
+  for room at a take count that still stands. Both are the driver's to
+  change, and neither needs root's own thread to run, so a root kept from
+  running does not get a healthy driver killed. When the take count has not
+  moved and root's message waits, two wakes in a row, the driver is alive and
+  not serving, and the watchdog kills it; root then prints `root: console
+  stalled, killed` before what it held. The `Sync` promise above is
+  unchanged.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

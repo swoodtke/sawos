@@ -29,12 +29,16 @@
 //!              then each of its heaps' pools, keeping `HEAP_POOL_KEEP`;
 //!   start      start every child with its System record's tag;
 //!   supervise  make a Waiter and attach every child to it, release every row
-//!              and connection end root still holds, and wait for the
-//!              children's ends.
+//!              and connection end root still holds but its inlet of the
+//!              console's connection, and wait for the children's ends.
 //!
 //! Root is written with `main`: it reaches its System and Process through
 //! `sosmain.context()`, and has no console record, so its lines go through the
-//! debug print. It stops the machine itself rather than returning from
+//! debug print, until a console's driver claims the console and the debug
+//! print answers `Claimed`: from then on they go to the driver, through root's
+//! own inlet of the console's connection and a writer that never parks, and
+//! a watchdog thread kills a driver that stops taking (`supervise`, `Out`,
+//! `watch_console`). It stops the machine itself rather than returning from
 //! `main`, which would exit through its Process and add the kernel's teardown
 //! line to every transcript.
 //!
@@ -42,7 +46,9 @@
 //! that fails prints `root: STEP WHO: STATUS` (WHO is the child, with the
 //! record's tag for a give; the register for a setup write; or `root`) and
 //! stops the machine with status 1. A child's end is reported as
-//! `root: NAME ended status=WORD`, the §8 status word. Root stops the machine
+//! `root: NAME ended status=WORD`, the §8 status word, followed by the death
+//! record's detail when a console claim kept the kernel from printing the
+//! death's own lines (`report`). Root stops the machine
 //! when a child whose image entry says `on-exit = "shutdown"` ends, with its
 //! exit code if it exited and 1 if it did not, and with 0 when every child has
 //! ended.
@@ -61,12 +67,15 @@
 //! vector that would grow is a panic too (`Exact`), never arena the builder
 //! did not size.
 
-import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
-            WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
-            PipeInletRight, PoolRight, QuotaKind}
+import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply, Event, Thread,
+            Waiter, Timer, Section,
+            WaitPayload, BootSet, BootHandle, SosStatus, SystemRight, Priority,
+            AttachMode, DeathCause, FaultReason, PipeInletRight, PoolRight, QuotaKind,
+            PIPE_BODY_BYTES}
+import uartproto.{UartOp, MAX_PAYLOAD}
 import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName, CeilingKind,
                  setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
-                 ROW_WINDOW_WORDS, SIMPLE_BANDS}
+                 ROW_WINDOW_WORDS, SIMPLE_BANDS, CONSOLE_WRITER_HANDLES}
 import imageplan
 import sosmain
 import std.alloc.{GlobalAllocator}
@@ -421,7 +430,8 @@ func system_right(name: RightName) -> UInt32 {
         case Debug -> SystemRight.Debug as UInt32,
         case ProcessSelf -> SystemRight.ProcessSelf as UInt32,
         case ClockGet -> SystemRight.ClockGet as UInt32,
-        case Transfer -> SystemRight.Transfer as UInt32
+        case Transfer -> SystemRight.Transfer as UInt32,
+        case Console -> SystemRight.Console as UInt32
     }
 }
 
@@ -569,8 +579,23 @@ func give_row(child: &Process, record: &var BootHandle, tag: UInt,
 
 /// Wait for the children's ends, reporting each; answers the machine's
 /// status.
+///
+/// In an image that names a console, root keeps the console's inlet past the
+/// release (`Watch`), and writes its lines to the console's driver through
+/// it once the debug print answers `Claimed` (`Out`). Root's one wait is this
+/// Waiter, which carries the deaths, the lines' answers and the inlet's room,
+/// so root reads every death whatever the console does. Once the console's
+/// process is the only child left and every line root posted is answered,
+/// root drops its inlet, so the driver sees every inlet gone and ends. Before
+/// a stop root waits on the same Waiter for its lines' answers and then for a
+/// `Sync`'s, so its last line has left the driver before the halt line.
+///
+/// An error after root's lines have gone to the driver kills the console's
+/// process first, so the claim ends, writes what root holds through the debug
+/// print and stops the watchdog: the error's own line, which `main` prints,
+/// reaches the console.
 func supervise(proc: &Process, plan: &Plan, children: &Vector<Process, Exact>, rows: Rows,
-             ends: Vector<Ends, Exact>) -> Result<UInt, SosStatus> {
+               ends: Vector<Ends, Exact>) unsafe -> Result<UInt, SosStatus> {
     let waiter = try proc.waiter_create()
     var i = 0
     while i < children.len() {
@@ -580,36 +605,900 @@ func supervise(proc: &Process, plan: &Plan, children: &Vector<Process, Exact>, r
         i = i + 1
     }
     // What root still holds of the rows and the connections is no child's:
-    // releasing it leaves each connection to the ends its children hold. A
-    // child that ended before it was attached is still reported: attaching
-    // a dead Process answers its death at the first wait.
-    let _ = move rows
-    let _ = move ends
-    var ended = 0
-    while ended < children.len() {
-        let record = try waiter.wait()
-        let index = record.key as Int
-        let word = status_of(&record)
-        let _ = move record
-        try waiter.remove(index as UInt)
-        borrow let c = plan.children[index] {
-            print("root: {} ended status={}", c.name, word)
-            if c.shutdown {
-                if (word >> REASON_SHIFT) == REASON_EXITED {
-                    return word & CODE_MASK
-                }
-                return EXIT_STOPPED
-            }
+    // releasing it leaves each connection to the ends its children hold, but
+    // for the console's inlet, which root keeps. A child that ended before it
+    // was attached is still reported: attaching a dead Process answers its
+    // death at the first wait. The console's Process sibling and the
+    // watchdog's kick are made after the release, which is the step the
+    // builder counts them at (`sosimage.plan`'s `console` step).
+    var watch = Watch(inlet: None, console: None, kick: None, claims: [None, None, None, None])
+    var all = move ends
+    if let index = plan.console {
+        borrow var e = all[index] {
+            watch.inlet = e.inlet.take()
         }
-        ended = ended + 1
     }
-    return EXIT_OK
+    let _ = move rows
+    let _ = move all
+    if let console = plan.console_child {
+        borrow let child = children[console] {
+            watch.console = try child.mint()
+        }
+        watch.kick = try proc.event_create()
+    }
+    let at = ((&var watch) as UnsafePointer<Watch>) as UInt
+    var out = Out.direct(at)
+    let code = try serve(&var out, &waiter, &var watch, &plan, &children) catch {
+        out.abandon(&waiter, &var watch)
+        return error
+    }
+    try out.stop_watchdog(&watch)
+    return code
 }
 
-/// The §8 status word out of a wait record: root attaches only Processes.
-func status_of(r: &WaitResult) -> UInt {
-    match r.what {
+/// `supervise`'s loop: the children's ends, the lines' answers and the
+/// inlet's room, until every child has ended or one that stops the machine
+/// has, and root's lines are answered.
+func serve(out: &var Out, waiter: &Waiter, watch: &var Watch, plan: &Plan,
+           children: &Vector<Process, Exact>) -> Result<UInt, SosStatus> {
+    var live = children.len()
+    var console_alive = plan.console_child != None
+    var code: UInt = EXIT_OK
+    var stopping = false
+    while {
+        if not stopping && live == 1 && console_alive && watch.inlet != None &&
+           not out.unanswered() {
+            try out.release(&var watch)
+        }
+        if stopping && not out.unanswered() {
+            if not console_alive || not (try out.sync(&waiter, &var watch)) {
+                break
+            }
+        }
+        let record = try waiter.wait()
+        let key = record.key
+        let (_, what) = (move record).open()
+        if key < (children.len() as UInt) {
+            let index = key as Int
+            let word = status_of(&what)
+            try waiter.remove(key)
+            live = live - 1
+            if (plan.console_child ?? -1) == index {
+                console_alive = false
+                try out.flush(&waiter, &var watch)
+            }
+            borrow let child = children[index] {
+                borrow let c = plan.children[index] {
+                    try report(&var out, &waiter, &var watch, &child, c.name, word)
+                    if c.shutdown && not stopping {
+                        stopping = true
+                        code = if (word >> REASON_SHIFT) == REASON_EXITED {
+                            word & CODE_MASK
+                        } else {
+                            EXIT_STOPPED
+                        }
+                    }
+                }
+            }
+            if live == 0 && not stopping {
+                stopping = true
+            }
+        } else if key == KEY_ROOM {
+            out.room_armed = false
+            try out.pump(&waiter, &var watch)
+        } else if key >= KEY_LINE && key < KEY_LINE + (ROOT_CONSOLE_OUTSTANDING as UInt) {
+            let arrived = arrived_of(&what)
+            var gone = false
+            if not arrived {
+                if let index = plan.console_child {
+                    borrow let child = children[index] {
+                        gone = (try child.get_status()) != STATUS_RUNNING
+                    }
+                }
+            }
+            if gone {
+                try out.flush(&waiter, &var watch)
+            } else {
+                try out.answered(&waiter, &var watch, key - KEY_LINE, arrived)
+            }
+        }
+    }
+    return code
+}
+
+/// The §8 status word out of a delivery of a child's end: root attaches its
+/// children under their indices, and nothing else under those keys.
+func status_of(what: &WaitPayload) -> UInt {
+    match what {
         case Process(status) -> status,
-        case _ -> panic("root attached only Processes"),
+        case _ -> panic("root: a child's key delivered something other than its end"),
+    }
+}
+
+/// Whether a line's answer arrived, out of its delivery: root attaches only
+/// claims under a line's key.
+func arrived_of(what: &WaitPayload) -> Bool {
+    match what {
+        case Reply(outcome) -> outcome.arrived(),
+        case _ -> panic("root: a line's key delivered something other than its answer"),
+    }
+}
+
+/// Reports the end of `child`, named `name`, whose status word is `word`:
+/// `root: NAME ended status=WORD`, and when the kernel did not print the
+/// death's lines itself (a console claim held them back), the death record's
+/// detail: a panic's text on the same line; a trap's cause, pc and address; a
+/// fault's reason, or the pid of the lock's owner in another process; and the
+/// teardown's counts after any of those, but never after an exit or a kill.
+func report(out: &var Out, waiter: &Waiter, watch: &var Watch, child: &Process, name: String,
+            word: UInt) -> Result<Void, SosStatus> {
+    let death = try child.death()
+    var line = Line()
+    line.text("root: ")
+    line.text(name)
+    line.text(" ended status=")
+    line.number(word)
+    if not death.printed && panicked(death.cause) {
+        line.text(" text=")
+        var t = 0
+        while t < death.text_len {
+            line.byte(death.text[t])
+            t = t + 1
+        }
+    }
+    try out.say(&line, &waiter, &var watch)
+    if death.printed {
+        return
+    }
+    match death.cause {
+        case Trap -> {
+            var trap = named(name)
+            trap.text(" trap cause=")
+            trap.hex(death.trap_cause)
+            trap.text(" pc=")
+            trap.hex(death.trap_pc)
+            trap.text(" addr=")
+            trap.hex(death.trap_addr)
+            try out.say(&trap, &waiter, &var watch)
+        },
+        case Fault -> {
+            var fault = named(name)
+            fault.text(" fault: ")
+            let code = UInt8.from(truncating: word & CODE_MASK)
+            if let reason = FaultReason.from(raw: code) {
+                fault.text(reason.describe())
+            } else {
+                fault.text("reason ")
+                fault.number(code as UInt)
+            }
+            try out.say(&fault, &waiter, &var watch)
+        },
+        case LockOwner -> {
+            var lock = named(name)
+            lock.text(" fault: lock owner is a thread of process ")
+            lock.number(UInt.from(truncating: death.holder_pid))
+            try out.say(&lock, &waiter, &var watch)
+        },
+        case _ -> {}
+    }
+    if not tears_down(death.cause) {
+        return
+    }
+    var teardown = named(name)
+    teardown.text(" teardown handles=")
+    teardown.number(UInt.from(truncating: death.handles))
+    teardown.text(" threads=")
+    teardown.number(UInt.from(truncating: death.threads))
+    teardown.text(" events=")
+    teardown.number(UInt.from(truncating: death.events))
+    teardown.text(" waiters=")
+    teardown.number(UInt.from(truncating: death.waiters))
+    teardown.text(" interrupts=")
+    teardown.number(UInt.from(truncating: death.interrupts))
+    teardown.text(" timers=")
+    teardown.number(UInt.from(truncating: death.timers))
+    try out.say(&teardown, &waiter, &var watch)
+    return
+}
+
+/// Whether a death was a panic, whose text the record keeps.
+func panicked(cause: DeathCause) -> Bool {
+    match cause {
+        case Panic -> true,
+        case _ -> false,
+    }
+}
+
+/// Whether root prints a death's teardown counts: after a fault, a trap, a
+/// panic or a lock wait's fault, and never after an exit or a kill.
+func tears_down(cause: DeathCause) -> Bool {
+    match cause {
+        case Exited -> false,
+        case Killed -> false,
+        case _ -> true,
+    }
+}
+
+/// A line that begins `root: NAME`.
+func named(name: String) -> Line {
+    var line = Line()
+    line.text("root: ")
+    line.text(name)
+    move line
+}
+
+// -----------------------------------------------------------------------------
+// Root's console
+// -----------------------------------------------------------------------------
+//
+// Root's lines go through the debug print until it answers `Claimed`, which
+// it does once the console's driver has claimed the console, and from then on
+// to the driver, through root's inlet of the console's connection, by a
+// writer of root's own that never parks: a line is posted with its claim
+// kept, the claim attached to root's supervise Waiter, and a delivered reply
+// is the line's answer. Root keeps every line until its answer arrives: at
+// most `ROOT_CONSOLE_OUTSTANDING` posted, and behind them a backlog of
+// `ROOT_CONSOLE_BACKLOG` bytes. A post refused for room, quota or a table row
+// leaves the line in the backlog, and the inlet's room level, attached
+// one-shot, says when to post again. A line that finds the backlog full is
+// dropped and counted, and `root: N lines dropped` follows once the console
+// moves again.
+//
+// If the driver dies, root writes every line it still holds, in order,
+// through the debug print, and goes on there. Its watchdog (`watch_console`)
+// kills a driver that stops taking while root has a line unanswered.
+
+/// The most lines root has posted and not seen answered.
+static ROOT_CONSOLE_OUTSTANDING: Int = 4
+
+// What the builder counts root's console handles as: the Process sibling, the
+// kick, the watchdog's Thread, its own handle, its Waiter, Clock and Timer,
+// and a claim per posted line.
+static_assert(CONSOLE_WRITER_HANDLES == 7 + ROOT_CONSOLE_OUTSTANDING,
+              "bootplan counts the console's handles root holds")
+/// The bytes root keeps of its lines, posted and not: answered bytes leave
+/// it from the front.
+static ROOT_CONSOLE_BACKLOG: Int = 2048
+/// The longest line root builds.
+static LINE_BYTES: Int = 400
+
+/// The Waiter's keys beside the children's indices: the inlet's room, and
+/// each posted line's claim, `KEY_LINE` plus its slot.
+static KEY_ROOM: UInt = 0x1_0000
+static KEY_LINE: UInt = 0x1_0001
+
+/// A child's status word while it runs.
+static STATUS_RUNNING: UInt = 0
+
+/// Root's lines, posted and not, from `Out.done` to `Out.tail`, each byte at
+/// its position modulo the length.
+unsafe static var BACKLOG: [UInt8; ROOT_CONSOLE_BACKLOG] = [0; ROOT_CONSOLE_BACKLOG]
+
+/// Whether root holds an unanswered line, which keeps the watchdog awake.
+static PENDING: Atomic<Int> = Atomic(0)
+/// Set by the watchdog once its kill of the console's process is answered.
+static STALLED: Atomic<Int> = Atomic(0)
+/// Whether root's last post was refused for room with nothing of root's
+/// posted, and the connection's take count (`PipeInlet.taken`) when it was:
+/// with no claim of root's to ask, the watchdog's evidence that root's line
+/// waits for a take.
+static REFUSED: Atomic<Int> = Atomic(0)
+static REFUSED_TAKEN: Atomic<Int> = Atomic(0)
+
+/// One line, built a piece at a time: printable text a supervisor reads.
+struct Line {
+    bytes: [UInt8; LINE_BYTES]
+    len: Int
+}
+
+extension Line {
+    init() -> Line {
+        Line(bytes: [0; LINE_BYTES], len: 0)
+    }
+
+    /// Appends `b`; past `LINE_BYTES` a line keeps what it has.
+    func byte(&var self, b: UInt8) {
+        if self.len < LINE_BYTES {
+            self.bytes[self.len] = b
+            self.len = self.len + 1
+        }
+    }
+
+    func text(&var self, s: String) {
+        var i = 0
+        while i < s.len() {
+            self.byte(s.byte_at(i))
+            i = i + 1
+        }
+    }
+
+    /// Appends `v` in decimal.
+    func number(&var self, v: UInt) {
+        var scale: UInt = 1
+        while v / scale >= 10 {
+            scale = scale * 10
+        }
+        while scale > 0 {
+            self.byte(ASCII_ZERO + UInt8.from(truncating: (v / scale) % 10))
+            scale = scale / 10
+        }
+    }
+
+    /// Appends `v` in hex, `0x` first, with no leading zeros.
+    func hex(&var self, v: UInt64) {
+        self.text("0x")
+        var shift = 60
+        while shift > 0 && ((v >> (shift as UInt64)) & 0xF) == 0 {
+            shift = shift - 4
+        }
+        while shift >= 0 {
+            let digit = UInt8.from(truncating: (v >> (shift as UInt64)) & 0xF)
+            self.byte(if digit < 10 { ASCII_ZERO + digit } else { ASCII_A + digit - 10 })
+            shift = shift - 4
+        }
+    }
+}
+
+static ASCII_ZERO: UInt8 = 0x30
+static ASCII_A: UInt8 = 0x61
+static NEWLINE: UInt8 = 0x0A
+
+/// What root's console and its watchdog share: root's inlet of the console's
+/// connection, a sibling of the console's Process handle for the watchdog to
+/// kill it through, the Event that wakes the watchdog, and the claim of each
+/// line root has posted and not seen answered, by its slot. All are none in
+/// an image that names no console, and the inlet is none once root drops it.
+/// It lives in `supervise`'s frame, and the watchdog reaches it by its
+/// address, which outlives the thread: `supervise` joins it before it returns
+/// or drops the inlet. The claims change inside the process's section
+/// (`sos.Section`), and the watchdog reads them inside it.
+struct Watch {
+    inlet: PipeInlet?
+    console: Process?
+    kick: Event?
+    claims: [PipeReply?; ROOT_CONSOLE_OUTSTANDING]
+}
+
+extension Watch: NoCopy {}
+
+static_assert(ROOT_CONSOLE_OUTSTANDING == 4,
+              "Watch's empty claims are spelled out and track ROOT_CONSOLE_OUTSTANDING")
+
+extension Watch {
+    func inlet(&self) borrows -> &PipeInlet {
+        lend self.inlet!
+    }
+
+    func console(&self) borrows -> &Process {
+        lend self.console!
+    }
+
+    func kick(&self) borrows -> &Event {
+        lend self.kick!
+    }
+
+    func claim(&self, slot: Int) borrows -> &PipeReply {
+        lend self.claims[slot]!
+    }
+}
+
+/// Where root's lines go: the debug print, or the console's driver once the
+/// debug print answers `Claimed`, or the debug print again once the driver
+/// is gone or root has dropped its inlet.
+enum Mode {
+    case Direct,
+    case Driver
+}
+
+@synthesize
+extension Mode: Equatable {}
+
+/// A message posted and not yet answered: where its bytes end in the backlog,
+/// whether its answer came, and whether it is a `Sync`, which carries none.
+struct Posted {
+    end: Int
+    answered: Bool
+    sync: Bool
+}
+
+/// Root's console writer (see the section's comment).
+struct Out {
+    mode: Mode
+    /// The posted messages, oldest first, from `first` in a ring of
+    /// `ROOT_CONSOLE_OUTSTANDING`.
+    posted: [Posted; ROOT_CONSOLE_OUTSTANDING]
+    first: Int
+    count: Int
+    /// Backlog positions: the first unanswered byte, the first byte not
+    /// posted, and the end.
+    done: Int
+    sent: Int
+    tail: Int
+    room_armed: Bool
+    dropped: Int
+    /// A `Sync` to post once every byte is: it waits behind the backlog's
+    /// end at `sync_at`. `synced` is the end of the last one answered, -1
+    /// before any.
+    sync_wanted: Bool
+    sync_at: Int
+    synced: Int
+    /// The watchdog, started at the first `Claimed`.
+    watchdog: Thread?
+    /// The address of `supervise`'s `Watch`, which the watchdog is given.
+    watch_at: UInt
+}
+
+extension Out: NoCopy {}
+
+/// The bytes a `Write` carries: a body less its op byte.
+static WRITE_PAYLOAD: Int = MAX_PAYLOAD
+
+/// The words of the watchdog's stack. It prints nothing; a panic builds its
+/// text on it.
+static WATCHDOG_STACK_WORDS: Int = 1024
+unsafe static var WATCHDOG_STACK: [UInt; WATCHDOG_STACK_WORDS] = [0; WATCHDOG_STACK_WORDS]
+
+/// The code root kills the console's process with when `supervise` fails
+/// after root's lines went to it, so the claim ends before root's error line.
+static CONSOLE_ABANDONED: UInt = 0x5B
+
+extension Out {
+    /// A writer that prints through the debug print.
+    static func direct(watch_at: UInt) -> Out {
+        Out(mode: Mode.Direct,
+            posted: [Posted(end: 0, answered: false, sync: false); ROOT_CONSOLE_OUTSTANDING],
+            first: 0, count: 0, done: 0, sent: 0, tail: 0, room_armed: false, dropped: 0,
+            sync_wanted: false, sync_at: 0, synced: -1, watchdog: None, watch_at: watch_at)
+    }
+
+    /// Whether root holds a message the driver has not answered: a line, or
+    /// a `Sync` wanted or posted.
+    func unanswered(&self) -> Bool {
+        self.tail != self.done || self.count > 0 || self.sync_wanted
+    }
+
+    /// Writes `line` and a line break: through the debug print, until it
+    /// answers `Claimed` and root holds the console's inlet; from that byte
+    /// on to the driver.
+    func say(&var self, line: &Line, waiter: &Waiter,
+             watch: &var Watch) -> Result<Void, SosStatus> {
+        var whole = Line()
+        var i = 0
+        while i < line.len {
+            whole.byte(line.bytes[i])
+            i = i + 1
+        }
+        if whole.len < LINE_BYTES {
+            whole.bytes[whole.len] = NEWLINE
+            whole.len = whole.len + 1
+        } else {
+            whole.bytes[LINE_BYTES - 1] = NEWLINE
+        }
+        var from = 0
+        if self.mode == Mode.Direct {
+            from = self.direct(&whole, 0)
+            if from == whole.len {
+                return
+            }
+            if watch.inlet == None {
+                self.dropped = self.dropped + 1
+                return
+            }
+            try self.start_watchdog()
+            self.mode = Mode.Driver
+        }
+        self.keep(&whole, from)
+        try self.pump(&waiter, &var watch)
+        return
+    }
+
+    /// Writes `line`'s bytes from `from` through the debug print; answers
+    /// where it stopped, the line's length when every byte went out, and the
+    /// first byte refused otherwise.
+    func direct(&self, line: &Line, from: Int) -> Int {
+        var i = from
+        while i < line.len {
+            try sosmain.context().system().debug_print_byte(line.bytes[i]) catch {
+                return i
+            }
+            i = i + 1
+        }
+        i
+    }
+
+    /// Keeps `line`'s bytes from `from` in the backlog, or drops the line and
+    /// counts it when it does not fit.
+    func keep(&var self, line: &Line, from: Int) unsafe {
+        let n = line.len - from
+        if self.tail - self.done + n > ROOT_CONSOLE_BACKLOG {
+            self.dropped = self.dropped + 1
+            return
+        }
+        var i = 0
+        while i < n {
+            BACKLOG[(self.tail + i) % ROOT_CONSOLE_BACKLOG] = line.bytes[from + i]
+            i = i + 1
+        }
+        self.wake()
+        self.tail = self.tail + n
+    }
+
+    /// The first unanswered message wakes the watchdog, before anything is
+    /// posted, so it is watching before a claimant that never answers can
+    /// take the processor.
+    func wake(&self) unsafe {
+        if self.unanswered() {
+            return
+        }
+        PENDING.store(1)
+        let w = self.watch_at as UnsafePointer<Watch>
+        let _ = w[0].kick().signal(bits: KICK_WATCH)
+    }
+
+    /// Whether root has a `Sync` to wait for before a stop: one is posted, or
+    /// one wanted and posted, unless one was answered after every byte root
+    /// has now. Through the debug print there is nothing to wait for.
+    func sync(&var self, waiter: &Waiter, watch: &var Watch) -> Result<Bool, SosStatus> {
+        if self.mode != Mode.Driver || self.synced == self.tail {
+            return false
+        }
+        self.wake()
+        self.sync_wanted = true
+        self.sync_at = self.tail
+        try self.pump(&waiter, &var watch)
+        return true
+    }
+
+    /// Posts the backlog's unposted bytes, a `Write` of at most
+    /// `WRITE_PAYLOAD` at a time, and then a wanted `Sync`, while fewer than
+    /// `ROOT_CONSOLE_OUTSTANDING` are posted. Each claim is kept in `watch`,
+    /// attached to `waiter`. A post refused for room attaches the inlet's
+    /// room level, once; a driver that is gone sends root back to the debug
+    /// print.
+    func pump(&var self, waiter: &Waiter, watch: &var Watch) unsafe -> Result<Void, SosStatus> {
+        if self.mode != Mode.Driver {
+            return
+        }
+        while self.count < ROOT_CONSOLE_OUTSTANDING &&
+              (self.sent < self.tail || self.sync_wanted) {
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            var n = 0
+            let sync = self.sent == self.tail
+            if sync {
+                body[0] = UartOp.Sync as UInt8
+            } else {
+                n = self.tail - self.sent
+                if n > WRITE_PAYLOAD {
+                    n = WRITE_PAYLOAD
+                }
+                body[0] = UartOp.Write as UInt8
+                var i = 0
+                while i < n {
+                    body[1 + i] = BACKLOG[(self.sent + i) % ROOT_CONSOLE_BACKLOG]
+                    i = i + 1
+                }
+            }
+            let claim = try watch.inlet().post(body: &body, len: (n + 1) as UInt) catch {
+                if error == SosStatus.PeerClosed {
+                    return self.flush(&waiter, &var watch)
+                }
+                if error != SosStatus.WouldBlock && error != SosStatus.QuotaExceeded &&
+                   error != SosStatus.NoResource {
+                    return error
+                }
+                if self.count == 0 {
+                    let taken = try watch.inlet().taken()
+                    REFUSED_TAKEN.store(Int.from(truncating: taken))
+                    REFUSED.store(1)
+                }
+                if not self.room_armed {
+                    try waiter.add(inlet: &watch.inlet(), key: KEY_ROOM, mode: AttachMode.OneShot)
+                    self.room_armed = true
+                }
+                return
+            }
+            REFUSED.store(0)
+            let slot = (self.first + self.count) % ROOT_CONSOLE_OUTSTANDING
+            self.posted[slot] = Posted(end: self.sent + n, answered: false, sync: sync)
+            self.count = self.count + 1
+            self.sent = self.sent + n
+            if sync {
+                self.sync_wanted = false
+            }
+            Section.enter()
+            watch.claims[slot] = move claim
+            Section.leave()
+            try waiter.add(reply: &watch.claim(slot), key: KEY_LINE + (slot as UInt))
+        }
+        return
+    }
+
+    /// The message in slot `slot` answered: delivered, or dropped by a driver
+    /// that lives on, whose bytes are lost and counted. Its claim is
+    /// released, and the answered messages at the front leave the backlog.
+    func answered(&var self, waiter: &Waiter, watch: &var Watch, slot: UInt,
+                  arrived: Bool) -> Result<Void, SosStatus> {
+        let s = slot as Int
+        self.posted[s].answered = true
+        Section.enter()
+        watch.claims[s] = None
+        Section.leave()
+        if not arrived && not self.posted[s].sync {
+            self.dropped = self.dropped + 1
+        }
+        while self.count > 0 && self.posted[self.first].answered {
+            self.done = self.posted[self.first].end
+            if self.posted[self.first].sync {
+                self.synced = self.done
+            }
+            self.first = (self.first + 1) % ROOT_CONSOLE_OUTSTANDING
+            self.count = self.count - 1
+        }
+        if not self.unanswered() {
+            PENDING.store(0)
+        }
+        try self.pump(&waiter, &var watch)
+        if self.dropped > 0 && arrived {
+            try self.say_dropped(&waiter, &var watch)
+        }
+        return
+    }
+
+    /// `root: N lines dropped`, once root's console moves again.
+    func say_dropped(&var self, waiter: &Waiter, watch: &var Watch) -> Result<Void, SosStatus> {
+        let n = self.dropped
+        self.dropped = 0
+        var line = Line()
+        line.text("root: ")
+        line.number(n as UInt)
+        line.text(" lines dropped")
+        self.say(&line, &waiter, &var watch)
+    }
+
+    /// The console's driver is gone, or root gives up on it: `root: console
+    /// stalled, killed` when the watchdog killed it, then every byte the
+    /// backlog holds, in order, through the debug print, where root goes on.
+    /// The posted messages, their claims and attachments are forgotten.
+    func flush(&var self, waiter: &Waiter, watch: &var Watch) unsafe -> Result<Void, SosStatus> {
+        if self.mode != Mode.Driver {
+            return
+        }
+        if STALLED.load() != 0 {
+            var line = Line()
+            line.text("root: console stalled, killed\n")
+            let _ = self.direct(&line, 0)
+        }
+        while self.count > 0 {
+            let _ = waiter.remove(KEY_LINE + (self.first as UInt))
+            self.first = (self.first + 1) % ROOT_CONSOLE_OUTSTANDING
+            self.count = self.count - 1
+        }
+        Section.enter()
+        var s = 0
+        while s < ROOT_CONSOLE_OUTSTANDING {
+            watch.claims[s] = None
+            s = s + 1
+        }
+        Section.leave()
+        if self.room_armed {
+            let _ = waiter.remove(KEY_ROOM)
+            self.room_armed = false
+        }
+        var at = self.done
+        while at < self.tail {
+            let _ = sosmain.context().system().debug_print_byte(
+                BACKLOG[at % ROOT_CONSOLE_BACKLOG])
+            at = at + 1
+        }
+        self.done = self.tail
+        self.sent = self.tail
+        self.sync_wanted = false
+        PENDING.store(0)
+        REFUSED.store(0)
+        self.mode = Mode.Direct
+        if self.dropped > 0 {
+            let n = self.dropped
+            self.dropped = 0
+            var line = Line()
+            line.text("root: ")
+            line.number(n as UInt)
+            line.text(" lines dropped\n")
+            let _ = self.direct(&line, 0)
+        }
+        return
+    }
+
+    /// `supervise` failed: when root's lines go to the driver, kill the
+    /// console's process, so the claim ends, and write what root holds
+    /// through the debug print; then stop the watchdog. Each step's own
+    /// failure is not read, since an error is already on its way.
+    func abandon(&var self, waiter: &Waiter, watch: &var Watch) {
+        if self.mode == Mode.Driver && watch.console != None {
+            let _ = watch.console().kill(code: CONSOLE_ABANDONED)
+            let _ = self.flush(&waiter, &var watch)
+        }
+        let _ = self.stop_watchdog(&watch)
+    }
+
+    /// Drops root's inlet of the console's connection, the watchdog stopped
+    /// first: the console's process is the only child left and every line is
+    /// answered, so the driver ends once its clients have all gone.
+    func release(&var self, watch: &var Watch) -> Result<Void, SosStatus> {
+        try self.stop_watchdog(&watch)
+        watch.inlet = None
+        self.mode = Mode.Direct
+        return
+    }
+
+    /// Starts the watchdog at root's `Rt1` band, which root's header puts
+    /// above every band a driver can run at but `Rt2` and `Rt3`.
+    func start_watchdog(&var self) unsafe -> Result<Void, SosStatus> {
+        if self.watchdog != None {
+            return
+        }
+        let top = ((&var WATCHDOG_STACK) as UnsafePointer<UInt>) as UInt +
+                  (WATCHDOG_STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+        let run: FuncPointer<(UInt) sync -> UInt> = watchdog
+        let thread = try sosmain.context().process().thread_create(run: run, arg: self.watch_at,
+                                                                  stack_top: top)
+        try thread.start(band: Priority.Rt1)
+        self.watchdog = move thread
+        return
+    }
+
+    /// Stops the watchdog and waits for its end, so nothing reads `Watch`
+    /// after.
+    func stop_watchdog(&var self, watch: &Watch) -> Result<Void, SosStatus> {
+        guard let thread = self.watchdog.take() else {
+            return
+        }
+        try watch.kick().signal(bits: KICK_STOP)
+        let _ = try thread.join()
+        return
+    }
+}
+
+/// The kick Event's bits: a message became unanswered, and the watchdog's
+/// end.
+static KICK_WATCH: UInt = 1
+static KICK_STOP: UInt = 2
+
+/// The watchdog's period, and the wakes in a row without progress that make
+/// the console stalled.
+static CONSOLE_STALL_PERIOD_NS: UInt64 = 1_000_000_000
+static STALL_WAKES: Int = 2
+
+/// The code the watchdog kills a stalled console's process with.
+static CONSOLE_STALLED: UInt = 0x5A
+
+/// The watchdog's keys on its own Waiter.
+static KEY_KICK: UInt = 1
+static KEY_TICK: UInt = 2
+
+/// The watchdog's thread: `at` is `supervise`'s `Watch`.
+func watchdog(at: UInt) sync -> UInt {
+    watch_console(at)
+}
+
+/// The console watchdog. While root has a message unanswered, from the kick
+/// of the first, it wakes `CONSOLE_STALL_PERIOD_NS` after each of its wakes,
+/// on a one-shot Timer armed again each time, so each period is measured
+/// after the watchdog ran. At each wake it asks whether the console's driver
+/// has taken a message from the console's connection since the last
+/// (`PipeInlet.taken`), and whether a message of root's still waits on the
+/// driver: a claim of root's not yet settled (`PipeReply.ready`), or, with
+/// none posted, root's last post refused for room at the take count that
+/// still stands. Both are the driver's to change, and neither needs root's
+/// own thread to run. When the driver has taken nothing and root's message
+/// waits for `STALL_WAKES` wakes in a row, the driver is alive and not
+/// serving, and the watchdog kills it with `CONSOLE_STALLED`. Its teardown
+/// ends the claim and answers root's claims `PeerClosed`, and root's main
+/// thread writes what it holds through the debug print. The watchdog runs at
+/// `Rt1`, above the driver, so a driver that spins in syscalls without taking
+/// cannot keep it from running.
+func watch_console(at: UInt) unsafe sync -> UInt {
+    let w = at as UnsafePointer<Watch>
+    let waiter = try sosmain.context().process().waiter_create() catch {
+        panic("root: the console's watchdog has no Waiter: {}", error)
+    }
+    let clock = try sosmain.context().system().clock_get() catch {
+        panic("root: the console's watchdog has no Clock: {}", error)
+    }
+    let timer = try clock.timer_create() catch {
+        panic("root: the console's watchdog has no Timer: {}", error)
+    }
+    try waiter.add(event: &w[0].kick(), key: KEY_KICK) catch {
+        panic("root: the console's watchdog cannot watch its kick: {}", error)
+    }
+    try waiter.add(timer: &timer, key: KEY_TICK) catch {
+        panic("root: the console's watchdog cannot watch its Timer: {}", error)
+    }
+    var armed = false
+    var strikes = 0
+    var taken: UInt = 0
+    while {
+        let record = try waiter.wait() catch {
+            panic("root: the console's watchdog's wait: {}", error)
+        }
+        let key = record.key
+        let (_, what) = (move record).open()
+        if key == KEY_KICK {
+            let bits = kick_bits(&what)
+            if (bits & KICK_STOP) != 0 {
+                let _ = timer.disarm()
+                return 0
+            }
+            if not armed && PENDING.load() != 0 {
+                arm(&timer)
+                armed = true
+                strikes = 0
+                taken = try w[0].inlet().taken() catch { taken }
+            }
+            continue
+        }
+        if not armed {
+            continue
+        }
+        if PENDING.load() == 0 {
+            armed = false
+            continue
+        }
+        let now = try w[0].inlet().taken() catch { taken &+ 1 }
+        if now == taken && waits_on_driver(w, now) {
+            strikes = strikes + 1
+        } else {
+            strikes = 0
+        }
+        taken = now
+        if strikes < STALL_WAKES {
+            arm(&timer)
+            continue
+        }
+        armed = false
+        try w[0].console().kill(code: CONSOLE_STALLED) catch {
+            continue
+        }
+        STALLED.store(1)
+    }
+}
+
+/// Arms the watchdog's Timer once, `CONSOLE_STALL_PERIOD_NS` from now.
+func arm(timer: &Timer) {
+    try timer.arm(after_ns: CONSOLE_STALL_PERIOD_NS) catch {
+        panic("root: the console's watchdog cannot arm its Timer: {}", error)
+    }
+}
+
+/// Whether a message of root's waits on the console's driver, as the
+/// watchdog reads it at the take count `taken`: a claim of root's the driver
+/// has not settled, or with none posted, root's post refused for room at
+/// that count.
+func waits_on_driver(w: UnsafePointer<Watch>, taken: UInt) unsafe -> Bool {
+    var posted = false
+    var unsettled = false
+    Section.enter()
+    var s = 0
+    while s < ROOT_CONSOLE_OUTSTANDING {
+        if w[0].claims[s] != None {
+            posted = true
+            let ready = try w[0].claim(s).ready() catch { true }
+            if not ready {
+                unsettled = true
+            }
+        }
+        s = s + 1
+    }
+    Section.leave()
+    if posted {
+        return unsettled
+    }
+    REFUSED.load() != 0 && REFUSED_TAKEN.load() == Int.from(truncating: taken)
+}
+
+/// The bits a kick carries: root signals the kick Event alone under its key.
+func kick_bits(what: &WaitPayload) -> UInt {
+    match what {
+        case Event(word) -> word,
+        case _ -> 0,
     }
 }

@@ -85,6 +85,7 @@ import sosimage.limits.{ImageLimits, PlanNeeds, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
 import sosimage.tool.{read_file, read_text}
+import sosimage.rules.{refused}
 
 /// The built-in heap a process is linked with when neither its declaration
 /// nor its image sizes it: the user scripts' own default, which the builder
@@ -144,6 +145,32 @@ public func image_declarations(image: &ImageFile, sawos: String,
         try! decls.push(try Declaration.load(file))
     }
     return move decls
+}
+
+/// Refuses, in an image with a hand-written root, a process whose package
+/// has a declaration (`process.toml`) whose `system` record names `console`:
+/// such an image names no console, and the right is the console's alone. A
+/// package with no declaration is not read. `sawos` and `product` are the
+/// roots its packages are found from (`package_dir`'s).
+public func refuse_console_right(image: &ImageFile, sawos: String,
+                                 product: String) -> Result<Void, BuildError> {
+    if image.stock {
+        return
+    }
+    var i = 0
+    while i < image.processes.len() {
+        let p = image.processes.get(i)!
+        i = i + 1
+        let file = "{package_dir(p.package, sawos, product)}/process.toml"
+        if not File.exists(Path(s: file)) {
+            continue
+        }
+        let d = try Declaration.parse(try read_text(file), file)
+        if d.names_console() {
+            return refused(d.file, d.system_record().at, "the process {p.name}'s `system` record names `console`, which the stock root gives only to the process serving an image's console, and the image {image.name} has a hand-written root, which names no console")
+        }
+    }
+    return
 }
 
 /// The `SlabKind` a `[limits]` key totals.
@@ -240,6 +267,7 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     }
 
     // Every refusal that needs no build, before anything is built.
+    try refuse_console_right(&image, sawos, product)
     let count = image.processes.len()
     var slots = Vector<Span>()
     var root_slot: Span? = None

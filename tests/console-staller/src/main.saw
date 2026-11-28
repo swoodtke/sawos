@@ -1,0 +1,219 @@
+// A test claimant of the console: the image's console, which claims the
+// console as a driver does and then serves as its build input
+// `stallconfig` says (`stallconfig.MODE`):
+//
+//   stall  takes one message, holds it unanswered, and stops taking, alive:
+//          it parks on an Event nothing signals.
+//   loop   takes one message, holds it, and loops in syscalls without
+//          taking: a yield and a `stats` read each turn, on a thread at
+//          `Rt0`, above every band its clients and root's main thread run at.
+//   slow   a healthy driver, slow: it takes one message each
+//          `stallconfig.PERIOD_NS`, keeps a `Write`'s bytes and answers every
+//          request at its take. When every inlet is gone it releases the
+//          console and prints what it kept through the debug print, in the
+//          order it took it, and exits.
+//   late   `slow`, answering each request a period after its take rather
+//          than at it, from a thread at `Rt0`, which claims and serves:
+//          above every band a simple-map client can run at.
+//
+// It drives no device: while it holds the claim nothing reaches the console,
+// and its own debug print answers `Claimed` too, which is why `slow` keeps
+// what it is sent until it has released.
+
+import sos.{Waiter, Event, Timer, BootSet, PipeOutlet, PipeRequest, WaitPayload, AttachMode,
+            SosStatus, Priority, OutletLevel, PIPE_BODY_BYTES}
+import uartproto.{BODY_BYTES, Frame, UartBody}
+import consolecore.{console_status, writes}
+import stallconfig
+import sosmain
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
+
+/// The modes `stallconfig.MODE` names.
+static MODE_STALL: Int = 1
+static MODE_LOOP: Int = 2
+static MODE_SLOW: Int = 3
+static MODE_LATE: Int = 4
+
+/// The tag its declaration gives its server end (`process.toml`).
+static TAG_SERVE: UInt = 2
+
+static KEY_OUTLET: UInt = 1
+static KEY_NEVER: UInt = 2
+static KEY_PAUSE: UInt = 3
+
+/// What `slow` keeps of the `Write`s it takes, to print once it has released
+/// the console.
+static KEPT_BYTES: Int = 4096
+unsafe static var KEPT: [UInt8; KEPT_BYTES] = [0; KEPT_BYTES]
+
+/// The looping thread's stack, and the late serving thread's.
+static LOOP_STACK_WORDS: Int = 1024
+unsafe static var LOOP_STACK: [UInt; LOOP_STACK_WORDS] = [0; LOOP_STACK_WORDS]
+
+func main() -> Int {
+    if stallconfig.MODE == MODE_LATE {
+        return try above() catch { EXIT_FAILED }
+    }
+    claim_and_serve()
+}
+
+/// Takes the server end, claims the console and serves; answers the exit
+/// code.
+func claim_and_serve() -> Int {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_SERVE) else {
+        return EXIT_FAILED
+    }
+    guard let outlet = record.take_outlet() else {
+        return EXIT_FAILED
+    }
+    try sosmain.context().system().console_claim() catch {
+        return EXIT_FAILED
+    }
+    let code = try serve(&outlet) catch {
+        return EXIT_FAILED
+    }
+    code
+}
+
+/// Claims and serves from a thread at `Rt0`, and answers its exit code.
+func above() unsafe -> Result<Int, SosStatus> {
+    let top = ((&var LOOP_STACK) as UnsafePointer<UInt>) as UInt +
+              (LOOP_STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let run: FuncPointer<(UInt) sync -> UInt> = serving
+    let thread = try sosmain.context().process().thread_create(run: run, arg: 0, stack_top: top)
+    try thread.start(band: Priority.Rt0)
+    let code = try thread.join()
+    return code as Int
+}
+
+func serving(arg: UInt) sync -> UInt {
+    claim_and_serve() as UInt
+}
+
+/// Serves `outlet` as the mode says; answers the exit code of a mode that
+/// ends.
+func serve(outlet: &PipeOutlet) -> Result<Int, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(outlet: &outlet, key: KEY_OUTLET)
+    if stallconfig.MODE == MODE_SLOW || stallconfig.MODE == MODE_LATE {
+        return slow(&outlet, &waiter, stallconfig.MODE == MODE_LATE)
+    }
+    let held = try take_one(&outlet, &waiter)
+    if stallconfig.MODE == MODE_LOOP {
+        try spin()
+    }
+    // Stopped, alive: nothing signals this Event.
+    let never = try sosmain.context().process().event_create()
+    let parked = try sosmain.context().process().waiter_create()
+    try parked.add(event: &never, key: KEY_NEVER)
+    let _ = try parked.wait()
+    let _ = move held
+    return EXIT_FAILED
+}
+
+/// The first message staged on `outlet`, taken and its obligation held.
+func take_one(outlet: &PipeOutlet, waiter: &Waiter) -> Result<PipeRequest, SosStatus> {
+    while {
+        let _ = try waiter.wait()
+        let taken = try outlet.take() catch {
+            if error == SosStatus.WouldBlock {
+                continue
+            }
+            return error
+        }
+        let (msg, request) = move taken
+        let _ = move msg
+        return move request
+    }
+}
+
+/// Starts the looping thread at `Rt0` and joins it, which never returns.
+func spin() unsafe -> Result<Void, SosStatus> {
+    let top = ((&var LOOP_STACK) as UnsafePointer<UInt>) as UInt +
+              (LOOP_STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let run: FuncPointer<(UInt) sync -> UInt> = looping
+    let thread = try sosmain.context().process().thread_create(run: run, arg: 0, stack_top: top)
+    try thread.start(band: Priority.Rt0)
+    let _ = try thread.join()
+    return
+}
+
+/// A yield and a `stats` read, forever: syscalls, and no take.
+func looping(arg: UInt) sync -> UInt {
+    let me = try sosmain.context().process().thread_self() catch {
+        return 1
+    }
+    while {
+        let _ = me.yield_now()
+        let _ = sosmain.context().process().stats()
+    }
+}
+
+/// `slow`: a take each period, every request answered at its take, or a
+/// period after it when `late`, a `Write`'s bytes kept, until every inlet is
+/// gone; then the release and the kept bytes.
+func slow(outlet: &PipeOutlet, waiter: &Waiter, late: Bool) unsafe -> Result<Int, SosStatus> {
+    let clock = try sosmain.context().system().clock_get()
+    let timer = try clock.timer_create()
+    let pause = try sosmain.context().process().waiter_create()
+    try pause.add(timer: &timer, key: KEY_PAUSE)
+    var kept = 0
+    var body = UartBody.empty()
+    while {
+        let wake = try waiter.wait()
+        if gone(&wake.what) {
+            break
+        }
+        let taken = try outlet.take() catch {
+            if error == SosStatus.WouldBlock {
+                continue
+            }
+            if error == SosStatus.PeerClosed {
+                break
+            }
+            return error
+        }
+        let (msg, request) = move taken
+        let frame = Frame(len: msg.len, bytes: msg.bytes)
+        let _ = move msg
+        if writes(&frame) {
+            var i = 0
+            while i < (frame.payload_len() as Int) && kept < KEPT_BYTES {
+                KEPT[kept] = frame.payload_byte(i)
+                kept = kept + 1
+                i = i + 1
+            }
+        }
+        let n = body.refuse(console_status(&frame))
+        var answer = move request
+        if late {
+            try timer.arm(after_ns: stallconfig.PERIOD_NS)
+            let _ = try pause.wait()
+            let _ = (move answer).reply(body: &body.bytes, len: n)
+        } else {
+            let _ = (move answer).reply(body: &body.bytes, len: n)
+            try timer.arm(after_ns: stallconfig.PERIOD_NS)
+            let _ = try pause.wait()
+        }
+    }
+    try sosmain.context().system().console_release()
+    var i = 0
+    while i < kept {
+        try sosmain.context().system().debug_print_byte(KEPT[i])
+        i = i + 1
+    }
+    return EXIT_OK
+}
+
+/// Whether a wake on the outlet says every inlet is gone.
+func gone(what: &WaitPayload) -> Bool {
+    match what {
+        case Readable(state) -> state == OutletLevel.PeerGone,
+        case _ -> false,
+    }
+}

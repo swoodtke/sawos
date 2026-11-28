@@ -11,6 +11,7 @@ import sosimage.imagefile.{ImageFile, bind}
 import sosimage.kernel.{KernelFacts}
 import sosimage.plan.{ImagePlan, PlanSlabs, Source, check_plan, heap_block, plan_image,
                       plan_module, root_arena, root_blocks}
+import sosimage.limits.{PlanNeeds}
 
 func join(lines: &Vector<String>) -> String {
     "{lines.join("\n")}\n"
@@ -109,6 +110,122 @@ func beat_named() -> Declaration {
           "rights = [\"clock-get\"]",
           "[quota]", "handles = 2"],
          "beat/process.toml")
+}
+
+// `driver` asking for the console claim, as the console's driver does.
+func claimant() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "rights = [\"debug\", \"process-self\", \"console\"]",
+          "[[boot]]", "name = \"port\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+          "[[boot]]", "name = \"port\"", "kind = \"line\"", "type = \"esp32s3-uart\"", "tag = 3",
+          "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 4",
+          "[quota]", "handles = 6"],
+         "driver/process.toml")
+}
+
+// `hello` asking for the console claim, which is not its to have.
+func hello_claiming() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "rights = [\"console\"]",
+          "[[boot]]", "name = \"uart\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2"],
+         "hello/process.toml")
+}
+
+// What binding the image's text `text` with the processes `d` says; "" when
+// it binds.
+func bind_refusal_with(text: String, d: &Vector<Declaration>) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(text, "i.toml", &b, 4)
+    match bind(&image, &b, &d, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// What `check_plan` finds `plan` asks, against tables of `table` handles.
+func needs(plan: &ImagePlan, table: Int) -> PlanNeeds {
+    let f = facts(table)
+    var d = Vector<Int>()
+    var k = 0
+    while k < 9 {
+        try! d.push(if k == 7 { 16 } else { 4 })
+        k = k + 1
+    }
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100,
+                          iomemories: 100)
+    try! check_plan(&plan, &f, &d, &slabs, "i.toml")
+}
+
+// The console claim (`console`): a declaration may name it, the plan gives
+// it to the image's console alone, and the builder refuses it elsewhere.
+func console_right() {
+    let claiming = claimant()
+    assert(claiming.names_console(), "the claimant names it")
+    assert(not driver().names_console(), "the driver names none")
+
+    var d = decls()
+    d[0] = claimant()
+    expect(bind_refusal_with(join(&image_lines()), &d), "", "the console's server names it")
+    let plan = planned_with(join(&image_lines()), &d)
+    expect(rights_of(&plan, 0), "debug | process-self | console", "the plan gives it")
+    let module = plan_module(&plan, "boxed").join("\n")
+    assert(module.contains("    try! rights.push(RightName.Console)"), "the module names it")
+
+    // Refused in a process that does not serve the console, and in an image
+    // that names none.
+    var other = decls()
+    other[1] = hello_claiming()
+    expect(bind_refusal_with(join(&image_lines()), &other),
+           "hello/process.toml: line 3, column 3: the process hello's `system` record names `console`, which the stock root gives only to the process serving the image's console, console",
+           "a client naming it")
+    expect(bind_refusal_with(with_line(6, ""), &d),
+           "driver/process.toml: line 3, column 3: the process console's `system` record names `console`, which the stock root gives only to the process serving the image's console, and the image boxed names no console",
+           "no console")
+    // The grant gives it to the console's server alone, whatever reached the
+    // plan: a client's declaration naming it, planned against bindings made
+    // without it, keeps the rest.
+    var claiming_client = decls()
+    claiming_client[1] = hello_claiming()
+    let b = board()
+    let image = try! ImageFile.parse(join(&image_lines()), "i.toml", &b, 4)
+    let plain_decls = decls()
+    let bound = try! bind(&image, &b, &plain_decls, 4)
+    let masked = try! plan_image(&image, &b, &claiming_client, &bound, 4)
+    expect(rights_of(&masked, 1), "", "the grant withholds it from a client")
+    // An image's default rights cannot name it.
+    expect(read_refusal(with_system(join(&image_lines()), "rights = [\"console\"]\n")),
+           "i.toml: line 10, column 11: `rights` in [system] names `console`, which an image may not name: an image's default keeps at most `debug`, `process-self`, `clock-get` and `transfer`; `console` is named only by the declaration of the image's console, and any other System right is its launcher's to give",
+           "the image's default")
+}
+
+// Root's part of an image that names a console: the plan names the console's
+// connection and the child serving it, which the module carries, and root
+// keeps the console's inlet past the release, beside the handles its writer
+// and watchdog take.
+func console_plan() {
+    let plan = planned(join(&image_lines()))
+    assert((plan.console ?? -1) == 0 && (plan.console_child ?? -1) == 0, "the console, planned")
+    let module = plan_module(&plan, "boxed").join("\n")
+    assert(module.contains("windows: 0, console: 0,\n         console_child: 0)"), "the module")
+    let without = planned(with_line(6, ""))
+    assert(without.console == None && without.console_child == None, "no console")
+
+    // Root holds its boot and start-up handles, a Process per child, its
+    // Waiter and the console's inlet, and the writer's and watchdog's
+    // eleven: twenty-two, at the console step. Beat's row is raised to its
+    // floor.
+    let raised = planned(with_line(22, "package = \"beat\"\nquota = \{ handles = 3 \}"))
+    let n = needs(&raised, 32)
+    expect(n.step, "console", "the console step")
+    assert(n.held == 22, "twenty-two at the console")
+    assert(n.console, "the console's watchdog is root's")
+    let m = needs(&without, 32)
+    assert(not m.step.equals("console") && not m.console, "no console step")
+    expect(checked(&raised, 21, 16),
+           "i.toml: the stock root would hold 22 handles at `console`, past the longest handle table (21)",
+           "the console step past the table")
 }
 
 func decls() -> Vector<Declaration> {
@@ -433,4 +550,7 @@ func main() {
     assert(grown > 0, "a block grew")
     assert(root_blocks(&plan, 4) == root_blocks(&same_rights, 4) + grown, "root's blocks")
     assert(root_arena(&plan, 4) >= root_arena(&same_rights, 4), "root's arena")
+
+    console_right()
+    console_plan()
 }

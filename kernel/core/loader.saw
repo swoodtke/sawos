@@ -386,6 +386,12 @@ extension ImageTable {
     public(package) func prio_map(&self) -> UInt {
         self.header.prio_map as UInt
     }
+
+    /// The validated header's realtime bands, `Rt0` to `Rt3`: zero when it
+    /// names none.
+    public(package) func rt_map(&self) -> UInt {
+        self.header.rt_map as UInt
+    }
 }
 
 /// Validate a whole image against `img_len` bytes at `img_base` and the
@@ -399,6 +405,10 @@ extension ImageTable {
 /// untouched, so a launcher that gets `BadImage` back has lost only the call,
 /// and a refused boot image leaves the root region as the linker left it.
 ///
+/// `reads_rt_map` is root's: only root's header is read for its realtime
+/// bands, so only the boot accepts an image that names them (version 4), and
+/// the create door refuses one, where the kernel would drop the request.
+///
 /// No preemption point: at most `hal.MAX_ROOT_SEGMENTS` iterations of an O(1)
 /// body, then each pair of segments once (`segments_meet`).
 public(package) func validate_image(
@@ -406,6 +416,7 @@ public(package) func validate_image(
     img_len: UInt,
     dest: &LoadRegion,
     allow_device: Bool,
+    reads_rt_map: Bool,
     table: &var ImageTable
 ) unsafe -> ImageFault? {
     let header_len = sizeof<SosimgHeader>() as UInt
@@ -420,7 +431,7 @@ public(package) func validate_image(
     if not header.has_magic() {
         return ImageFault(reason: "bad magic", detail: header.magic as UInt)
     }
-    if not header.has_known_version() {
+    if not header.has_known_version(reads_rt_map: reads_rt_map) {
         return ImageFault(reason: "unsupported version", detail: header.version as UInt)
     }
     // An image built for the other profile is refused rather than jumped into:
@@ -714,13 +725,14 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // nothing else to run, so every refusal stops it with the reason. The
     // create door turns the same `ImageFault` into a status.
     var table = ImageTable.empty()
-    if let bad = validate_image(base, img_len, &dest, true, &var table) {
+    if let bad = validate_image(base, img_len, &dest, true, true, &var table) {
         fatal_image(bad.reason, bad.detail)
     }
 
     let entry = table.entry()
     let seg_count = table.seg_count()
     let prio_map = table.prio_map()
+    let rt_map = table.rt_map()
 
     let uart = console()
     uart.write_str("SOS: root image ok segments=")
@@ -741,7 +753,7 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     load_domain(ROOT_PROCESS)
 
     // Spec §7: root's band map applies verbatim from its image.
-    let bands = root_band_map(prio_map)
+    let bands = root_band_map(prio_map, rt_map)
 
     // Spec §12: root's boot handle set. The entry register carries exactly one
     // handle, System; everything else the kernel minted for root is collected
@@ -750,8 +762,9 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
                   bands)
 }
 
-/// How many bands an image header's map carries: `Background` to `High`, a
-/// byte each, low byte first.
+/// How many bands each of an image header's two maps carries: `prio_map`
+/// `Background` to `High`, and `rt_map` `Rt0` to `Rt3`, a byte each, low byte
+/// first.
 static HEADER_BANDS: Int = 4
 
 /// Bits per band in an image header's map.
@@ -760,31 +773,41 @@ static HEADER_BAND_BITS: Int = 8
 /// A header band's byte.
 static HEADER_BAND_MASK: UInt = 0xFF
 
-/// Root's band map, from the four bands its image header carries (spec §7,
-/// §12): each header band at the level its byte names, and the realtime bands
-/// `Rt0` to `Rt3` at `High`'s, which a header has no bytes for. A byte at or
-/// above `SYSTEM_LEVELS` stops the boot, naming the band, with the level as
-/// the detail. Blade refuses such a manifest, so only a hand-assembled image
-/// reaches the refusal.
-func root_band_map(header: UInt) unsafe -> UInt32 {
-    var map: UInt32 = 0
-    var band: Int = 0
-    while band < HEADER_BANDS {
-        let shift = (band * HEADER_BAND_BITS) as UInt
-        let level = (header >> shift) & HEADER_BAND_MASK
-        if level >= (SYSTEM_LEVELS as UInt) {
-            fatal_image(header_band_past_last(band), level)
+/// Root's band map, from its image header (spec §7, §12): each band of
+/// `header` at the level its byte names, and the realtime bands `Rt0` to
+/// `Rt3` at the levels `rt` names, or each at `High`'s when `rt` is zero, an
+/// image that names none. A byte at or above `SYSTEM_LEVELS` stops the boot,
+/// naming the band, with the level as the detail. Blade refuses such a
+/// manifest, so only a hand-assembled image reaches the refusal.
+func root_band_map(header: UInt, rt: UInt) unsafe -> UInt32 {
+    var map = header_bands(0, header, 0)
+    if rt == 0 {
+        let high = band_level(map, Priority.High as Int)
+        var band = Priority.Rt0 as Int
+        while band < BANDS {
+            map = with_band_level(map, band, high)
+            band = band + 1
         }
-        map = with_band_level(map, band, level as UInt8)
-        band = band + 1
+        return map
     }
-    let high = band_level(map, Priority.High as Int)
-    band = Priority.Rt0 as Int
-    while band < BANDS {
-        map = with_band_level(map, band, high)
-        band = band + 1
+    header_bands(map, rt, Priority.Rt0 as Int)
+}
+
+/// `map` with the `HEADER_BANDS` bands from `first` up at the levels the
+/// bytes of `word` name, refusing a level past the last.
+func header_bands(map: UInt32, word: UInt, first: Int) unsafe -> UInt32 {
+    var out = map
+    var i: Int = 0
+    while i < HEADER_BANDS {
+        let shift = (i * HEADER_BAND_BITS) as UInt
+        let level = (word >> shift) & HEADER_BAND_MASK
+        if level >= (SYSTEM_LEVELS as UInt) {
+            fatal_image(header_band_past_last(first + i), level)
+        }
+        out = with_band_level(out, first + i, level as UInt8)
+        i = i + 1
     }
-    map
+    out
 }
 
 /// The refusal of header band `band`'s level.
@@ -793,6 +816,10 @@ func header_band_past_last(band: Int) -> String {
         case 0 -> "band background is past the last level",
         case 1 -> "band low is past the last level",
         case 2 -> "band normal is past the last level",
-        case _ -> "band high is past the last level",
+        case 3 -> "band high is past the last level",
+        case 4 -> "band rt0 is past the last level",
+        case 5 -> "band rt1 is past the last level",
+        case 6 -> "band rt2 is past the last level",
+        case _ -> "band rt3 is past the last level",
     }
 }

@@ -17,7 +17,9 @@
 //! root's own objects of the kind plus each child's row of it, a declaration's
 //! or the image's, so the rows the children state always fit the slab they
 //! draw from. Root's own are its main thread, its one Waiter and the Memory
-//! objects of the region table; a child that states no row of a kind counts
+//! objects of the region table, and in an image that names a console its
+//! console's watchdog: a second thread, its Waiter and Timer and an Event;
+//! a child that states no row of a kind counts
 //! nothing of it, except a Thread, which counts its main thread, and a
 //! Memory, which counts at least its heaps. An image may state such a total
 //! above its sum and never below it.
@@ -187,10 +189,12 @@ extension ImageLimits {
 /// any step and the first step it holds them at, each child's name, `Handle`
 /// row and the records its boot set is given, and `summed`, by `SlabKind`
 /// value, what the children's rows add up to in each slab (see
-/// `plan_limits`). An image whose root is not the stock root has no plan to
-/// read, and `PlanNeeds.none()` asks nothing.
+/// `plan_limits`). `console` says the image names a console, so root's own
+/// objects include its console's watchdog. An image whose root is not the
+/// stock root has no plan to read, and `PlanNeeds.none()` asks nothing.
 public struct PlanNeeds {
     stock: Bool
+    console: Bool
     held: Int
     step: String
     names: Vector<String>
@@ -205,7 +209,7 @@ extension PlanNeeds: ExplicitCopy {}
 extension PlanNeeds {
     /// The needs of an image with no plan to read.
     public static func none() -> PlanNeeds {
-        PlanNeeds(stock: false, held: 0, step: "", names: Vector<String>(),
+        PlanNeeds(stock: false, console: false, held: 0, step: "", names: Vector<String>(),
                   rows: Vector<Int>(), records: Vector<Int>(),
                   summed: Vector<Int>())
     }
@@ -309,13 +313,16 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, needs: &PlanN
     // A stock root's slabs hold root's own objects and what each child's rows
     // ask: each kind's total is their sum, which a stated total may exceed.
     // Root has its main thread, its one Waiter and the region table's Memory
-    // objects, and a child with no row of a kind counts nothing of it.
+    // objects, and in an image that names a console its console's watchdog:
+    // a thread, its Waiter and Timer, and the Event that wakes it. A child
+    // with no row of a kind counts nothing of it.
     var threads = 0
     if needs.stock {
-        threads = 1 + (needs.summed.get(THREADS) ?? 0)
-        try sum_kind(&var total, &limits, &needs, EVENTS, 0, name)
-        try sum_kind(&var total, &limits, &needs, WAITERS, 1, name)
-        try sum_kind(&var total, &limits, &needs, TIMERS, 0, name)
+        let watchdog = if needs.console { 1 } else { 0 }
+        threads = 1 + watchdog + (needs.summed.get(THREADS) ?? 0)
+        try sum_kind(&var total, &limits, &needs, EVENTS, watchdog, name)
+        try sum_kind(&var total, &limits, &needs, WAITERS, 1 + watchdog, name)
+        try sum_kind(&var total, &limits, &needs, TIMERS, watchdog, name)
         try sum_kind(&var total, &limits, &needs, MAPPINGS, 0, name)
         try sum_kind(&var total, &limits, &needs, PIPES, 0, name)
         try sum_kind(&var total, &limits, &needs, MEMORIES, memory_rows, name)
@@ -327,8 +334,12 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, needs: &PlanN
                facts.records_per_body * bodies, name,
                "{facts.records_per_body} records per process body, for {bodies} bodies")
     if threads > bodies {
-        try derive(&var total, &limits, THREADS, threads, name,
-                   "root's main thread and the processes' Thread rows")
+        let why = if needs.console {
+            "root's main thread, its console's watchdog and the processes' Thread rows"
+        } else {
+            "root's main thread and the processes' Thread rows"
+        }
+        try derive(&var total, &limits, THREADS, threads, name, why)
     } else {
         try derive(&var total, &limits, THREADS, bodies, name,
                    "a main thread for each of {bodies} process bodies")

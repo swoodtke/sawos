@@ -86,8 +86,14 @@
 //! without `debug` (`console_rights`): there a program written with `main`
 //! prints through the console, so `debug` is for a process that writes
 //! through the kernel's debug print, the console's driver among them, and it
-//! names it. The four are also every right a declaration or an image may
-//! name, since any other System right is the launcher's to give.
+//! names it. The four are also every right an image may name, and with
+//! `console` every right a declaration may name, since any other System right
+//! is the launcher's to give. `console` (`SystemRight.Console`, the console
+//! claim) is the console's driver's: the stock root gives it only to the
+//! process serving its image's `[image] console`, and the builder refuses a
+//! declaration naming it in any other process (`sosimage.imagefile.bind`) and
+//! in an image with a hand-written root
+//! (`sosimage.product.refuse_console_right`).
 //!
 //! Beyond the rules of `sosimage.rules`, a declaration is refused by name
 //! for: a `[ceilings]` key that is no kind, is `system`, or lists a right the
@@ -97,8 +103,8 @@
 //! not ask for it; a `count` on a record (the list form,
 //! reserved); a tag in the range
 //! the runtime reserves (`bootplan.RESERVED_TAG_FIRST` up, whose first is
-//! `CONSOLE_TAG`); a right in `rights` that is not one of the four, or one
-//! named twice; a tag given twice;
+//! `CONSOLE_TAG`); a right in `rights` that is not one of the four or
+//! `console`, or one named twice; a tag given twice;
 //! not exactly one `system` record; a name given twice within its family
 //! (device needs; endpoints, a serve and a client sharing one set of names;
 //! memory), where a window and a line of one type under one name are one
@@ -355,19 +361,36 @@ public func console_rights() -> Vector<String> {
     ["process-self", "clock-get", "transfer"]
 }
 
-/// The list `rights` in `t`, each one of `child_rights()`; `place` says
-/// where the key is for a refusal (empty, or ` in [TABLE]`) and `owner` what
-/// states it.
-public func read_rights(t: &TomlTable, file: String, place: String,
-                        owner: String) -> Result<Vector<String>, BuildError> {
-    let allowed = child_rights()
+/// The System right a declaration may name beside `child_rights()`: the
+/// console claim, which the stock root gives only to the image's console.
+public func console_right_name() -> String {
+    "console"
+}
+
+/// The System rights a declaration may name: `child_rights()` and
+/// `console_right_name()`.
+public func declared_rights() -> Vector<String> {
+    var out = child_rights()
+    try! out.push(console_right_name())
+    move out
+}
+
+/// The list `rights` in `t`, each one of `allowed`; `place` says where the
+/// key is for a refusal (empty, or ` in [TABLE]`) and `owner` what states it.
+public func read_rights(t: &TomlTable, file: String, place: String, owner: String,
+                        allowed: &Vector<String>) -> Result<Vector<String>, BuildError> {
     let rights = try name_list(&t, "rights", file, "a System right's name")
     var i = 0
     while i < rights.len() {
         let name = rights.get(i) ?? ""
         if not holds(&allowed, name) {
+            let most = if holds(&allowed, console_right_name()) {
+                "a process's System record keeps at most `debug`, `process-self`, `clock-get`, `transfer` and, in the image's console, `console`;"
+            } else {
+                "an image's default keeps at most `debug`, `process-self`, `clock-get` and `transfer`; `console` is named only by the declaration of the image's console, and"
+            }
             return refused(file, element_at(&t, "rights", i),
-                           "`rights`{place} names `{name}`, which {owner} may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+                           "`rights`{place} names `{name}`, which {owner} may not name: {most} any other System right is its launcher's to give")
         }
         i = i + 1
     }
@@ -453,7 +476,9 @@ extension Declaration {
                 if let r = boot.table(i) {
                     let record = try read_record(&r, file)
                     if record.kind == RecordKind.System && r.contains("rights") {
-                        system_rights = try read_rights(&r, file, "", "a process's declaration")
+                        let allowed = declared_rights()
+                        system_rights = try read_rights(&r, file, "", "a process's declaration",
+                                                        &allowed)
                     }
                     try! records.push(record)
                 } else {
@@ -538,6 +563,27 @@ extension Declaration {
                            quota: move quota,
                            inputs: move inputs, inputs_at: inputs_at,
                            defaults: move defaults, heaps: move heaps)
+    }
+
+    /// Whether its `system` record names `console`, the console claim.
+    public func names_console(&self) -> Bool {
+        match self.system_rights {
+            case Some(own) -> holds(&own, console_right_name()),
+            case None -> false
+        }
+    }
+
+    /// Its `system` record, which a declaration has exactly one of.
+    public func system_record(&self) -> BootRecord {
+        var i = 0
+        while i < self.records.len() {
+            let r = self.records.get(i)!
+            if r.kind == RecordKind.System {
+                return r
+            }
+            i = i + 1
+        }
+        panic("{}: internal: a declaration with no system record was read", self.file)
     }
 
     /// The rights its System record keeps: those it names, or the image's

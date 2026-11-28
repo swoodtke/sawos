@@ -17,6 +17,7 @@ import std.file.{File}
 import std.path.{Path}
 import sosimage.tool.{read_text, write_lines}
 import sosimage.tree.{check_images, check_tree_board, hold_quota, read_tree, runs_on}
+import sosimage.product.{refuse_console_right}
 
 /// The protection grain of each board of the tree, by its name: a page on
 /// arm64, a word elsewhere.
@@ -90,7 +91,7 @@ func fixture_with(dir: String, decl: Vector<String>, spi: Vector<String>) {
     try! write_lines("{dir}/drivers/e/process.toml", &spi)
     try! write_lines("{dir}/drivers/d/Saw.toml", &manifest("d"))
     try! write_lines("{dir}/drivers/e/Saw.toml", &manifest("e"))
-    let images: Vector<String> = ["i.toml", "o.toml", "u.toml"]
+    let images: Vector<String> = ["i.toml", "o.toml", "u.toml", "h.toml"]
     var i = 0
     while i < images.len() {
         let path = Path(s: "{dir}/tests/images/{images.get(i) ?? ""}")
@@ -213,6 +214,32 @@ func main() {
         case Err(e) -> e.message
     }
     assert(refused.equals("s.toml: line 9, column 1: UART0 is the kernel's own device, bound only when an image names it: name it in the `device` of the process driver"), "the console unnamed: {refused}")
+
+    // The console claim in an image with a hand-written root, which names no
+    // console: a process whose declaration names `console` is refused, and
+    // one with no declaration, or whose declaration names none, is not.
+    let hand: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"hand\"", "board = \"riscv32-virt\"", "tick = false",
+        "[root]", "package = \"sawos:tests/console-claim\"",
+        "[[process]]", "name = \"other\"", "package = \"sawos:tests/child-ends\"",
+        "[[process]]", "name = \"exit\"", "package = \"sawos:tests/console-exit\""]
+    let plain = try! ImageFile.parse(hand.join("\n"), "h.toml", &virt, 4)
+    let kept = match refuse_console_right(&plain, "../..", "../..") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(kept.is_empty(), "no declaration names the claim: {kept}")
+    var claiming = hand.copy()
+    try! claiming.push("[[process]]")
+    try! claiming.push("name = \"staller\"")
+    try! claiming.push("package = \"sawos:tests/console-staller\"")
+    let claimed = try! ImageFile.parse(claiming.join("\n"), "h.toml", &virt, 4)
+    let claim_refused = match refuse_console_right(&claimed, "../..", "../..") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(claim_refused.equals("../../tests/console-staller/process.toml: line 12, column 3: the process staller's `system` record names `console`, which the stock root gives only to the process serving an image's console, and the image hand has a hand-written root, which names no console"), "the claim refused: {claim_refused}")
     let named = try! ImageFile.parse(service.join("\n").replace("package = \"sawos:drivers/svc-uart-ns16550\"", "package = \"sawos:drivers/svc-uart-ns16550\"\ndevice = \{ uart = \"UART0\" \}"), "s.toml", &virt, 4)
     let bound = try! bind(&named, &virt, &decls, 4)
     assert((bound.windows.get(0)!).window.base == 0x1000_0000, "the console, named")
@@ -260,6 +287,27 @@ func main() {
         case Err(e) -> e.message
     }
     expect(unbound, unbound_message)
+
+    // An image with a hand-written root whose process's declaration names
+    // the console claim is refused by the tree's check.
+    let claimant: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "rights = [\"console\"]",
+        "[[boot]]", "name = \"uart\"", "kind = \"window\"", "type = \"uart\"", "tag = 2",
+        "[build]", "inputs = [\"pins\"]"]
+    fixture(dir, move claimant)
+    let hand_image: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"h\"", "board = \"b\"", "tick = false",
+        "[root]", "package = \"sawos:drivers/e\"",
+        "[[process]]", "name = \"d\"", "package = \"sawos:drivers/d\""]
+    try! write_lines("{dir}/tests/images/h.toml", &hand_image)
+    let hand_refused = match check_images(dir, &board, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(hand_refused, "{dir}/drivers/d/process.toml: line 3, column 3: the process d's `system` record names `console`, which the stock root gives only to the process serving an image's console, and the image h has a hand-written root, which names no console")
+    remove_if("{dir}/tests/images/h.toml")
 
     // One board against its kernel's numbers: a declaration that runs on it
     // is held to them, one that runs elsewhere is not, and every image for

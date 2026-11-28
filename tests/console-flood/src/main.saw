@@ -1,0 +1,116 @@
+// A client of an image's console, written with `main`. As its build input
+// `floodconfig` says, it first yields `floodconfig.YIELDS` times, tells one
+// byte to the driver of its `aux` record (`floodconfig.AUX`), prints
+// `floodconfig.LINES` numbered lines to the console:
+//
+//   SOS flood: line N of LINES
+//
+// computes on a thread at `High`, or at `Low` (`floodconfig.HOG_LOW`), for
+// `floodconfig.HOG_NS` of the Monotonic clock, prints
+//
+//   SOS flood: a line after computing
+//
+// when `floodconfig.AFTER` says to, and ends as `floodconfig.END` says: it
+// returns, so the start-up's `Sync` waits for the console's driver to answer
+// every line first (with no lines it sends no `Sync`); it faults, releasing a
+// word that names nothing; or it panics, with a short text or one past the
+// kernel's bound.
+//
+// No tick is armed in the images it runs in, so a yield returns once every
+// thread runnable at it has run until it blocked, which is how it orders
+// itself behind what other processes do first.
+
+import sos.{SosStatus, Priority, sos_handle_release}
+import uartpipe.{uart}
+import floodconfig
+import sosmain
+
+/// The tag its declaration gives its `aux` record (`process.toml`).
+static TAG_AUX: UInt = 2
+
+/// The ends `floodconfig.END` names.
+static END_RETURN: Int = 0
+static END_FAULT: Int = 1
+static END_PANIC: Int = 2
+static END_LONG_PANIC: Int = 3
+
+/// The word that names nothing, whose release is the `BadHandle` fault.
+static NAMES_NOTHING: UInt = 0
+
+/// The computing thread's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    var y = 0
+    while y < floodconfig.YIELDS {
+        let me = try sosmain.context().process().thread_self()
+        try me.yield_now()
+        y = y + 1
+    }
+    if floodconfig.AUX {
+        guard var record = set.take(TAG_AUX) else {
+            return SosStatus.BadImage
+        }
+        guard let inlet = record.take_inlet() else {
+            return SosStatus.BadImage
+        }
+        var aux = uart(move inlet)
+        let _ = aux.write("x")
+    }
+    var i = 1
+    while i <= floodconfig.LINES {
+        print("SOS flood: line {} of {}", i, floodconfig.LINES)
+        i = i + 1
+    }
+    if floodconfig.HOG_NS > 0 {
+        try hog()
+    }
+    if floodconfig.AFTER {
+        print("SOS flood: a line after computing")
+    }
+    if floodconfig.END == END_FAULT {
+        let _ = sos_handle_release(NAMES_NOTHING)
+    }
+    if floodconfig.END == END_PANIC {
+        panic("SOS flood: a panic")
+    }
+    if floodconfig.END == END_LONG_PANIC {
+        panic("SOS flood: a panic whose text runs past the bound the kernel keeps of it, so that the line root prints for it is as long as a line of root's gets: {} {} {} {}",
+              "abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz",
+              "abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz")
+    }
+    return
+}
+
+/// Runs `computing` on a thread at `High`, above the `Normal` its own main
+/// thread and root's run at, or at `Low`, below them, and joins it.
+func hog() unsafe -> Result<Void, SosStatus> {
+    let top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+              (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let run: FuncPointer<(UInt) sync -> UInt> = computing
+    let thread = try sosmain.context().process().thread_create(run: run, arg: 0, stack_top: top)
+    try thread.start(band: if floodconfig.HOG_LOW { Priority.Low } else { Priority.High })
+    let _ = try thread.join()
+    return
+}
+
+/// Reads the Monotonic clock until `floodconfig.HOG_NS` has passed: it never
+/// blocks, so nothing at or below its level runs meanwhile.
+func computing(arg: UInt) sync -> UInt {
+    let clock = try sosmain.context().system().clock_get() catch {
+        return 1
+    }
+    let start = try clock.now() catch {
+        return 1
+    }
+    while {
+        let now = try clock.now() catch {
+            return 1
+        }
+        if now - start >= floodconfig.HOG_NS {
+            return 0
+        }
+    }
+}

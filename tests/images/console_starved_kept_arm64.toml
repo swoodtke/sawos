@@ -1,0 +1,35 @@
+# An image whose console is a healthy claimant that answers each request a
+# period after its take, from a thread at `Rt0` (`tests/console-staller` in its
+# `late` mode), on the arm64 `virt` board. A client exits at once, and the
+# claimant answers root's line about it while the hog (`tests/console-flood`
+# with `hog`) computes on a thread at `High` for longer than the watchdog's two
+# periods, above root's main thread: root cannot take the answer, and the
+# watchdog keeps the claimant. The image arms no tick. The
+# `console_starved_kept` case builds it with `sosimage build`.
+format = 1
+
+[image]
+name = "console_starved_kept"
+board = "arm64-virt"
+tick = false
+console = "console.uart"
+
+[root]
+package = "stock"
+
+[[process]]
+name = "console"
+package = "sawos:tests/console-staller"
+inputs = { stallconfig = "tests/console-staller/config/late.saw" }
+
+[[process]]
+name = "trigger"
+package = "sawos:tests/console-flood"
+inputs = { floodconfig = "tests/console-flood/config/exit.saw" }
+clients = { aux = "console.uart" }
+
+[[process]]
+name = "hog"
+package = "sawos:tests/console-flood"
+inputs = { floodconfig = "tests/console-flood/config/hog.saw" }
+clients = { aux = "console.uart" }

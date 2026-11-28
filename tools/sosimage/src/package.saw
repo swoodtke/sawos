@@ -36,9 +36,10 @@
 //! the module of its name (`write_input`). `plan` and `inputs` may be left
 //! out; every other key is required, and an unknown key is refused.
 //!
-//! A child's image header carries the default band map (`check_header_bands`):
-//! the header's map is root's, which the kernel applies verbatim, and nothing
-//! reads a child's, so a child asks for its bands in its declaration.
+//! A child's image header carries the default band map and no realtime bands
+//! (`check_header_bands`): the header's maps are root's, which the kernel
+//! applies verbatim, and nothing reads a child's, so a child asks for its
+//! bands in its declaration.
 
 import std.data.{Data}
 import std.file.{File}
@@ -300,27 +301,42 @@ public func build_process(profile: &Profile, name: String, package: String, out:
     return Built(image: image, elf: "{blade_out}/{pkg}.elf")
 }
 
-/// The header's `prio_map`, by offset (`imgformat`'s `SosimgHeader`).
+/// The header's `prio_map` and `rt_map`, by offset (`imgformat`'s
+/// `SosimgHeader`).
 static HEADER_PRIO_MAP: Int = 8
+static HEADER_RT_MAP: Int = 12
 /// The map a manifest with no `[sos] priorities` writes: one byte a band, low
 /// byte first, background at 0 and the others at 1.
 static DEFAULT_PRIO_MAP: UInt32 = 0x0101_0100
 
 /// Refuses a child whose built image, `image`, carries a header band map
-/// other than the default: the map is root's, and nothing reads a child's.
+/// other than the default, or any realtime band (a nonzero `rt_map`, which
+/// makes the image one the create door refuses): the maps are root's, and
+/// nothing reads a child's.
 public func check_header_bands(image: &Data, process: String, file: String,
                                at: TomlPosition) -> Result<Void, BuildError> {
-    var map: UInt32 = 0
-    var b = 3
-    while b >= 0 {
-        guard let byte = image.get(HEADER_PRIO_MAP + b) else {
-            return BuildError(message: "the image of the process {process} is truncated before its header's band map")
-        }
-        map = (map << 8) | (byte as UInt32)
-        b = b - 1
-    }
+    let map = try header_word(&image, HEADER_PRIO_MAP, process)
     if map != DEFAULT_PRIO_MAP {
         return refused(file, at, "the package of the process {process} states a band map of {hex(map as UInt64)} in its `Saw.toml` `[sos] priorities`, which is root's band map and is not read for a child: a child asks for bands in its process.toml")
     }
+    let rt = try header_word(&image, HEADER_RT_MAP, process)
+    if rt != 0 {
+        return refused(file, at, "the package of the process {process} states realtime bands of {hex(rt as UInt64)} in its `Saw.toml` `[sos] priorities`, which are root's and are not read for a child: a child asks for bands in its process.toml")
+    }
     return
+}
+
+/// The header's little-endian word at `at` in `image`, the image of the
+/// process `process`.
+func header_word(image: &Data, at: Int, process: String) -> Result<UInt32, BuildError> {
+    var word: UInt32 = 0
+    var b = 3
+    while b >= 0 {
+        guard let byte = image.get(at + b) else {
+            return BuildError(message: "the image of the process {process} is truncated before its header's band maps")
+        }
+        word = (word << 8) | (byte as UInt32)
+        b = b - 1
+    }
+    return word
 }

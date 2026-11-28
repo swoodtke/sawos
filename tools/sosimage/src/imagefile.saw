@@ -378,7 +378,8 @@ extension ImageFile {
             let system_keys: Vector<String> = ["rights"]
             try only_keys(&t, &system_keys, file, "[system]")
             if t.contains("rights") {
-                system_rights = try read_rights(&t, file, " in [system]", "an image")
+                let allowed = child_rights()
+                system_rights = try read_rights(&t, file, " in [system]", "an image", &allowed)
             }
         }
 
@@ -916,6 +917,7 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
     if let target = image.console {
         try console_serve(&image, &decls, target)
     }
+    try console_right(&image, &decls)
 
     // Every device bound to more than one process, printed.
     var w = 0
@@ -1287,6 +1289,42 @@ func console_serve(image: &ImageFile, decls: &Vector<Declaration>,
         }
     }
     return refused(file, at, "`console` in [image] is `{target}`, which names no process of this image: there is no `{server}`")
+}
+
+/// The process serving a stock-root image's console, `[image] console`'s
+/// PROCESS; "" in an image that names none.
+public func console_server(image: &ImageFile) -> String {
+    guard let target = image.console else {
+        return ""
+    }
+    guard let dot = target.index_of(46) else {
+        return ""
+    }
+    target.substring(0, dot)
+}
+
+/// Refuses a declaration of a stock-root image's processes (`decls`, in
+/// order) whose `system` record names `console`, the console claim, when its
+/// process is not the one serving the image's console: the stock root gives
+/// the right to that process alone.
+func console_right(image: &ImageFile, decls: &Vector<Declaration>) -> Result<Void, BuildError> {
+    let server = console_server(&image)
+    var i = 0
+    while i < image.processes.len() {
+        let p = image.processes.get(i)!
+        i = i + 1
+        borrow let d = decls[i - 1] {
+            if not d.names_console() || (not server.is_empty() && p.name.equals(server)) {
+                continue
+            }
+            let at = d.system_record().at
+            if server.is_empty() {
+                return refused(d.file, at, "the process {p.name}'s `system` record names `console`, which the stock root gives only to the process serving the image's console, and the image {image.name} names no console")
+            }
+            return refused(d.file, at, "the process {p.name}'s `system` record names `console`, which the stock root gives only to the process serving the image's console, {server}")
+        }
+    }
+    return
 }
 
 extension ImageFile {

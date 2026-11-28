@@ -1,0 +1,38 @@
+# An image whose console is a healthy claimant that takes one message a period
+# (`tests/console-staller` in its `slow` mode), on the ESP32-S3: a client
+# prints twelve lines, a quick one tells a byte to a second console driver
+# (`svc-console` as `aux`, which the claim ends with `EXIT_CLAIMED`) and
+# panics, and root's lines about those ends wait behind the flood for longer
+# than the watchdog's two periods while the claimant goes on taking, so the
+# watchdog keeps it. The image arms no tick. The `console_backpressure_kept`
+# case builds it with `sosimage build`.
+format = 1
+
+[image]
+name = "console_backpressure_kept"
+board = "esp32s3"
+tick = false
+console = "console.uart"
+
+[root]
+package = "stock"
+
+[[process]]
+name = "console"
+package = "sawos:tests/console-staller"
+inputs = { stallconfig = "tests/console-staller/config/slow.saw" }
+
+[[process]]
+name = "aux"
+package = "sawos:drivers/svc-console"
+
+[[process]]
+name = "flood"
+package = "sawos:tests/console-flood"
+clients = { aux = "aux.uart" }
+
+[[process]]
+name = "quick"
+package = "sawos:tests/console-flood"
+inputs = { floodconfig = "tests/console-flood/config/quick_panic.saw" }
+clients = { aux = "aux.uart" }
