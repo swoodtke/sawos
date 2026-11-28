@@ -169,6 +169,9 @@ static_assert(FRAME_WORDS * 8 == (FRAME_BYTES as UInt), "frame_init zeroes the w
 static UART_BASE: UInt = 0x0900_0000
 static FR_TX_FULL: UInt32 = 0x20         // FR bit 5 — transmit FIFO full
 
+/// The line the board's console interrupts on: the PL011's SPI 1.
+static CONSOLE_IRQ: UInt = 33
+
 /// The interrupt controller: a distributor shared by the machine and a
 /// per-core interface. This board wires the v2 layout, which
 /// `tools/sos_runner.py` pins on the command line so a newer emulator's default
@@ -320,6 +323,24 @@ public func console_byte(b: UInt8) unsafe {
     Pl011(at: UART_BASE).write_byte(b)
 }
 
+/// Take the console back from a process that claimed it, for a stop of the
+/// machine (`kcore`'s `console_stop`): mask the console's line at the
+/// controller, so the claimant's interrupt stays quiet whatever the stop does
+/// next. Nothing else is put back and no FIFO is reset: the bytes the
+/// claimant stored go out first, and the kernel's writes follow them. Whether
+/// a PL011 driver can leave a register the kernel's write path depends on
+/// (the control register's transmit enable) clear is not settled here.
+public func console_reclaim() unsafe {
+    irq_mask(CONSOLE_IRQ)
+}
+
+// `kcore` ends a console claim and writes what it held back before a stop's
+// lines (`console_stop`). The stops this file makes on its own reach it by
+// symbol, since the HAL sits below `kcore` in the module order.
+extern "C" {
+    func sos_console_stop()
+}
+
 // =============================================================================
 // Stopping the machine
 // =============================================================================
@@ -334,6 +355,7 @@ extern "C" {
 
 /// Stop the machine with status 0. Never returns.
 public func exit_pass() {
+    sos_console_stop()
     sos_platform_exit(0)
     while true { }
 }
@@ -345,6 +367,7 @@ public func exit_pass() {
 /// decided once, for every board. How to stop is this file's: a semihosting
 /// exit through the C leaf.
 public func exit_fail(code: UInt) {
+    sos_console_stop()
     sos_platform_exit(abort_status(code))
     while true { }
 }
@@ -368,6 +391,7 @@ public func exit_fail(code: UInt) {
 @export("sos_rt_abort")
 public func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
                      code: UInt32) unsafe -> Never {
+    sos_console_stop()
     rt_write(ptr, len)
     exit_fail(code as UInt)
     while { }
@@ -1119,6 +1143,7 @@ public func kernel_fault(esr: UInt, elr: UInt, far: UInt) unsafe {
         exit_fail(ec)
     }
     IN_KERNEL_FAULT = 1
+    sos_console_stop()
     report_str("SOS: kernel fault ec=")
     report_hex(ec)
     report_str(" elr=")
@@ -1750,6 +1775,7 @@ func build_set(level1: UInt) unsafe {
 /// a memory map that outgrew the window, which is a kernel bug and reads as
 /// one.
 func grant_outside_window(va: UInt) {
+    sos_console_stop()
     report_str("SOS: grant outside the page-granular window: ")
     report_hex(va)
     report_str("\n")

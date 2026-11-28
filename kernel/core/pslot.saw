@@ -41,8 +41,8 @@
 //! back in `.bss`. The record table is all-zero, and so is a donated extent of
 //! it: a zeroed record is a `Free` record with no body.
 
-import sosabi.{BootHandleKind, HANDLE_KINDS, ObjType, ProcessStatusKind,
-               QUOTA_KINDS, StatsRow}
+import sosabi.{BootHandleKind, DeathRecord, HANDLE_KINDS, ObjType,
+               PANIC_TEXT_BYTES, ProcessStatusKind, QUOTA_KINDS, StatsRow}
 import kcore.limits.{
     HANDLE_BLOCK,
     MAX_GRANT_ROWS,
@@ -249,6 +249,13 @@ public(package) struct ProcessRecord {
     /// process at its next switch point (`drain_doomed`), and a teardown clears
     /// the field.
     public(package) doom: UInt8,
+    /// How the process ended, beyond the status word (spec §8): what
+    /// `ProcessOp.Death` answers, its status and pid filled in from the
+    /// fields above. Written where each line about the death is decided, at
+    /// every death, and emptied when a create takes the record
+    /// (`kcore.process.assign_pid`), so a process that has not died reads
+    /// none.
+    public(package) death: DeathRecord,
 }
 
 /// What a live process runs in (spec §2.7): its protection domain, its handle
@@ -511,7 +518,17 @@ unsafe static var PROCESS_RECORDS: ProcessRecordTable = ProcessRecordTable(slab:
                            refs: 0, attachment: 0,
                            final_stats: StatsRow(syscalls: 0, interrupts: 0,
                                                  faults: 0, pid: 0, pinned: 0),
-                           body_link: 0, doom: 0); MAX_PROCESS_RECORDS],
+                           body_link: 0, doom: 0,
+                           death: DeathRecord(status: 0, pid: 0, cause: 0,
+                                              printed: 0, trap_cause: 0,
+                                              trap_pc: 0, trap_addr: 0,
+                                              holder_pid: 0, handles: 0,
+                                              threads: 0, events: 0,
+                                              waiters: 0, interrupts: 0,
+                                              timers: 0, text_len: 0,
+                                              reserved: 0,
+                                              text: [0; PANIC_TEXT_BYTES]));
+             MAX_PROCESS_RECORDS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],

@@ -145,6 +145,9 @@ import sosabi.{
     THREAD_WAKE_OP,
     PARK_OP,
     PANIC_TEXT_BYTES,
+    DeathCause,
+    DeathRecord,
+    death_record_bytes,
     HandleInfo,
     HandleKind,
     ENTRY_IMAGE,
@@ -261,7 +264,9 @@ import kcore.objects.{
     quota_word,
     unbind_handle,
 }
-import kcore.diag.{ExitCode, console, fatal_kernel}
+import kcore.diag.{ExitCode, console, console_claim, console_claimed,
+                   console_held_by, console_line, console_refuses_byte,
+                   console_return, fatal_kernel}
 import kcore.stackdepth.{report_stack_peak}
 import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
                     stats_pin_raise, stats_pin_lower, stats_region_phys, stats_region_len}
@@ -362,7 +367,10 @@ import kcore.loader.{
 
 import kcore.irq.{service_irq}
 import kcore.sched.{
+    death_line,
     end_process,
+    end_with_fault,
+    record_cause,
     kill_process,
     exit_thread,
     fault_process,
@@ -373,6 +381,7 @@ import kcore.sched.{
     stamp_interrupt_latency,
 }
 import kcore.mem.{word_bytes}
+import sosrt.{ascii_byte}
 
 /// The System object's ops (§2.8). Returns a status; `shutdown` does not
 /// return.
@@ -399,16 +408,22 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
     match op {
         // The rights check is per-op, not per-object: holding the System handle
         // is not the same as being allowed to use every part of it.
+        // A console claim refuses every caller's byte, the claimant's
+        // included, and counts it (spec §9a).
         case DebugPrint -> {
             if not obj.allows(SystemRight.Debug) {
                 fault_process(p, FaultReason.AccessDenied)
+            }
+            if console_refuses_byte() {
+                return op_status(SosStatus.Claimed)
             }
             hal.console_byte((arg0 & BYTE_MASK) as UInt8)
             op_ok()
         },
         // Stop the machine with `arg0` as the status. Not process exit (that is
         // `ProcessOp.Exit`): this is the whole machine, and kernels with no
-        // Process object use it to finish a run.
+        // Process object use it to finish a run. A console claim is taken
+        // back by the HAL's stop (`kcore.diag.console_stop`).
         case Shutdown -> {
             if not obj.allows(SystemRight.Shutdown) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -528,6 +543,35 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
                 fault_process(p, FaultReason.AccessDenied)
             }
             process_by_pid(p, arg0)
+        },
+        // The console claim (spec §9a). The claimant is named by its record
+        // and its pid. A second claim by the claimant is the caller's mistake;
+        // another process's claim is a status, since the caller could not
+        // have known.
+        case ConsoleClaim -> {
+            if not obj.allows(SystemRight.Console) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let pid = process_records().at(ProcessIndex(p)).pid
+            if console_held_by(p, pid) {
+                fault_process(p, FaultReason.BadState)
+            }
+            if console_claimed() {
+                return op_status(SosStatus.Claimed)
+            }
+            console_claim(p, pid)
+            op_ok()
+        },
+        // Giving the console back needs no right: a claimant can always end
+        // its claim through whatever System handle it holds. The returned
+        // line, if anything was held, is written here.
+        case ConsoleRelease -> {
+            let pid = process_records().at(ProcessIndex(p)).pid
+            if not console_held_by(p, pid) {
+                fault_process(p, FaultReason.BadState)
+            }
+            console_return()
+            op_ok()
         },
     }
 }
@@ -946,7 +990,43 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_section_word(p, arg0)
         },
+        // The death record (§8), on a right of its own, which a launcher's
+        // handle carries and the observe set does not. `arg0` is the answer
+        // buffer and `arg1` its capacity, as for `Stats`.
+        case Death -> {
+            if not obj.allows(ProcessRight.Death) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_death(p, obj.slot, arg0, arg1)
+        },
     }
+}
+
+/// `ProcessOp.Death`: copy the death record of process `target` into process
+/// `p`'s buffer at `dst`, of `cap` bytes (spec §8).
+///
+/// The record is the one the death wrote, with the status word and the pid
+/// filled in from the record beside it. A process that has not died reads the
+/// `Running` word, its pid and nothing else, because a create empties the
+/// record. A capacity below the record's size is a `BadArg` fault and a buffer
+/// the door refuses ends the caller, as for `Stats`. It allocates nothing: the
+/// answer is built on the kernel's stack.
+func process_death(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
+    if cap < (death_record_bytes() as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    var rec = borrow var record = process_records().at(ProcessIndex(target)) {
+        var r = record.death
+        r.status = process_status_word(record.exit_kind, record.exit_code) as UInt64
+        r.pid = record.pid
+        r
+    }
+    if let why = copy_out(ProcessIndex(p), dst,
+                          ((&var rec) as UnsafePointer<DeathRecord>) as UInt,
+                          death_record_bytes() as UInt) {
+        fault_process(p, why)
+    }
+    op_ok()
 }
 
 /// `ProcessOp.SectionWord`: process `p`'s section word becomes the pair of
@@ -2427,8 +2507,21 @@ func live_thread_named(p: Int, q: Int, t: Int, line: Bool) unsafe -> Int {
 /// after, with `line` set, the lock wait's console line naming both. `q` is a
 /// live process's record, never `NO_PROCESS`: a live thread's process is
 /// never disowned, and the exited arm leaves a disowned slot out.
+///
+/// With `line` set the caller's death record keeps `q`'s pid
+/// (`DeathCause.LockOwner`): the wait named another process's lock. Without
+/// it the fault is an ordinary one (`DeathCause.Fault`), since no lock was
+/// named.
 func thread_elsewhere(p: Int, q: Int, line: Bool) unsafe -> Never {
-    if line {
+    if not line {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let holder_pid = process_records().at(ProcessIndex(q)).pid
+    borrow var record = process_records().at(ProcessIndex(p)) {
+        record.death.cause = (DeathCause.LockOwner as UInt8) as UInt64
+        record.death.holder_pid = holder_pid
+    }
+    if death_line(p) {
         let out = console()
         out.write_str("SOS: lock wait: the owner is a thread of another process waiter=")
         out.write_hex(p as UInt)
@@ -2436,7 +2529,7 @@ func thread_elsewhere(p: Int, q: Int, line: Bool) unsafe -> Never {
         out.write_hex(q as UInt)
         out.write_str("\n")
     }
-    fault_process(p, FaultReason.BadArg)
+    end_with_fault(p, FaultReason.BadArg)
 }
 
 /// Fault process `p` with `LockChain` when the chain from `holder` comes back
@@ -3619,6 +3712,10 @@ static LINE_FEED: UInt8 = 0x0Au8
 /// The line is the fault line with the text last, so nothing the text holds
 /// can move a field before it. The end is `end_process`'s, as at every fault,
 /// and root's stops the machine with `ExitCode.Panic`.
+///
+/// The text goes into the death record first (`DeathCause.Panic`), as the line
+/// prints it, and the line prints it from there: under a console claim the
+/// record is the only place it is (spec §9a).
 func panic_process(p: Int, src: UInt, len: UInt) unsafe -> Never {
     let bound = PANIC_TEXT_BYTES as UInt
     let bytes = if len > bound { bound } else { len }
@@ -3627,31 +3724,64 @@ func panic_process(p: Int, src: UInt, len: UInt) unsafe -> Never {
         refused = copy_in_check(ProcessIndex(p), src, bytes)
     }
     let reason = FaultReason.Panic
-    let uart = console()
-    uart.write_str("SOS: process fault: ")
-    uart.write_str(reason.describe())
-    uart.write_str(" process=")
-    uart.write_hex(p as UInt)
-    uart.write_str(" text=")
+    record_cause(p, DeathCause.Panic)
     if let why = refused {
-        uart.write_str("text unreadable: ")
-        uart.write_str(why.describe())
+        keep_text(p, "text unreadable: ")
+        keep_text(p, why.describe())
     } else {
-        write_panic_text(p, src, bytes, bytes == len)
+        keep_panic_text(p, src, bytes, bytes == len)
     }
-    uart.write_str("\n")
+    if death_line(p) {
+        let uart = console()
+        uart.write_str("SOS: process fault: ")
+        uart.write_str(reason.describe())
+        uart.write_str(" process=")
+        uart.write_hex(p as UInt)
+        uart.write_str(" text=")
+        write_kept_text(p)
+        uart.write_str("\n")
+    }
     end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
                 ExitCode.Panic as UInt)
 }
 
-/// Write the `bytes` of process `p`'s text at `src`, which the door has
-/// passed, to the console, so that it can neither start a line of its own nor
-/// reach the terminal as a control sequence: printable ASCII as it is, and
-/// every other byte as `?`, line breaks and every byte of a multi-byte
+/// Append `b` to process `p`'s kept panic text, which holds at most
+/// `PANIC_TEXT_BYTES`.
+func keep_text_byte(p: Int, b: UInt8) unsafe {
+    borrow var record = process_records().at(ProcessIndex(p)) {
+        let n = record.death.text_len as Int
+        if n < PANIC_TEXT_BYTES {
+            record.death.text[n] = b
+            record.death.text_len = (n + 1) as UInt64
+        }
+    }
+}
+
+/// Append an ASCII string to process `p`'s kept panic text.
+func keep_text(p: Int, msg: String) unsafe {
+    for scalar in msg.scalars() {
+        keep_text_byte(p, ascii_byte(scalar))
+    }
+}
+
+/// Write process `p`'s kept panic text to the console.
+func write_kept_text(p: Int) unsafe {
+    let n = process_records().at(ProcessIndex(p)).death.text_len as Int
+    var i: Int = 0
+    while i < n {
+        hal.console_byte(process_records().at(ProcessIndex(p)).death.text[i])
+        i = i + 1
+    }
+}
+
+/// Keep the `bytes` of process `p`'s text at `src`, which the door has
+/// passed, in its death record, so that it can neither start a line of its
+/// own nor reach the terminal as a control sequence: printable ASCII as it is,
+/// and every other byte as `?`, line breaks and every byte of a multi-byte
 /// character included. The one exception is a line break that is the text's
 /// last byte, which is dropped: the compiler's messages end with one. `whole`
 /// says the last byte read is the text's last, which a cut text's is not.
-func write_panic_text(p: Int, src: UInt, bytes: UInt, whole: Bool) unsafe {
+func keep_panic_text(p: Int, src: UInt, bytes: UInt, whole: Bool) unsafe {
     var chunk: [UInt; PANIC_CHUNK_WORDS] = [0; PANIC_CHUNK_WORDS]
     let buf = ((&var chunk) as UnsafePointer<UInt>) as UInt
     let size = (PANIC_CHUNK_WORDS * sizeof<UInt>()) as UInt
@@ -3670,9 +3800,9 @@ func write_panic_text(p: Int, src: UInt, bytes: UInt, whole: Bool) unsafe {
             let b = UnsafeMemory<UInt8, Normal>(buf + i).read()
             let last = whole && done + i + 1 == bytes
             if b >= PANIC_PRINTABLE_FIRST && b <= PANIC_PRINTABLE_LAST {
-                hal.console_byte(b)
+                keep_text_byte(p, b)
             } else if not (last && b == LINE_FEED) {
-                hal.console_byte(PANIC_SUBSTITUTE)
+                keep_text_byte(p, PANIC_SUBSTITUTE)
             }
             i = i + 1
         }
@@ -4736,7 +4866,7 @@ func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     // not pay for an object it never got.
     PIPES[slot] = PipeSlot(state: SlotState.Live, process: owner, staged: 0,
                            inlet_attachment: 0, outlet_attachment: 0,
-                           inlet_refs: 1, outlet_refs: 1)
+                           inlet_refs: 1, outlet_refs: 1, taken: 0)
     quota_charge(ProcessIndex(owner), QuotaKind.Pipe)
 
     var rec = PipeCreateRecord(inlet: inlet, outlet: outlet)
@@ -4785,6 +4915,14 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
                 fault_process(p, FaultReason.AccessDenied)
             }
             pipe_call(p, obj.slot, arg0, arg1, arg2)
+        },
+        // How far the server has taken: the connection's count, on the bit
+        // that posts. It reads a counter and changes nothing.
+        case Taken -> {
+            if not obj.allows(PipeInletRight.Post) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            op_value(PIPES[obj.slot].taken)
         },
     }
 }
@@ -6104,7 +6242,9 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     // that trapped, so this is not a syscall, a fault or an interrupt and no
     // stats column counts it; the line is its observable.
     if hal.fp_trap(frame_addr, cause) {
-        console().write_str("SOS: fp first use\n")
+        if console_line() {
+            console().write_str("SOS: fp first use\n")
+        }
         return frame_addr
     }
 

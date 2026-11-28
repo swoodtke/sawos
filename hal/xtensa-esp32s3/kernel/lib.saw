@@ -483,9 +483,60 @@ extension EspUart: ConsoleSink {
 /// One UART, and a driver process may be granted its page, so after the
 /// handover marker there can be a second writer (the protocol is stated on
 /// `kcore`'s `Console`). Each write is one register store guarded by its own
-/// poll, so the two interleave and neither loses a byte.
+/// poll, so the two interleave and neither loses a byte. After a kernel fault
+/// the poll is bounded (`fault_console_stop`).
 public func console_byte(b: UInt8) unsafe {
-    if s3stall.CONSOLE_STALL_COUNT { s3stall.counted_byte(b) } else { EspUart(at: UART_BASE).write_byte(b) }
+    if FAULT_WRITES {
+        bounded_byte(b)
+    } else if s3stall.CONSOLE_STALL_COUNT { s3stall.counted_byte(b) } else { EspUart(at: UART_BASE).write_byte(b) }
+}
+
+/// Whether the console writes with a bounded poll: set once a kernel fault has
+/// been reported, after which nothing but the stop's own lines is written.
+unsafe static var FAULT_WRITES: Bool = false
+
+/// Polls of the transmit FIFO's count a bounded write makes before it stores
+/// anyway: `sink.c`'s `FAULT_POLLS_PER_BYTE`, whose comment says why the bound
+/// always outlasts a draining UART.
+static FAULT_POLLS_PER_BYTE: UInt = 1 << 16
+
+/// Write `b` after at most `FAULT_POLLS_PER_BYTE` polls for room, as
+/// `sink.c`'s `fault_byte` does, so a UART that never drains cannot keep a
+/// stop from reaching its halt.
+func bounded_byte(b: UInt8) unsafe {
+    let uart = EspUart(at: UART_BASE)
+    var polls: UInt = 0
+    while polls < FAULT_POLLS_PER_BYTE && not uart.can_write() {
+        polls = polls + 1
+    }
+    uart.put(b)
+}
+
+/// End a console claim for `sink.c`'s `kernel_fault`, after its line: the
+/// console's writes are bounded from here on, so the held-back line cannot
+/// keep the fault from reaching its halt either.
+@export("sos_fault_console_stop")
+public func fault_console_stop() unsafe {
+    FAULT_WRITES = true
+    sos_console_stop()
+}
+
+/// Take the console back from a process that claimed it, for a stop of the
+/// machine (`kcore`'s `console_stop`): mask the console's line as `irq_mask`
+/// does, disabling the CPU interrupt its source is routed to, so the
+/// claimant's interrupt stays quiet whatever the stop does next. The write
+/// path is a count read and a store, which need no enable bit, so the mask is
+/// all there is. No FIFO is reset: the bytes the claimant
+/// stored go out first, and the kernel's writes follow them.
+public func console_reclaim() unsafe {
+    irq_mask(CONSOLE_IRQ)
+}
+
+// `kcore` ends a console claim and writes what it held back before a stop's
+// lines (`console_stop`). The stops this file makes on its own reach it by
+// symbol, since the HAL sits below `kcore` in the module order.
+extern "C" {
+    func sos_console_stop()
 }
 
 /// Write a string to the console, byte at a time, allocating nothing: the stop
@@ -521,6 +572,7 @@ func console_hex(v: UInt) unsafe {
 
 /// Report a clean stop and halt.
 public func exit_pass() unsafe {
+    sos_console_stop()
     if s3stall.CONSOLE_STALL_COUNT { s3stall.report_stall() }; console_str("SOS-S3: halt pass\n")
     sos_sim_exit(0)
     while true { }
@@ -531,6 +583,7 @@ public func exit_pass() unsafe {
 /// What status to report is `sosrt.abort_status`'s call: a failing exit never
 /// reads as a passing one. The line and the exit status carry the same code.
 public func exit_fail(code: UInt) unsafe {
+    sos_console_stop()
     let status = abort_status(code)
     console_str("SOS-S3: halt fail code=0x")
     console_hex(status)
@@ -555,6 +608,7 @@ public func exit_fail(code: UInt) unsafe {
 @export("sos_rt_abort")
 public func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
                      code: UInt32) unsafe -> Never {
+    sos_console_stop()
     rt_write(ptr, len)
     exit_fail(code as UInt)
     while { }
@@ -1221,6 +1275,7 @@ public func irq_unmask(line: UInt) unsafe {
             entry = take_back_entry()
         }
         if entry == DEVICE_CPU_INT_COUNT {
+            sos_console_stop()
             console_str("SOS-S3: out of CPU interrupts for line 0x")
             console_hex(line)
             console_byte(10)
@@ -1510,6 +1565,7 @@ static WINDOWED_CALL_REFUSED_STATUS: UInt = 6
 /// was given (../ABI.md §7g). The stub comes here instead of calling it.
 @export("sos_windowed_call_refused")
 public func windowed_call_refused(fn_addr: UInt) unsafe -> Never {
+    sos_console_stop()
     console_str("SOS-S3: kernel bug: windowed call to 0x")
     console_hex(fn_addr)
     console_str(" after the loader\n")

@@ -17,6 +17,7 @@
 
 import hal
 import sosabi.{
+    DeathCause,
     ObjType,
     QuotaKind,
     FaultReason,
@@ -40,7 +41,9 @@ import kcore.limits.{
 }
 import kcore.result.{SyscallResult, op_ok, op_status, op_value, write_result}
 import kcore.mem.{word_bytes}
-import kcore.diag.{ExitCode, console, fatal_deadlock, fatal_kernel}
+import kcore.diag.{ExitCode, console, console_claimed, console_held_by,
+                   console_line, console_return, console_stop,
+                   fatal_deadlock, fatal_kernel}
 import kcore.stackdepth.{report_stack_peak}
 import kcore.stats.{stats_read}
 import kcore.pslot.{processes, process_records, ProcessState, body_of,
@@ -1037,6 +1040,12 @@ func disown_bound(p: Int) unsafe {
 /// after another, never inside one.
 func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
                       is_caller: Bool) unsafe -> TeardownCounts {
+    // A console claim is the claimant's and ends at its teardown, whatever
+    // ended it (spec §9a), before anything about the death is written. Then
+    // every line about this death goes the same way, so the record says which
+    // way that was: root's end is a stop, which writes whatever the claim.
+    end_claim_of(p)
+    let printed = not console_claimed() || p == ROOT_PROCESS
     // Whatever end this process was owed, it is having one: a fault left
     // pending must not outlive the record it was written on.
     borrow var record = process_records().at(ProcessIndex(p)) {
@@ -1044,6 +1053,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
         record.state = ProcessState.Gone
         record.exit_kind = kind
         record.exit_code = code
+        record.death.printed = if printed { 1 } else { 0 }
     }
     // The teardown's own reference, dropped at the end (see above). It is taken
     // before the notify, which is the first thing that can drop another.
@@ -1073,12 +1083,14 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     if is_caller && p != ROOT_PROCESS {
         match kind {
             case Exited -> {
-                let out = console()
-                out.write_str("SOS: process exit: code=")
-                out.write_hex(code)
-                out.write_str(" process=")
-                out.write_hex(p as UInt)
-                out.write_str("\n")
+                if death_line(p) {
+                    let out = console()
+                    out.write_str("SOS: process exit: code=")
+                    out.write_hex(code)
+                    out.write_str(" process=")
+                    out.write_hex(p as UInt)
+                    out.write_str("\n")
+                }
             },
             case _ -> {},
         }
@@ -1394,6 +1406,17 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // survives (keeping the spec §8 status word readable), and the creator's
     // release frees the record later. A process that never ran is torn down at
     // a count of zero, so its record is reclaimed here every time.
+    //
+    // The counts go into the death record first, while the record is still
+    // the dying process's.
+    borrow var record = process_records().at(ProcessIndex(p)) {
+        record.death.handles = counts.closed as UInt64
+        record.death.threads = counts.threads as UInt64
+        record.death.events = counts.events as UInt64
+        record.death.waiters = counts.waiters as UInt64
+        record.death.interrupts = counts.interrupts as UInt64
+        record.death.timers = counts.timers as UInt64
+    }
     unref_object(ObjType.Process, p)
 
     counts
@@ -1405,8 +1428,12 @@ func spared(t: ThreadIndex, is_caller: Bool) unsafe -> Bool {
     not is_caller && (t == CURRENT_THREAD || t == PENDING_FREE)
 }
 
-/// Print the teardown line for process `p`.
+/// Print the teardown line for process `p`, unless a console claim holds it
+/// back (`death_line`).
 func report_teardown(counts: TeardownCounts, p: Int) unsafe {
+    if not death_line(p) {
+        return
+    }
     let uart = console()
     uart.write_str("SOS: process teardown handles=")
     uart.write_hex(counts.closed)
@@ -1507,6 +1534,7 @@ func end_unstarted(p: Int) unsafe {
 /// ended first: every other process dies with the machine, uncounted. The call
 /// does not return for root.
 public(package) func kill_process(p: Int, code: UInt) unsafe {
+    record_cause(p, DeathCause.Killed)
     let counts = teardown_process(p, ProcessStatusKind.Killed, code, false)
     report_teardown(counts, p)
     if p == ROOT_PROCESS {
@@ -1564,6 +1592,7 @@ func end_doomed(p: Int, why: FaultReason) unsafe {
     if owns_current_thread(p) || p == ROOT_PROCESS {
         fault_process(p, why)
     }
+    record_cause(p, DeathCause.Fault)
     report_fault(p, why)
     let counts = teardown_process(p, ProcessStatusKind.Faulted,
                                   (why as UInt8) as UInt, false)
@@ -1650,6 +1679,14 @@ public(package) func drain_deaths() unsafe {
 /// stopped machine when root is the one that was wrong, and into whatever runs
 /// next when it was a child.
 public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
+    record_cause(p, DeathCause.Fault)
+    end_with_fault(p, reason)
+}
+
+/// `fault_process` for a death whose record the caller has already written:
+/// the fault's line, then the end. A lock wait that names another process's
+/// thread is one (`DeathCause.LockOwner`).
+public(package) func end_with_fault(p: Int, reason: FaultReason) unsafe -> Never {
     report_fault(p, reason)
     end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
                 ExitCode.ProcessFault as UInt)
@@ -1658,6 +1695,9 @@ public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never 
 /// The console line for a process ended by `reason`: the reason reads first, so
 /// the process number follows it.
 func report_fault(p: Int, reason: FaultReason) unsafe {
+    if not death_line(p) {
+        return
+    }
     let uart = console()
     uart.write_str("SOS: process fault: ")
     uart.write_str(reason.describe())
@@ -1670,24 +1710,84 @@ func report_fault(p: Int, reason: FaultReason) unsafe {
 /// (spec §8: a thread fault kills its process). The harness reads the report's
 /// wording and shape, so keep them; which process it was is in the teardown
 /// line that follows.
+///
+/// The death record keeps the three words the line prints.
 public(package) func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt) unsafe -> Never {
-    let uart = console()
-    uart.write_str("SOS: fault ")
-    uart.write_str(tag)
-    uart.write_str(" cause=")
-    uart.write_hex(cause)
-    uart.write_str(" epc=")
-    uart.write_hex(epc)
-    uart.write_str(" tval=")
-    uart.write_hex(tval)
-    uart.write_str("\n")
-    if CURRENT_THREAD != NO_THREAD {
-        end_process(threads().at(CURRENT_THREAD).process, ProcessStatusKind.Faulted, 0,
-                    ExitCode.UmodeFault as UInt)
+    // No process object: the harness kernels that enter user mode directly,
+    // where the trap stops the machine.
+    let p = if CURRENT_THREAD != NO_THREAD {
+        threads().at(CURRENT_THREAD).process
+    } else {
+        NO_PROCESS
     }
-    // No process object yet: the harness kernels that enter user mode directly.
+    if p == NO_PROCESS {
+        console_stop()
+    } else {
+        borrow var record = process_records().at(ProcessIndex(p)) {
+            record.death.cause = (DeathCause.Trap as UInt8) as UInt64
+            record.death.trap_cause = cause as UInt64
+            record.death.trap_pc = epc as UInt64
+            record.death.trap_addr = tval as UInt64
+        }
+    }
+    if p == NO_PROCESS || death_line(p) {
+        let uart = console()
+        uart.write_str("SOS: fault ")
+        uart.write_str(tag)
+        uart.write_str(" cause=")
+        uart.write_hex(cause)
+        uart.write_str(" epc=")
+        uart.write_hex(epc)
+        uart.write_str(" tval=")
+        uart.write_hex(tval)
+        uart.write_str("\n")
+    }
+    if p != NO_PROCESS {
+        end_process(p, ProcessStatusKind.Faulted, 0, ExitCode.UmodeFault as UInt)
+    }
     hal.exit_fail(ExitCode.UmodeFault as UInt)
     while { }
+}
+
+// =============================================================================
+// The console's lines about a death (spec §9a), and the death record (§8)
+// =============================================================================
+
+/// End the console claim process `p` holds, if it holds one: its death ends
+/// it, and the lines about the death are written. Root's end stops the
+/// machine, so a claim root holds is ended as a stop ends one, its line
+/// masked (`console_stop`).
+func end_claim_of(p: Int) unsafe {
+    let pid = process_records().at(ProcessIndex(p)).pid
+    if not console_held_by(p, pid) {
+        return
+    }
+    if p == ROOT_PROCESS {
+        console_stop()
+    } else {
+        console_return()
+    }
+}
+
+/// Whether the kernel writes a line about process `p`'s end now, asked once
+/// per line at its first byte.
+///
+/// Root's end stops the machine, and a stop takes the console back over any
+/// claim (`console_stop`). The claimant's end ends its claim first. Any
+/// other process's line, while a claim stands, is held back and counted, and
+/// its death record is where it is kept (`DeathRecord.printed`).
+public(package) func death_line(p: Int) unsafe -> Bool {
+    if p == ROOT_PROCESS {
+        console_stop()
+        return true
+    }
+    end_claim_of(p)
+    console_line()
+}
+
+/// Record how process `p` is ending, before its first line is written.
+public(package) func record_cause(p: Int, cause: DeathCause) unsafe {
+    process_records().at(ProcessIndex(p)).death.cause = (cause as UInt8) as UInt64
 }
 
 /// The kernel's answer to `sosrt`'s lock-owner hook, which std's `SpinLock`

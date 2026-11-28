@@ -1,0 +1,376 @@
+// Test child: ends in the way its role names, or meets the console claim the
+// way it names, for `death_record`, `console_claim` and `pipe_taken`.
+//
+// The launcher gives it a System handle as its boot handle and an Event whose
+// word is its role under `TAG_ROLE`. `LOCK` takes a second Event, whose word
+// is the launcher's thread ID, under `TAG_ARG`, and `TRAP` signals the
+// address it calls into on the one given there. It prints nothing: under a
+// console claim a print is refused and counted, and the case counts exactly.
+//
+//   EXIT            exits with `EXIT_CODE`
+//   PARK            parks for good, for the launcher to read and kill
+//   FAULT           a debug print through handle 0: the `BadHandle` fault
+//   TRAP            calls into a zeroed word of its writable data, after
+//                   signalling its address: a hardware fault on every
+//                   profile, data that may not be executed or an instruction
+//                   that is not one
+//   PANIC           the panic op on `PANIC_BYTES` bytes, past the kernel's
+//                   bound, the byte at `i` being `'a' + i % 26`
+//   LOCK            waits on a lock pair of its own whose owner word is the
+//                   launcher's thread: the kernel's lock-owner line, then the
+//                   `BadArg` fault
+//   CLAIM HELD      claims the console while the launcher holds it, and exits
+//                   with `EXIT_SAW_CLAIMED` when the claim answers `Claimed`
+//   RELEASE UNHELD  releases a console it does not hold: the `BadState` fault
+//   CLAIM DENIED    claims the console through a System handle without the
+//                   right: the `AccessDenied` fault
+//   CLAIM TWICE     claims the console, finds its own debug print answered
+//                   `Claimed`, and claims again: the `BadState` fault, whose
+//                   end gives the console back
+//   DEATH DENIED    reads its own death record through a Process handle
+//                   carrying the observe set, `Wait | Stats`, and no
+//                   `Death`: the `AccessDenied` fault
+//   DEATH SHORT     reads it into a buffer a doubleword short of the record:
+//                   the `BadArg` fault
+//   TAKEN DENIED    reads a connection's take count through an inlet without
+//                   `Post`: the `AccessDenied` fault
+//   CLAIM PARK      claims the console and parks for good, for the launcher
+//                   to kill holding the claim
+//   SENDER DEATH    takes the message staged on the outlet given under
+//                   `TAG_OUTLET`, reads its sender's status word through the
+//                   sender handle, then its death record: the `AccessDenied`
+//                   fault, since a sender handle carries the observe set
+//   LOOKUP DEATH    the same through the handle `ProcessByPid` answers for
+//                   root's pid
+//   CLAIM WEAK      claims the console, releases it through a sibling of its
+//                   System handle without `Console`, claims and releases
+//                   again, and exits with `EXIT_RELEASED`
+//   CLAIM EXIT      claims the console, has its own debug print refused, and
+//                   exits with `EXIT_CODE` holding the claim
+//   CLAIM TRAP      the same, and traps as `TRAP` does
+//   CLAIM PANIC     the same, and panics as `PANIC` does
+//
+// An answer other than the one the role expects exits with a code of its own
+// that no role's honest end produces.
+
+import sos.{System, Process, Event, PipeOutlet, ALL_RIGHTS, PipeInletRight,
+            ProcessRight, SystemRight,
+            sos_lock_wait, sos_panic, sos_process_death,
+            sos_system_debug_print, sos_system_process_self}
+import sosabi.{DEATH_RECORD_DOUBLEWORDS}
+
+static TAG_ROLE: UInt = 40
+static TAG_ARG: UInt = 41
+static TAG_OUTLET: UInt = 42
+
+static ROLE_EXIT: UInt = 1
+static ROLE_PARK: UInt = 2
+static ROLE_FAULT: UInt = 3
+static ROLE_TRAP: UInt = 4
+static ROLE_PANIC: UInt = 5
+static ROLE_LOCK: UInt = 6
+static ROLE_CLAIM_HELD: UInt = 7
+static ROLE_RELEASE_UNHELD: UInt = 8
+static ROLE_CLAIM_DENIED: UInt = 9
+static ROLE_CLAIM_TWICE: UInt = 10
+static ROLE_DEATH_DENIED: UInt = 11
+static ROLE_DEATH_SHORT: UInt = 12
+static ROLE_TAKEN_DENIED: UInt = 13
+static ROLE_CLAIM_PARK: UInt = 14
+static ROLE_SENDER_DEATH: UInt = 16
+static ROLE_LOOKUP_DEATH: UInt = 17
+static ROLE_CLAIM_WEAK: UInt = 18
+static ROLE_CLAIM_EXIT: UInt = 19
+static ROLE_CLAIM_TRAP: UInt = 20
+static ROLE_CLAIM_PANIC: UInt = 21
+
+/// Root's pid, which `LOOKUP DEATH` looks up.
+static ROOT_PID: UInt64 = 1
+
+/// `EXIT`'s code.
+static EXIT_CODE: UInt = 0x2A
+/// `CLAIM HELD`'s code when the claim answered `Claimed`.
+static EXIT_SAW_CLAIMED: UInt = 0x2C
+/// `CLAIM WEAK`'s code when both releases gave the console back.
+static EXIT_RELEASED: UInt = 0x2D
+
+/// The boot set held no role, or a step before the one under test failed.
+static EXIT_SETUP: UInt = 0x50
+/// A call that was to end this process came back.
+static EXIT_SURVIVED: UInt = 0x51
+/// A claim answered other than the role expects.
+static EXIT_WRONG_ANSWER: UInt = 0x52
+
+/// `PANIC`'s length, past the kernel's bound, and the alphabet its bytes are.
+static PANIC_BYTES: Int = 300
+static ASCII_LOWER_A: Int = 0x61
+static ALPHABET: Int = 26
+
+/// The text `PANIC` hands the kernel.
+unsafe static var TEXT: [UInt8; PANIC_BYTES] = [0; PANIC_BYTES]
+
+/// The words `TRAP` calls into: zero is no instruction on any profile, and a
+/// profile that protects memory refuses to run data at all.
+unsafe static var ZEROS: [UInt; 4] = [0; 4]
+
+/// `LOCK`'s pair: the owner word, then the waiters flag.
+unsafe static var PAIR: [UInt; 2] = [0; 2]
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        return
+    }
+    var role_ev: Event? = None
+    var arg_ev: Event? = None
+    var outlet: PipeOutlet? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_ROLE {
+                    role_ev = rec.take_event()
+                } else if tag == TAG_ARG {
+                    arg_ev = rec.take_event()
+                } else if tag == TAG_OUTLET {
+                    outlet = rec.take_outlet()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let told = role_ev.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let role = try told.receive() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+
+    if role == ROLE_EXIT {
+        let _ = proc.exit(EXIT_CODE)
+    } else if role == ROLE_PARK {
+        park(&proc)
+    } else if role == ROLE_FAULT {
+        let _ = sos_system_debug_print(0, 0x41)
+    } else if role == ROLE_TRAP {
+        guard let ev = arg_ev.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        trap(&ev)
+    } else if role == ROLE_PANIC {
+        panic_long()
+    } else if role == ROLE_LOCK {
+        guard let ev = arg_ev.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let owner = try ev.receive() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        lock_foreign(owner)
+    } else if role == ROLE_CLAIM_HELD {
+        match system.console_claim() {
+            case Err(Claimed) -> { let _ = proc.exit(EXIT_SAW_CLAIMED) },
+            case _ -> { let _ = proc.exit(EXIT_WRONG_ANSWER) },
+        }
+    } else if role == ROLE_RELEASE_UNHELD {
+        let _ = system.console_release()
+    } else if role == ROLE_CLAIM_DENIED {
+        let _ = system.console_claim()
+    } else if role == ROLE_CLAIM_TWICE {
+        claim_twice(&system)
+    } else if role == ROLE_DEATH_DENIED {
+        let weak = try system.process_self(keep: ProcessRight.Wait
+                                                 | ProcessRight.Stats) catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let _ = weak.death()
+    } else if role == ROLE_DEATH_SHORT {
+        death_short(boot_handle)
+    } else if role == ROLE_TAKEN_DENIED {
+        let (inlet, own_outlet) = try proc.pipe_create() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let weak = try inlet.mint(rights: PipeInletRight.Transfer) catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let _ = weak.taken()
+        let _ = move own_outlet
+    } else if role == ROLE_SENDER_DEATH {
+        guard let out = outlet.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let (msg, request) = try out.take() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let _ = move msg
+        let sender = try request.sender() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        read_death(&proc, &sender)
+    } else if role == ROLE_LOOKUP_DEATH {
+        let found = try system.process_by_pid(pid: ROOT_PID) catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        read_death(&proc, &found)
+    } else if role == ROLE_CLAIM_WEAK {
+        if claim_weak(&system) {
+            let _ = proc.exit(EXIT_RELEASED)
+        }
+    } else if role == ROLE_CLAIM_EXIT {
+        if claim_refused(&system) {
+            let _ = proc.exit(EXIT_CODE)
+        }
+    } else if role == ROLE_CLAIM_TRAP {
+        guard let ev = arg_ev.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        if claim_refused(&system) {
+            trap(&ev)
+        }
+    } else if role == ROLE_CLAIM_PANIC {
+        if claim_refused(&system) {
+            panic_long()
+        }
+    } else if role == ROLE_CLAIM_PARK {
+        match system.console_claim() {
+            case Ok(_) -> { park(&proc) },
+            case _ -> {},
+        }
+        let _ = proc.exit(EXIT_WRONG_ANSWER)
+    }
+    let _ = proc.exit(EXIT_SURVIVED)
+}
+
+/// Read `other`'s status word, which its observe set allows, then its death
+/// record, which it does not.
+func read_death(proc: &Process, other: &Process) {
+    let _ = try other.get_status() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = other.death()
+}
+
+/// Park for good: wait on an Event nobody signals.
+func park(proc: &Process) {
+    let event = try proc.event_create() catch {
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        return
+    }
+    try waiter.add(event: &event, key: 1) catch {
+        return
+    }
+    let _ = waiter.wait()
+}
+
+/// Signal `ZEROS`' address on `told`, then call into it.
+func trap(told: &Event) unsafe {
+    let at = ((&var ZEROS) as UnsafePointer<UInt>) as UInt
+    let _ = told.signal(bits: at)
+    let f = FuncPointer<() sync -> Void>.from_raw(addr: at as UnsafePointer<UInt8>)
+    f()
+}
+
+/// The panic op on `PANIC_BYTES` bytes of the alphabet.
+func panic_long() unsafe {
+    var i = 0
+    while i < PANIC_BYTES {
+        TEXT[i] = (ASCII_LOWER_A + i % ALPHABET) as UInt8
+        i = i + 1
+    }
+    sos_panic(((&var TEXT) as UnsafePointer<UInt8>) as UnsafePointer<Int8>,
+              PANIC_BYTES as UInt)
+}
+
+/// Wait on `PAIR` with `owner`, another process's thread, as its owner.
+func lock_foreign(owner: UInt) unsafe {
+    PAIR[0] = owner
+    let _ = sos_lock_wait(((&var PAIR) as UnsafePointer<UInt>) as UInt)
+}
+
+/// Read this process's own death record, through the System handle's word,
+/// into a buffer one doubleword short of it.
+func death_short(word: UInt) unsafe {
+    var me: UInt = 0
+    if sos_system_process_self(word, ALL_RIGHTS as UInt,
+                               (&var me) as UnsafePointer<UInt>) != 0 {
+        return
+    }
+    var buf: [UInt64; DEATH_RECORD_DOUBLEWORDS] = [0; DEATH_RECORD_DOUBLEWORDS]
+    let short = ((DEATH_RECORD_DOUBLEWORDS - 1) * 8) as UInt
+    let _ = sos_process_death(me, (&var buf) as UnsafePointer<UInt64>, short)
+}
+
+/// Claim the console and have one debug-print byte refused: whether both
+/// answered as a claimant's do. The claim stands when it answers true.
+func claim_refused(system: &System) -> Bool {
+    match system.console_claim() {
+        case Ok(_) -> {},
+        case _ -> { return false },
+    }
+    match system.debug_print_byte(0x41) {
+        case Err(Claimed) -> true,
+        case _ -> false,
+    }
+}
+
+/// Claim, release through a sibling without `Console`, claim and release
+/// again: whether every step answered `Ok`. A release the sibling could not
+/// make would end this process.
+func claim_weak(system: &System) -> Bool {
+    match system.console_claim() {
+        case Ok(_) -> {},
+        case _ -> { return false },
+    }
+    let weak = try system.mint(rights: SystemRight.Debug) catch {
+        let _ = system.console_release()
+        return false
+    }
+    match weak.console_release() {
+        case Ok(_) -> {},
+        case _ -> { return false },
+    }
+    match system.console_claim() {
+        case Ok(_) -> {},
+        case _ -> { return false },
+    }
+    match system.console_release() {
+        case Ok(_) -> true,
+        case _ -> false,
+    }
+}
+
+/// Claim, print, and claim again. The second claim ends this process; an
+/// answer the role does not expect gives the console back and returns.
+func claim_twice(system: &System) {
+    match system.console_claim() {
+        case Ok(_) -> {},
+        case _ -> { return },
+    }
+    match system.debug_print_byte(0x41) {
+        case Err(Claimed) -> {},
+        case _ -> {
+            let _ = system.console_release()
+            return
+        },
+    }
+    let _ = system.console_claim()
+}

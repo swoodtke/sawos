@@ -39,7 +39,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
                process_stats_record_bytes,
                StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
                STATS_REGION_MAP_RECORD_WORDS, STATS_REGION_MAP_ROW_WORD,
-               stats_region_map_record_bytes}
+               stats_region_map_record_bytes, DeathCause, DeathRecord,
+               PANIC_TEXT_BYTES, death_record_bytes, empty_death_record}
 
 // The `sosabi.` qualifier, for the one encoding this module names without
 // binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes for its
@@ -56,13 +57,14 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
                   sos_process_exit, sos_process_give, sos_process_kill,
                   sos_process_pipe_create,
-                  sos_process_start, sos_process_stats,
+                  sos_process_start, sos_process_stats, sos_process_death,
                   sos_process_restrict_rights, ceiling_word,
                   sos_process_quota_set, sos_process_band_map,
                   sos_process_section_register,
                   sos_system_debug_print, sos_system_shutdown,
                   sos_system_slab_donate, sos_system_process_next,
-                  sos_system_process_by_pid, sos_waiter_add, handle_rights}
+                  sos_system_process_by_pid, sos_system_console_claim,
+                  sos_system_console_release, sos_waiter_add, handle_rights}
 import sos.memory.{Memory}
 import sos.pool.{Pool}
 import sos.iomemory.{IoMemory}
@@ -207,7 +209,10 @@ extension System {
         return System(handle: SystemHandle(raw))
     }
 
-    /// Write one byte to the debug console.
+    /// Write one byte to the debug console. Requires `SystemRight.Debug`.
+    /// While a process holds the console claim (`console_claim`), the byte
+    /// is refused with `SosStatus.Claimed`, this process's own claim
+    /// included, and the kernel counts it.
     public func debug_print_byte(&self, byte: UInt8) -> Result<Void, SosStatus> {
         checked(sos_system_debug_print(self.handle, byte as UInt))
     }
@@ -219,6 +224,28 @@ extension System {
             try self.debug_print_byte(ascii_byte(scalar))
         }
         return
+    }
+
+    /// Claim the console (spec §9a): from here until `console_release`, or
+    /// this process's death, the kernel writes nothing to the console but what
+    /// a stop of the machine writes. Every debug print answers
+    /// `SosStatus.Claimed`, this process's own included, and the lines the
+    /// kernel would have written about other processes' deaths are held back
+    /// and counted; each death's record (`Process.death`) keeps them.
+    /// Requires `SystemRight.Console`.
+    ///
+    /// A claim another process holds is `SosStatus.Claimed`. Claiming twice
+    /// terminates the caller with a `BadState` fault.
+    public func console_claim(&self) -> Result<Void, SosStatus> {
+        checked(sos_system_console_claim(self.handle))
+    }
+
+    /// Give the console back. The kernel writes one line, if it held anything
+    /// back, saying how many lines and debug-print bytes. Requires no right: a
+    /// claimant can always give the console back. A process that does not
+    /// hold the claim terminates with a `BadState` fault.
+    public func console_release(&self) -> Result<Void, SosStatus> {
+        checked(sos_system_console_release(self.handle))
     }
 
     /// Stop the machine with `status`. Does not return when it succeeds; a
@@ -729,6 +756,39 @@ public struct ProcessStats {
     public faults: UInt64,
     public pid: UInt64,
     public pinned: UInt64,
+}
+
+/// How a process ended, as `Process.death` reads it (spec §8).
+///
+/// `status` is the §8 status word and `cause` says which end it was; the
+/// other fields are filled in for the causes that have them. `printed` is
+/// true when the kernel wrote the death's lines to the console itself, and
+/// false when a console claim held them back, so a supervisor that prints the
+/// record knows whether it is the only one who will. The counts are the
+/// teardown line's. `text` is a panic's text as the kernel's line prints it,
+/// `text_len` bytes: printable ASCII, every other byte `?`, cut at
+/// `PANIC_TEXT_BYTES`.
+///
+/// Plain data, on the automatic `Copy` tier, like `ProcessStats`.
+public struct ProcessDeath {
+    public status: UInt,
+    public pid: UInt64,
+    public cause: DeathCause,
+    public printed: Bool,
+    /// A trap's cause word, pc and faulting address, in the HAL's terms.
+    public trap_cause: UInt64,
+    public trap_pc: UInt64,
+    public trap_addr: UInt64,
+    /// The pid of the process whose thread owned the lock a wait named.
+    public holder_pid: UInt64,
+    public handles: UInt64,
+    public threads: UInt64,
+    public events: UInt64,
+    public waiters: UInt64,
+    public interrupts: UInt64,
+    public timers: UInt64,
+    public text_len: Int,
+    public text: [UInt8; PANIC_TEXT_BYTES],
 }
 
 /// One of a process's quota rows (spec §2.9), as `Process.quota_get` reads it:
@@ -2024,6 +2084,18 @@ extension Process {
         process_stats_into_frame(self.handle)
     }
 
+    /// How this process ended (spec §8): its death record, read through a
+    /// handle onto it, which is what it is for, since a dead process cannot
+    /// ask. Requires `ProcessRight.Death`, which the handle `process_create`
+    /// answers carries and a sender handle or a lookup's does not.
+    ///
+    /// A process that has not died reads the `Running` status word, its pid
+    /// and nothing else. It allocates nothing and charges no quota, so a
+    /// correct caller meets no failure here.
+    public func death(&self) -> Result<ProcessDeath, SosStatus> {
+        process_death_into_frame(self.handle)
+    }
+
     // -------------------------------------------------------------------------
     // Quota rows (spec §2.7, §2.9)
     // -------------------------------------------------------------------------
@@ -2486,6 +2558,33 @@ func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessSta
                         faults: buf[PROCESS_STATS_FAULTS_SLOT],
                         pid: buf[PROCESS_STATS_PID_SLOT],
                         pinned: buf[PROCESS_STATS_PINNED_SLOT])
+}
+
+/// The `unsafe` half of `Process.death`, confined to one small named helper.
+/// The record buffer's address never leaves it. A cause this build does not
+/// name reads as `SosStatus.Unknown`, the skew `checked` guards against.
+func process_death_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessDeath, SosStatus> {
+    var rec = empty_death_record()
+    try checked(sos_process_death(handle,
+                                  ((&var rec) as UnsafePointer<DeathRecord>)
+                                      as UnsafePointer<UInt64>,
+                                  death_record_bytes() as UInt))
+    guard let cause = DeathCause.from(raw: UInt8.from(truncating: rec.cause)) else {
+        return SosStatus.Unknown
+    }
+    let len = if rec.text_len > (PANIC_TEXT_BYTES as UInt64) {
+        PANIC_TEXT_BYTES
+    } else {
+        rec.text_len as Int
+    }
+    return ProcessDeath(status: UInt.from(truncating: rec.status),
+                        pid: rec.pid, cause: cause, printed: rec.printed != 0,
+                        trap_cause: rec.trap_cause, trap_pc: rec.trap_pc,
+                        trap_addr: rec.trap_addr, holder_pid: rec.holder_pid,
+                        handles: rec.handles, threads: rec.threads,
+                        events: rec.events, waiters: rec.waiters,
+                        interrupts: rec.interrupts, timers: rec.timers,
+                        text_len: len, text: rec.text)
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named

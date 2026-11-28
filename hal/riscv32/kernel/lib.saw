@@ -247,6 +247,24 @@ public func console_byte(b: UInt8) unsafe {
     Uart16550(at: UART_BASE).write_byte(b)
 }
 
+/// Take the console back from a process that claimed it, for a stop of the
+/// machine (`kcore`'s `console_stop`): mask the console's line at the
+/// controller, so the claimant's interrupt stays quiet whatever the stop does
+/// next. Nothing else is put back and no FIFO is reset: the bytes the
+/// claimant stored go out first, and the kernel's writes follow them. Whether
+/// a 16550 driver can leave a register the kernel's write path depends on
+/// (the line control register's divisor latch) set is not settled here.
+public func console_reclaim() unsafe {
+    irq_mask(CONSOLE_IRQ)
+}
+
+// `kcore` ends a console claim and writes what it held back before a stop's
+// lines (`console_stop`). The stops this file makes on its own reach it by
+// symbol, since the HAL sits below `kcore` in the module order.
+extern "C" {
+    func sos_console_stop()
+}
+
 // =============================================================================
 // Stopping the machine
 // =============================================================================
@@ -254,6 +272,7 @@ public func console_byte(b: UInt8) unsafe {
 /// Terminate the emulator with status 0. Never returns; if the write is somehow
 /// ignored, spin rather than fall back into the caller.
 public func exit_pass() unsafe {
+    sos_console_stop()
     SifiveTest(at: TEST_BASE).regs.finisher.write(FINISHER_PASS)
     while true { }
 }
@@ -265,6 +284,7 @@ public func exit_pass() unsafe {
 /// passing one is decided once, for every board. How to stop is this file's:
 /// the SiFive test finisher takes the code in its upper half.
 public func exit_fail(code: UInt) unsafe {
+    sos_console_stop()
     SifiveTest(at: TEST_BASE).regs.finisher.write(
         (FINISHER_FAIL | (abort_status(code) << FAIL_CODE_SHIFT)) as UInt32)
     while true { }
@@ -291,6 +311,7 @@ public func exit_fail(code: UInt) unsafe {
 @export("sos_rt_abort")
 public func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
                      code: UInt32) unsafe -> Never {
+    sos_console_stop()
     rt_write(ptr, len)
     exit_fail(code as UInt)
     while { }

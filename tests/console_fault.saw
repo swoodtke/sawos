@@ -1,0 +1,32 @@
+// A kernel-mode trap under a console claim (spec §9a): the HAL's kernel-fault
+// stop takes the console back.
+//
+// The harness kernel claims the console for a process that does not exist,
+// has one of its own lines held back, and then reads an address it cannot
+// reach, as `trap.saw` does. The fault is a stop, so the kernel's held-back
+// line, one line and no byte, reaches the console before the machine stops:
+// after the fault's own report on the board whose reporter is written in C
+// and must not wait on Saw, before it everywhere else.
+
+import kcore.{console, console_claim, console_line}
+import hal
+
+struct Word { v: UInt32 }
+
+/// A claimant that is not root: no process holds this record.
+static CLAIMANT_RECORD: Int = 1
+static CLAIMANT_PID: UInt64 = 2
+
+@export("kmain")
+func kmain() unsafe {
+    console().write_str("SOS M2: claiming, then faulting\n")
+    console_claim(CLAIMANT_RECORD, CLAIMANT_PID)
+    if console_line() {
+        console().write_str("SOS M2: a line the claim should have held\n")
+    }
+    let bad = UnsafeMemory<Word, Device>(hal.UNMAPPED_PROBE)
+    let x = bad.v.read()
+    // Consume the load so it cannot be optimized away before the fault.
+    console().write_hex(x as UInt)
+    while true { }
+}

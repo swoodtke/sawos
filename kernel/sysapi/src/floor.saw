@@ -265,6 +265,27 @@ public func sos_system_process_by_pid(
                  value_out)
 }
 
+/// Claim the console: the kernel writes nothing to it while the claim stands
+/// but what a stop of the machine writes, and its debug print answers
+/// `SosStatus.Claimed` to everyone, the claimant included (spec §9a). Requires
+/// `SystemRight.Console`.
+///
+/// A claim another process holds is `SosStatus.Claimed`. A caller that holds
+/// the claim already terminates with a `BadState` fault. The claim is this
+/// process's, and ends at its release or at the process's death.
+@export("sos_system_console_claim")
+public func sos_system_console_claim(handle: UInt) -> UInt {
+    sos_syscall1(handle, SystemOp.ConsoleClaim as UInt, 0)
+}
+
+/// Give the console back, writing the kernel's line about what it held back
+/// while the claim stood. Requires no right. A caller that does not hold the
+/// claim terminates with a `BadState` fault.
+@export("sos_system_console_release")
+public func sos_system_console_release(handle: UInt) -> UInt {
+    sos_syscall1(handle, SystemOp.ConsoleRelease as UInt, 0)
+}
+
 /// Give the kernel a Pool or a Memory region to back the slab `kind` names.
 /// Requires `SystemRight.SlabDonate`.
 ///
@@ -655,6 +676,21 @@ public func sos_process_stats(handle: UInt, buf: UnsafePointer<UInt64>,
                               cap: UInt) unsafe -> UInt {
     var ignored: UInt = 0
     sos_syscall3(handle, ProcessOp.Stats as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// This process's death record (spec §8), `death_record_bytes()` of it, into
+/// `buf`, which holds `cap` bytes. Requires `ProcessRight.Death`.
+///
+/// The record is `sosabi`'s `DeathRecord` layout, doublewords then the panic
+/// text. A process that has not died reads the `Running` status word, its pid
+/// and zeros. A `cap` below the record's size, or a buffer outside this
+/// process's writable memory, terminates the caller.
+@export("sos_process_death")
+public func sos_process_death(handle: UInt, buf: UnsafePointer<UInt64>,
+                              cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.Death as UInt, buf as UInt, cap, 0,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
@@ -1273,6 +1309,15 @@ public func sos_pipe_inlet_call(handle: UInt, args: UnsafePointer<UInt>,
                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, PipeInletOp.Call as UInt, args as UInt, args_bytes,
                  reply as UInt, value_out)
+}
+
+/// How many messages this connection's server has taken, through
+/// `value_out`. Requires `PipeInletRight.Post`. The count wraps: compare two
+/// readings for equality only.
+@export("sos_pipe_inlet_taken")
+public func sos_pipe_inlet_taken(handle: UInt,
+                                 value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PipeInletOp.Taken as UInt, 0, 0, 0, value_out)
 }
 
 /// Reply-wait: discharge this obligation, then park on a Waiter, in one trap.

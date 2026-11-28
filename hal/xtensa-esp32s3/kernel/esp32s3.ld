@@ -86,10 +86,15 @@ ENTRY(_entry)
 /* `sosrt`'s heap arena (hal/riscv32/kernel/virt.ld describes it in
  * full). Nothing in the kernel reaches the allocator at run time
  * (hal/riscv32-esp32c3/kernel/esp32c3.ld says why); the link still needs the
- * arena, whose bounds the allocator seams `sosrt` exports read. The boot
- * stack is the other boards' size. */
+ * arena, whose bounds the allocator seams `sosrt` exports read.
+ *
+ * The boot stack is the kernel's one stack, and smaller than the other
+ * boards' because DRAM is short here. Its size is checked, not assumed: the
+ * smoke's `stack_peak_*` cases paint it, run the heaviest kernel paths, and
+ * print the deepest use against the size (`kcore.stackdepth`), and a peak
+ * that reaches the far end stops the machine with a kernel-bug report. */
 PROVIDE(ARENA_SIZE = 16K);
-KERNEL_STACK_SIZE = 64K;
+KERNEL_STACK_SIZE = 16K;
 
 /* Whether `sos_sim_exit` executes `simcall`. The emulator answers it under
  * `-semihosting`; on a board no debugger does, so a board image is linked

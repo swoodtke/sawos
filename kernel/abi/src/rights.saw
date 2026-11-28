@@ -163,6 +163,12 @@
 /// line itself and gives the Interrupt to the driver that services it, so the
 /// driver holds the lines it was given and no authority to bind another. It is
 /// in the root set and absent from the ordinary child mask.
+///
+/// `Console` gates `SystemOp.ConsoleClaim`: taking the console from the
+/// kernel, so that the kernel writes nothing to it while the claim stands. It
+/// is in the root set, and a stock image gives it to the image's console
+/// process alone. `ConsoleRelease` is not gated: giving the console back is
+/// never authority.
 public enum SystemRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -176,6 +182,7 @@ public enum SystemRight: UInt32 {
     case StatsRegionMap = 1 << 15,
     case InterruptBind = 1 << 16,
     case ProcessObserve = 1 << 17,
+    case Console = 1 << 18,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -208,6 +215,8 @@ static_assert((SystemRight.InterruptBind as UInt32) >= (1 << 8),
               "kind-specific right InterruptBind must start at bit 8 or above")
 static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
               "kind-specific right ProcessObserve must start at bit 8 or above")
+static_assert((SystemRight.Console as UInt32) >= (1 << 8),
+              "kind-specific right Console must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row).
 ///
@@ -295,7 +304,8 @@ static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
 /// riding `Wait`, the other observation bit. The pid is why the observe set
 /// (`Wait | Stats`) carries it: a handle that may observe a process may match
 /// it against a server's table by pid. `Wait` answers §8's status word, a fact
-/// about whether the process is alive; `Stats` answers how many traps it has
+/// about whether the process is alive, and nothing more: how it died is
+/// `Death`'s (below). `Stats` answers how many traps it has
 /// taken, a fact about what it has been doing. A supervisor that may learn a
 /// child died need not be able to watch it work, and the separation costs one
 /// bit. It joins the one default set below because self-inspection has to
@@ -329,6 +339,16 @@ static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
 /// between its create and its start (spec §7). It is in the default set for
 /// `QuotaSet`'s reason and is never in the observe set; on a started process
 /// it sets nothing.
+///
+/// `Death` gates `ProcessOp.Death`, the read of the process's death record
+/// (spec §8): how it ended beyond the status word, its panic text, a trap's
+/// registers and whether the kernel printed the death's lines. It is its own
+/// bit and not `Wait`'s because the record says more than whether a process
+/// is alive: a panic's text is the process's own words. It is in the one
+/// default set, so a launcher's handle onto its child carries it and a
+/// supervisor that launched a process reports its end; it is never in the
+/// observe set, so a server's sender handle and a walk's or a lookup's handle
+/// learn that a process died, and not how.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -348,6 +368,7 @@ public enum ProcessRight: UInt32 {
     case RestrictRights = 1 << 21,
     case QuotaSet = 1 << 22,
     case BandMap = 1 << 23,
+    case Death = 1 << 24,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -386,6 +407,8 @@ static_assert((ProcessRight.QuotaSet as UInt32) >= (1 << 8),
               "kind-specific right QuotaSet must start at bit 8 or above")
 static_assert((ProcessRight.BandMap as UInt32) >= (1 << 8),
               "kind-specific right BandMap must start at bit 8 or above")
+static_assert((ProcessRight.Death as UInt32) >= (1 << 8),
+              "kind-specific right Death must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row).
 ///
@@ -1090,6 +1113,10 @@ public func root_system_rights() -> UInt32 {
      // an observer. The convention mask a launcher builds a child's System
      // sibling with leaves it out.
      | (SystemRight.ProcessObserve as UInt32)
+     // `Console` is here on `InterruptBind`'s terms: root is the launcher
+     // that decides which process writes the console, and a deployment gives
+     // the bit to that process alone.
+     | (SystemRight.Console as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 
@@ -1104,8 +1131,8 @@ public func root_system_rights() -> UInt32 {
 /// What is in it, all named for the op it gates: `ThreadCreate`, `ThreadSelf`,
 /// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `Start`,
 /// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights`,
-/// `Kill`, `QuotaSet` and `BandMap`, plus the two universal bits `Transfer`
-/// and `Mint`.
+/// `Kill`, `QuotaSet`, `BandMap` and `Death`, plus the two universal bits
+/// `Transfer` and `Mint`.
 ///
 /// Some bits read oddly on root's own handle and are harmless there, which is
 /// the price of one list. `Start` on a process that is already `Running` is the
@@ -1134,6 +1161,7 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.Kill as UInt32)
      | (ProcessRight.QuotaSet as UInt32)
      | (ProcessRight.BandMap as UInt32)
+     | (ProcessRight.Death as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 

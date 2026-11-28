@@ -335,6 +335,24 @@ public static PANIC_TEXT_BYTES: Int = 256
 /// ceiling, in the value register; neither takes a keep mask. The walk ends in
 /// `Drained` and a pid the record table does not hold is `Revoked`. The kernel
 /// keeps no walk state: the cursor is the caller's.
+///
+/// `ConsoleClaim` and `ConsoleRelease` hand the console between the kernel and
+/// one process (spec §9a). Neither takes an argument and each answers a status
+/// alone. A claim says the calling process writes the console and the kernel
+/// does not: it names no device and no window, only the claimant, by its
+/// record and its pid, so a reused record is never taken for the claimant. It
+/// belongs to the claimant process and ends at its release or at its
+/// teardown, whatever ended it; a panic and every stop of the machine take the
+/// console back over it. It is console-specific and interim: claiming devices
+/// in general belongs to a device object, a separate design not built.
+///
+/// `ConsoleClaim` is gated by `SystemRight.Console`. A caller that already
+/// holds the claim is a `BadState` fault; a claim another process holds
+/// answers `SosStatus.Claimed`, a status because the caller could not have
+/// known. `ConsoleRelease` needs no right, because giving the console back is
+/// never authority: a caller that does not hold the claim is a `BadState`
+/// fault, so a claimant can always end its claim through whatever System
+/// handle it holds.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
@@ -347,6 +365,8 @@ public enum SystemOp: UInt {
     case InterruptBind = 8,
     case ProcessNext = 9,
     case ProcessByPid = 10,
+    case ConsoleClaim = 11,
+    case ConsoleRelease = 12,
 }
 
 // =============================================================================
@@ -492,6 +512,18 @@ public enum SystemOp: UInt {
 /// `BadAlign` fault; a pair that does not lie in one writable row the
 /// process's image was placed with is a `BadArg` fault; and a second
 /// registration is a `BadState` fault. It answers a status alone.
+///
+/// `Death(buf, cap)` answers the named process's death record (spec §8), a
+/// `DeathRecord` copied out as `Stats`' columns are: how it ended, the
+/// teardown's counts, a trap's registers, a panic's text, and whether the
+/// kernel printed the death's lines itself. It is gated by
+/// `ProcessRight.Death`, which a launcher's handle onto its child carries and
+/// the observe set does not: a sender handle, a walk's and a lookup's learn
+/// that a process died, through `Wait`, and not how. It reads a `Gone`
+/// process, which is what
+/// it is for; a live one reads `Running` and no death. A capacity below
+/// `death_record_bytes()` is a `BadArg` fault, and a buffer the copy door
+/// refuses ends the caller, as for every record.
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -511,6 +543,7 @@ public enum ProcessOp: UInt {
     case QuotaGet = 15,
     case BandMap = 16,
     case SectionWord = 17,
+    case Death = 18,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -1068,6 +1101,13 @@ public enum PipeInletOp: UInt {
     /// `pipe_msg_record_bytes()` through the copy door and against the caller's
     /// real memory, a stronger test than a number the caller typed.
     case Call = 1,
+    /// How many messages the connection's server has taken, as the value: a
+    /// count the kernel adds one to each time a staged message is handed over,
+    /// by a `Take` or by a delivery under a consuming attach. It wraps, so a
+    /// reader compares two readings for equality only. It is gated by
+    /// `PipeInletRight.Post`: a poster may learn how far the server has taken.
+    /// It takes no argument.
+    case Taken = 2,
 }
 
 /// A method id on a PipeOutlet, the server end.

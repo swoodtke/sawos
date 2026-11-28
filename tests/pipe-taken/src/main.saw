@@ -1,0 +1,107 @@
+// `PipeInletOp.Taken` (spec §2.1): a connection's count of the messages its
+// server has taken, read through the client end.
+//
+//   SOS pipetaken: a new connection: 0
+//   SOS pipetaken: a message staged: 0          posting takes nothing
+//   SOS pipetaken: taken: 1                     a `take`
+//   SOS pipetaken: delivered: 2                 a consuming attach's delivery
+//   SOS pipetaken: through an inlet without Post: status=131075
+//                                               `child-ends` reads the count
+//                                               through a sibling of its own
+//                                               inlet minted without the
+//                                               right: `AccessDenied`
+//   SOS pipetaken: done
+
+import sos.{System, Process, SosStatus, SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static ROLE_TAKEN_DENIED: UInt = 13
+
+static KEY_SERVER: UInt = 2
+static KEY_DEATH: UInt = 6
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pipetaken: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS pipetaken: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS pipetaken: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let (inlet, outlet) = try proc.pipe_create()
+    print("SOS pipetaken: a new connection: {}", try inlet.taken())
+
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let first = try inlet.post(&body, 1)
+    print("SOS pipetaken: a message staged: {}", try inlet.taken())
+
+    let (msg, request) = try outlet.take()
+    let _ = move msg
+    let _ = move request
+    let _ = move first
+    print("SOS pipetaken: taken: {}", try inlet.taken())
+
+    // Under a consuming attach the delivery is the take.
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_SERVER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let second = try inlet.post(&body, 1)
+    let wake = try waiter.wait()
+    if wake.key != KEY_SERVER {
+        return BUG
+    }
+    let _ = move wake
+    let _ = move second
+    print("SOS pipetaken: delivered: {}", try inlet.taken())
+
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &img, memory: &ram)
+    let told = try proc.event_create()
+    try told.signal(bits: ROLE_TAKEN_DENIED)
+    try child.give(event: move told, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let watch = try proc.waiter_create()
+    try watch.add(process: &child, key: KEY_DEATH)
+    let ended = try watch.wait()
+    let _ = move ended
+    print("SOS pipetaken: through an inlet without Post: status={}",
+          try child.get_status())
+    return
+}

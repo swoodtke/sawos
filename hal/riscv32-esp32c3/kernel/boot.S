@@ -105,6 +105,9 @@ hang:
     .section .text.fault, "ax", @progbits
     .globl kernel_fault
 kernel_fault:
+    /* A stop: end a console claim first (`kcore`'s `sos_console_stop`, spec
+     * §9a), which with no claim returns at once. */
+    call    sos_console_stop
     li      t0, UART0_FIFO
     la      t3, .Lfault_msg
 5:

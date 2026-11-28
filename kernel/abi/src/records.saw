@@ -11,7 +11,8 @@
 // `PIPE_MSG_HANDLES` and `PipeMsgMeta` are the pipe body's dimensions and its
 // packed meta, and they are declared in `ops`. The dependency is one-way:
 // nothing in `ops` names a record, so the leaf graph stays acyclic.
-import sosabi.ops.{PIPE_BODY_BYTES, PIPE_MSG_HANDLES, PipeMsgMeta}
+import sosabi.ops.{PANIC_TEXT_BYTES, PIPE_BODY_BYTES, PIPE_MSG_HANDLES,
+                   PipeMsgMeta}
 
 // =============================================================================
 // The wait record (spec §2.2)
@@ -839,4 +840,89 @@ public static STATS_REGION_MAP_ROW_WORD: Int = 0
 /// must give the op, and what the kernel checks the buffer against.
 public func stats_region_map_record_bytes() -> Int {
     STATS_REGION_MAP_RECORD_WORDS * sizeof<UInt>()
+}
+
+// =============================================================================
+// The death record (spec §8)
+// =============================================================================
+//
+// `Process.Death` answers how a process ended, beyond the status word. The
+// kernel writes the record where it decides each line about the death, at
+// every death, whether or not the console is claimed, and keeps it in the
+// process record, which outlives the body for as long as a handle names it.
+// `printed` says which way the console went: 1 when the kernel wrote the
+// death's lines itself, 0 when a console claim held them back and the record
+// is the only place they are.
+//
+// Every field is `UInt64`, on `StatsRow`'s terms: one layout on every
+// profile.
+
+/// How a process ended, as `DeathRecord.cause` reads it.
+///
+/// `Fault` is a syscall fault or a delivery's, and the status word's code is
+/// the `FaultReason`. `Trap` is a hardware fault: its code is 0, and the
+/// record keeps the HAL's cause word, the pc and the address. `Panic` is the
+/// panic op, and the record keeps the text. `LockOwner` is a lock wait whose
+/// owner is a thread of another process: the record keeps that process's pid,
+/// and the status word reads the `BadArg` fault the wait ended in.
+public enum DeathCause: UInt8 {
+    case Exited = 0,
+    case Killed = 1,
+    case Fault = 2,
+    case Trap = 3,
+    case Panic = 4,
+    case LockOwner = 5,
+}
+
+/// A `Process.Death` answer, and the kernel's copy of it.
+///
+/// `status` and `pid` are the §8 status word and the pid, filled in as the
+/// record is answered; the kernel's copy holds the rest. A process that has
+/// not died reads the `Running` word, its pid, and nothing else. The
+/// teardown's counts are the ones its line prints, at every end. `text` is
+/// the panic's text as the line prints it, `text_len` bytes of it: printable
+/// ASCII, every other byte `?`, at most `PANIC_TEXT_BYTES`.
+public struct DeathRecord {
+    public status: UInt64,
+    public pid: UInt64,
+    /// A `DeathCause`'s number.
+    public cause: UInt64,
+    public printed: UInt64,
+    public trap_cause: UInt64,
+    public trap_pc: UInt64,
+    public trap_addr: UInt64,
+    public holder_pid: UInt64,
+    public handles: UInt64,
+    public threads: UInt64,
+    public events: UInt64,
+    public waiters: UInt64,
+    public interrupts: UInt64,
+    public timers: UInt64,
+    public text_len: UInt64,
+    public reserved: UInt64,
+    public text: [UInt8; PANIC_TEXT_BYTES],
+}
+
+/// Doublewords in a `Process.Death` record: sixteen fields, then the text.
+public static DEATH_RECORD_DOUBLEWORDS: Int = 16 + PANIC_TEXT_BYTES / 8
+
+static_assert(PANIC_TEXT_BYTES % 8 == 0,
+              "the death record's text is whole doublewords")
+static_assert(sizeof<DeathRecord>()
+              == DEATH_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "a death record must be exactly the doublewords sosabi publishes")
+
+/// Bytes in a `Process.Death` record: the minimum capacity a caller must give
+/// the op. A function for `process_stats_record_bytes`' reason.
+public func death_record_bytes() -> Int {
+    DEATH_RECORD_DOUBLEWORDS * sizeof<UInt64>()
+}
+
+/// A record with nothing in it: what the kernel keeps for a process until it
+/// dies.
+public func empty_death_record() -> DeathRecord {
+    DeathRecord(status: 0, pid: 0, cause: 0, printed: 0, trap_cause: 0,
+                trap_pc: 0, trap_addr: 0, holder_pid: 0, handles: 0,
+                threads: 0, events: 0, waiters: 0, interrupts: 0, timers: 0,
+                text_len: 0, reserved: 0, text: [0; PANIC_TEXT_BYTES])
 }

@@ -1,0 +1,291 @@
+// `ProcessOp.Death` (spec §8): root launches `child-ends` once per role, one
+// at a time, waits for each to end, and prints its death record beside the
+// kernel's own lines. No console claim stands, so every record reads
+// `printed=1`.
+//
+//   SOS deathrec: exit: ...            an exit: the code in the status word
+//   SOS deathrec: running: status=0    a live process's record reads Running
+//   SOS deathrec: killed: ...          a kill: the code in the status word
+//   SOS deathrec: fault: ...           a syscall fault: the reason
+//   SOS deathrec: trap: ...            a hardware fault: the pc it trapped
+//                                      at is the address it called into, and
+//                                      the three words read as the kernel's
+//                                      trap line prints them
+//   SOS deathrec: panic: ...           the panic op on 300 bytes: the text
+//                                      cut at 256, as the kernel's line has it
+//   SOS deathrec: lock: ...            a lock wait naming root's thread: the
+//                                      holder's pid is root's
+//   SOS deathrec: denied: ...          the op through the observe set, `Wait`
+//                                      and `Stats`: `AccessDenied`
+//   SOS deathrec: short: ...           the op into a short buffer: `BadArg`
+//   SOS deathrec: sender: ...          the op through a server's sender
+//                                      handle onto root: `AccessDenied`
+//   SOS deathrec: lookup: ...          the op through `ProcessByPid`'s handle
+//                                      onto root: `AccessDenied`
+//
+// Every record root reads is through the handle `ProcessCreate` answered it,
+// which carries `ProcessRight.Death`.
+//   SOS deathrec: done
+//
+// Each record line prints the cause, the status word, the pid, whether the
+// kernel printed the death, the lock holder's pid and the text's length, then
+// the teardown's counts, which the case holds to the kernel's teardown line
+// beside it. A record is reused once its last name is gone, and the panic's
+// is the lock wait's next, so the lock wait's `text_len=0` says a create
+// emptied it.
+
+import sos.{System, Process, Memory, Event, SosStatus, SystemRight,
+            DeathCause, ProcessDeath, PANIC_TEXT_BYTES, PIPE_BODY_BYTES,
+            sos_thread_id}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_ARG: UInt = 41
+static TAG_OUTLET: UInt = 42
+
+static ROLE_EXIT: UInt = 1
+static ROLE_PARK: UInt = 2
+static ROLE_FAULT: UInt = 3
+static ROLE_TRAP: UInt = 4
+static ROLE_PANIC: UInt = 5
+static ROLE_LOCK: UInt = 6
+static ROLE_DEATH_DENIED: UInt = 11
+static ROLE_DEATH_SHORT: UInt = 12
+static ROLE_SENDER_DEATH: UInt = 16
+static ROLE_LOOKUP_DEATH: UInt = 17
+
+static KEY_DEATH: UInt = 6
+
+/// The code root kills with.
+static KILL_CODE: UInt = 0x2B
+
+/// What every child may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+static OBSERVER_SYSTEM: UInt32 = CHILD_SYSTEM | SystemRight.ProcessObserve
+
+/// The panic text's alphabet: the byte at `i` is `'a' + i % 26`.
+static ASCII_LOWER_A: Int = 0x61
+static ALPHABET: Int = 26
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS deathrec: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS deathrec: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS deathrec: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let exited = try make(&system, &proc, &img, &ram, ROLE_EXIT)
+    try exited.start(boot_tag: TAG_BOOT)
+    try show(&proc, "exit", &exited)
+
+    let parked = try make(&system, &proc, &img, &ram, ROLE_PARK)
+    try parked.start(boot_tag: TAG_BOOT)
+    try yield_to(&proc)
+    let live = try parked.death()
+    print("SOS deathrec: running: status={} pid={} cause={} printed={}",
+          live.status, live.pid, cause_name(live.cause), flag(live.printed))
+    try parked.kill(code: KILL_CODE)
+    try show(&proc, "killed", &parked)
+
+    let faulted = try make(&system, &proc, &img, &ram, ROLE_FAULT)
+    try faulted.start(boot_tag: TAG_BOOT)
+    try show(&proc, "fault", &faulted)
+
+    try trap(&system, &proc, &img, &ram)
+    try panicked(&system, &proc, &img, &ram)
+
+    // The lock's owner word is root's own thread.
+    let locked = try make(&system, &proc, &img, &ram, ROLE_LOCK)
+    let owner = try proc.event_create()
+    try owner.signal(bits: sos_thread_id())
+    try locked.give(event: move owner, tag: TAG_ARG) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try locked.start(boot_tag: TAG_BOOT)
+    try show(&proc, "lock", &locked)
+
+    let denied = try make(&system, &proc, &img, &ram, ROLE_DEATH_DENIED)
+    try denied.start(boot_tag: TAG_BOOT)
+    try show(&proc, "denied", &denied)
+
+    let short = try make(&system, &proc, &img, &ram, ROLE_DEATH_SHORT)
+    try short.start(boot_tag: TAG_BOOT)
+    try show(&proc, "short", &short)
+
+    // A server's sender handle onto root carries the observe set.
+    let server = try make(&system, &proc, &img, &ram, ROLE_SENDER_DEATH)
+    let (inlet, outlet) = try proc.pipe_create()
+    try server.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try inlet.post(&body, 1)
+    try server.start(boot_tag: TAG_BOOT)
+    try show(&proc, "sender", &server)
+    let _ = move claim
+
+    let looker = try make_with(&system, &proc, &img, &ram, ROLE_LOOKUP_DEATH,
+                               OBSERVER_SYSTEM)
+    try looker.start(boot_tag: TAG_BOOT)
+    try show(&proc, "lookup", &looker)
+    return
+}
+
+/// A child that signals the address it calls into, and traps there.
+func trap(system: &System, proc: &Process, img: &Memory,
+          ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try make(&system, &proc, &img, &ram, ROLE_TRAP)
+    let told = try proc.event_create()
+    let theirs = try told.mint()
+    try child.give(event: move theirs, tag: TAG_ARG) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let death = try show(&proc, "trap", &child)
+    let called = try told.receive()
+    let same = if death.trap_pc == (called as UInt64) { "yes" } else { "no" }
+    print("SOS deathrec: trap: the pc is the address it called: {}", same)
+    // The three words in the kernel's own form, so the case holds them to
+    // the kernel's trap line.
+    print("SOS deathrec: trap: cause={} pc={} addr={}", hex(death.trap_cause),
+          hex(death.trap_pc), hex(death.trap_addr))
+    return
+}
+
+/// `v` as the kernel's console writes a machine word: `0x` and one hex digit
+/// per nibble of the word, lowercase.
+func hex(v: UInt64) -> String {
+    let digits = sizeof<UInt>() * 2
+    var out = StringBuilder()
+    try! out.append("0x")
+    var n = digits - 1
+    while n >= 0 {
+        let d = ((v >> ((n * 4) as UInt64)) & 0xF) as Int
+        let c = if d < 10 { 0x30 + d } else { 0x57 + d }
+        try! out.append(Byte(c as UInt8))
+        n = n - 1
+    }
+    out.build()
+}
+
+/// A child that panics on 300 bytes: the record keeps the first 256, as the
+/// kernel's line prints them.
+func panicked(system: &System, proc: &Process, img: &Memory,
+              ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try make(&system, &proc, &img, &ram, ROLE_PANIC)
+    try child.start(boot_tag: TAG_BOOT)
+    let death = try show(&proc, "panic", &child)
+    var alphabet = death.text_len == PANIC_TEXT_BYTES
+    var i = 0
+    while i < death.text_len {
+        if death.text[i] != (ASCII_LOWER_A + i % ALPHABET) as UInt8 {
+            alphabet = false
+        }
+        i = i + 1
+    }
+    print("SOS deathrec: panic: text_len={}, the alphabet cut at the bound: {}",
+          death.text_len, if alphabet { "yes" } else { "no" })
+    return
+}
+
+// -----------------------------------------------------------------------------
+// Parts
+// -----------------------------------------------------------------------------
+
+/// A `child-ends` process from `img` and `ram`, told its role and given its
+/// System handle under its boot tag. It is not started.
+func make(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+          role: UInt) -> Result<Process, SosStatus> {
+    make_with(&system, &proc, &img, &ram, role, CHILD_SYSTEM)
+}
+
+/// `make`, with a System handle carrying `rights`.
+func make_with(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               role: UInt, rights: UInt32) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let told = try proc.event_create()
+    try told.signal(bits: role)
+    try child.give(event: move told, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return move child
+}
+
+/// Wait for `child` to end, then print its death record under `name`, and
+/// answer it.
+func show(proc: &Process, name: String,
+          child: &Process) -> Result<ProcessDeath, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let _ = move wake
+    let d = try child.death()
+    print("SOS deathrec: {}: status={} pid={} cause={} printed={} holder_pid={} text_len={}",
+          name, d.status, d.pid, cause_name(d.cause), flag(d.printed),
+          d.holder_pid, d.text_len)
+    print("SOS deathrec: {}: handles={} threads={} events={} waiters={} interrupts={} timers={}",
+          name, d.handles, d.threads, d.events, d.waiters, d.interrupts,
+          d.timers)
+    return d
+}
+
+/// Let every other process that can run, run until it parks: nothing ticks
+/// in this case.
+func yield_to(proc: &Process) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+func cause_name(cause: DeathCause) -> String {
+    match cause {
+        case Exited -> "Exited",
+        case Killed -> "Killed",
+        case Fault -> "Fault",
+        case Trap -> "Trap",
+        case Panic -> "Panic",
+        case LockOwner -> "LockOwner",
+    }
+}
+
+func flag(b: Bool) -> Int {
+    if b { 1 } else { 0 }
+}

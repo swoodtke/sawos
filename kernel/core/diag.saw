@@ -4,7 +4,8 @@
 //! machine word as fixed-width hex) plus the reports that stop the machine:
 //! `fatal` for a trap the kernel cannot survive, `fatal_kernel` for a broken
 //! kernel invariant, `fatal_image` for a root image it refuses to boot and
-//! `fatal_deadlock` for a system that can make no more progress.
+//! `fatal_deadlock` for a system that can make no more progress. And the
+//! console claim, which every report consults before it writes.
 //!
 //! It calls nothing in the kernel, which is what lets every other seam report.
 //! The reports that tear a process down are not here: they own kernel state and
@@ -38,6 +39,10 @@ import sosrt.{AbortCode, ascii_byte, hex_digit_of, hex_digits_per_word}
 ///      teardown, a panic, or an interrupt on a line nothing is bound to. The
 ///      interleaving those may cause is acceptable because there is no longer a
 ///      transcript to protect.
+///
+/// A process that drives the device itself goes further and claims the
+/// console (see "The console claim" below): while the claim stands the third
+/// phase is suspended, and only a stop of the machine writes.
 ///
 /// What the kernel writes on demand does not violate this: a
 /// `SystemOp.DebugPrint` is the process asking the kernel to place a byte, and
@@ -105,6 +110,133 @@ public func console() -> Console {
     Console(sink: 0)
 }
 
+// =============================================================================
+// The console claim (spec §9a)
+// =============================================================================
+//
+// A process that drives the console's device itself claims the console
+// (`SystemOp.ConsoleClaim`), and while the claim stands the kernel writes
+// nothing to it but what a stop writes. Each line the kernel would have
+// written about another process is held back and counted, and the debug print
+// is refused and counted; when the console comes back, at a release or at the
+// claimant's death, one line says what was held, so a line nobody printed is
+// never lost without a trace. A line about the claimant itself comes from its
+// fault or its end, so the claim is ended first and the line is written.
+//
+// The claim is decided per line, at the line's first byte, and every line is
+// written inside one kernel entry with no preemption point, as are the claim,
+// the release and the teardown that ends a claim. So no line is ever half on
+// each side of a claim.
+//
+// It is state the kernel keeps at the bottom of its module order so that every
+// report can consult it, and the HAL's own stops reach it through
+// `sos_console_stop`. It names the claimant by its record and its pid, which
+// the callers pass: this module reads no kernel table.
+
+/// Who holds the console, and what the kernel held back while they did.
+struct ConsoleClaim {
+    /// The claimant's record, plus one; 0 is no claim.
+    holder: Int,
+    /// The claimant's pid, so that a reused record is never taken for it.
+    pid: UInt64,
+    /// The lines the kernel did not write while the claim stood.
+    lines_held: UInt,
+    /// The debug-print bytes refused while the claim stood.
+    bytes_refused: UInt,
+}
+
+unsafe static var CONSOLE_CLAIM: ConsoleClaim = ConsoleClaim(
+    holder: 0, pid: 0, lines_held: 0, bytes_refused: 0)
+
+/// Whether a process holds the console.
+public func console_claimed() unsafe -> Bool {
+    CONSOLE_CLAIM.holder != 0
+}
+
+/// Whether process `p`, whose pid is `pid`, holds the console.
+public func console_held_by(p: Int, pid: UInt64) unsafe -> Bool {
+    CONSOLE_CLAIM.holder == p + 1 && CONSOLE_CLAIM.pid == pid
+}
+
+/// Give the console to process `p`, whose pid is `pid`. The caller has found
+/// it unclaimed.
+public func console_claim(p: Int, pid: UInt64) unsafe {
+    CONSOLE_CLAIM.holder = p + 1
+    CONSOLE_CLAIM.pid = pid
+}
+
+/// End the claim and take the console back, writing the held-back line when
+/// anything was held.
+///
+/// The claim is cleared before anything is written, so a stop reached from
+/// inside the write finds the console already back and writes as it would.
+public func console_return() unsafe {
+    let held = CONSOLE_CLAIM.lines_held
+    let refused = CONSOLE_CLAIM.bytes_refused
+    CONSOLE_CLAIM = ConsoleClaim(holder: 0, pid: 0, lines_held: 0,
+                                 bytes_refused: 0)
+    write_returned(held, refused)
+}
+
+/// The held-back line, when anything was held.
+func write_returned(held: UInt, refused: UInt) {
+    if held == 0 && refused == 0 {
+        return
+    }
+    let uart = console()
+    uart.write_str("SOS: console returned, lines held=")
+    uart.write_hex(held)
+    uart.write_str(", debug bytes refused=")
+    uart.write_hex(refused)
+    uart.write_str("\n")
+}
+
+/// Take the console back for a stop of the machine: a panic, a fault the
+/// kernel cannot survive, root's end, or one of the HAL's own stops. With no
+/// claim it does nothing.
+///
+/// The claim is ended over the claimant's head, the console's line is masked
+/// at the controller (`hal.console_reclaim`), so the claimant's interrupt
+/// stays quiet whatever the stop does next, and the held-back line is
+/// written. No FIFO is reset: the bytes the claimant stored are the run's last
+/// output and go out first, and the stop's lines follow them.
+///
+/// The HAL's stops reach it by symbol, from below the module order. The claim
+/// is cleared first, so a stop reached from inside this one finds no claim.
+@export("sos_console_stop")
+public func console_stop() unsafe {
+    if CONSOLE_CLAIM.holder == 0 {
+        return
+    }
+    let held = CONSOLE_CLAIM.lines_held
+    let refused = CONSOLE_CLAIM.bytes_refused
+    CONSOLE_CLAIM = ConsoleClaim(holder: 0, pid: 0, lines_held: 0,
+                                 bytes_refused: 0)
+    hal.console_reclaim()
+    write_returned(held, refused)
+}
+
+/// Whether the kernel may write a line now: true with no claim; false while
+/// one stands, counting the line as held back. A line about the claimant
+/// itself, or a stop's, ends the claim before it asks.
+public func console_line() unsafe -> Bool {
+    if CONSOLE_CLAIM.holder == 0 {
+        return true
+    }
+    CONSOLE_CLAIM.lines_held = CONSOLE_CLAIM.lines_held &+ 1
+    false
+}
+
+/// Whether the debug print must refuse its byte, counting it when it does: a
+/// claim refuses every caller's, the claimant's included.
+public func console_refuses_byte() unsafe -> Bool {
+    if CONSOLE_CLAIM.holder == 0 {
+        return false
+    }
+    CONSOLE_CLAIM.bytes_refused = CONSOLE_CLAIM.bytes_refused &+ 1
+    true
+}
+
 /// Exit codes the kernel reports through the platform's failure channel,
 /// distinct from any status root chooses for itself.
 ///
@@ -148,6 +280,7 @@ static_assert((ExitCode.Panic as UInt) == ((AbortCode.Panic as UInt32) as UInt),
 /// Report a fatal condition on the console and fail the run. Never returns: a
 /// fault is diagnosed and the machine stops non-zero, never a hang.
 public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCode) {
+    console_stop()
     let uart = console()
     uart.write_str("SOS: fault ")
     uart.write_str(tag)
@@ -174,6 +307,7 @@ public func fatal(tag: String, cause: UInt, epc: UInt, tval: UInt, code: ExitCod
 /// left (`install_quota_limits` is what makes it unreachable), and a
 /// `free_object` reaching a kind that has no slab to free into.
 public func fatal_kernel(reason: String, detail: UInt) {
+    console_stop()
     let uart = console()
     uart.write_str("SOS: kernel bug: ")
     uart.write_str(reason)
@@ -190,6 +324,7 @@ public func fatal_kernel(reason: String, detail: UInt) {
 /// kernel attempts no recovery: nothing is ended and nothing is torn down. The
 /// exit code is its own, so a harness tells this stop from a process fault.
 public func fatal_deadlock() {
+    console_stop()
     let uart = console()
     uart.write_str("SOS: deadlock: every thread is blocked and nothing can ")
     uart.write_str("wake one\n")
@@ -198,6 +333,7 @@ public func fatal_deadlock() {
 
 /// Reject the root image. Never returns.
 public func fatal_image(reason: String, detail: UInt) {
+    console_stop()
     let uart = console()
     uart.write_str("SOS: bad root image: ")
     uart.write_str(reason)

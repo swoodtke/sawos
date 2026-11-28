@@ -41,7 +41,8 @@ own restore path.
 | `arch_name() -> String` | What the boot banner says this kernel is running on. |
 | `arch_tag() -> UInt8` | This profile's `sosimg` arch tag, read out of `imgformat`'s registry rather than spelled again. An image carrying another one is refused by the loader, not jumped into. |
 | `console_byte(b)` | Put one byte on the kernel's console. Byte-at-a-time on purpose: the arch-free half formats, this half places. |
-| `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. |
+| `console_reclaim()` | Take the console back from a process that claimed it, for a stop (spec §9a): mask the console's line at the controller. Nothing else is put back and no FIFO is reset. |
+| `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. Each first ends a console claim through `sos_console_stop` (below). |
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
 | `region_table_start()` / `region_table_end()` | Bounds of the build-emitted boot region table. Equal when there is none, which is zero regions and the ordinary state of an image that appends no child images. |
 | `kernel_slabs_start()` / `kernel_slabs_end()` | Bounds of the kernel's slab region, the `.bss.sos_slab*` input sections the board script gathers between `_sos_slabs_start` and `_sos_slabs_end`, with no other static of the kernel's among them: where an image's slab areas must lie (spec §12). |
@@ -179,6 +180,11 @@ register writers above) are Saw in `lib.saw`.
   which is what knows whether the saved PC needs advancing. It returns the
   frame to resume: the same one for an ordinary return, another thread's for a
   switch. The trap entry does not know which happened and must not care.
+- `sos_console_stop()` — `kcore`'s end of a console claim for a stop (spec
+  §9a): with a claim standing it calls `console_reclaim` and writes what the
+  kernel held back; with none it does nothing. `exit_pass`, `exit_fail`,
+  `sos_rt_abort` and `boot.S`'s `kernel_fault` call it before they write or
+  stop.
 
 ## Which altitude is supported for whom
 

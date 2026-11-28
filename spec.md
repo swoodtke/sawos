@@ -250,6 +250,15 @@ answers it and never at an early end (below). `PipeInletOp.Call`,
 `PipeRequestOp.ReplyWait`, `PipeReplyOp.Ready` and `PipeRequestOp.Sender` are
 described below.
 
+**The taken count.** A connection counts the messages its server has taken:
+the kernel adds one each time a staged message is handed over, by a `Take` or
+by a delivery under a consuming attach, which is the take (§2.2). The count
+wraps, so a reader compares two readings for equality only.
+`PipeInletOp.Taken`, on `PipeInletRight.Post`, answers it as its value: a
+poster may learn how far the server has taken, and two equal readings say the
+server took nothing between them, whether it was blocked, spinning or busy
+with other work. It takes no argument and changes nothing.
+
 **Peer-closed is read off the columns** — the peer-gone doctrine (§2.2). The
 outlet column reaching zero drops what is staged, and every later `Post`
 answers `SosStatus.PeerClosed`. The inlet column reaching zero drains first:
@@ -2010,9 +2019,9 @@ of the process or its record.
 
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
-`GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
-`Kill` (§8), `Stats`, `RestrictRights` and `Ceiling` (on
-`Stats`; both below). `QuotaSet` sets and `QuotaGet` (on `Stats`) reads the
+`GetStatus` (on `Wait`), `Death` (§8), `Start`, `BootHandleNext` (on
+`BootHandles`), `Give`, `Kill` (§8), `Stats`, `RestrictRights` and `Ceiling`
+(on `Stats`; both below). `QuotaSet` sets and `QuotaGet` (on `Stats`) reads the
 named process's quota rows (below). `BandMap` sets its band map (§7).
 `SectionWord` (on `ThreadCreate`) registers the caller's section word (§7).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
@@ -2055,8 +2064,8 @@ three groups:
   process's handle never names the live caller, so through one these are the
   same `NotSelf` fault. The right on the handle used is checked first, so a handle without it
   is `AccessDenied`.
-- **`Start`, `Give`, `GetStatus`, `Stats` and `Kill` act on the named
-  process**, which is what supervision is; `Kill` naming the caller's own
+- **`Start`, `Give`, `GetStatus`, `Death`, `Stats` and `Kill` act on the
+  named process**, which is what supervision is; `Kill` naming the caller's own
   process or a `Created` one faults the caller (§8). `Start`
   and `Give` require a `Created` child, and naming one that is not, a `Gone`
   one included, is a `BadState` fault rather than `Revoked` (§2.10): a `Gone`
@@ -2071,7 +2080,7 @@ pid, mint the observe set, below), named for its ops
 throughout: `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`,
 `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
 `PipeCreate`, `Stats`, `RestrictRights`, `QuotaSet` (both below), `BandMap`
-(below) and `Kill` (§8), plus the universal `Transfer | Mint`. A launcher keeps
+(below), `Kill` and `Death` (§8), plus the universal `Transfer | Mint`. A launcher keeps
 the child's handle — it is what supervises with — and the child derives its
 own authority from the masked System handle it was given (§12), so supervision
 and self-management are not alternatives.
@@ -2482,7 +2491,7 @@ a whole.
 
 | op | right | what it does |
 |---|---|---|
-| `DebugPrint` | `SystemRight.Debug` | places a byte on the console (§9a) |
+| `DebugPrint` | `SystemRight.Debug` | places a byte on the console (§9a); `Claimed` while a process holds the console claim (below) |
 | `Shutdown(status)` | `SystemRight.Shutdown` | stops the machine (QEMU: `sifive_test` on Profile A, semihosting on Profile B) |
 | `ProcessSelf` | `SystemRight.ProcessSelf` | mints the caller's own Process handle, narrowed by a keep mask |
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
@@ -2493,6 +2502,8 @@ a whole.
 | `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
 | `ProcessNext(address of cursor)` | `SystemRight.ProcessObserve` | reads the cursor from a doubleword in the caller's memory and answers the process with the smallest pid above it, as a Process handle carrying the observe set, and writes its pid back as the next cursor; `Drained` at the end (below) |
 | `ProcessByPid(address of pid)` | `SystemRight.ProcessObserve` | reads a pid from a doubleword in the caller's memory and answers the process it names, as a Process handle carrying the observe set; `Revoked` for a pid the record table does not hold (below) |
+| `ConsoleClaim` | `SystemRight.Console` | takes the console from the kernel for the calling process (below, §9a); `Claimed` while another process holds it |
+| `ConsoleRelease` | none | gives the console back (below) |
 
 - **`exit` is not here**: process exit is `ProcessOp.Exit`, which ends the
   calling process, and faults a caller whose handle names another (§2.7).
@@ -2561,6 +2572,39 @@ a whole.
 - **`TierGet`** answers `Isolated` or `Flat` (§5b.1). It reads no state, spends
   no resource, takes no argument and cannot fail. Info queries of this kind
   belong on this object and are gated like any other op.
+
+**The console claim.** A process that drives the console's device itself, a
+console driver, claims the console with `ConsoleClaim`, and from then on the
+kernel writes nothing to it but what a stop of the machine writes (§9a). The
+claim is console-specific and interim: it names no device and no window, only
+the claimant, and claiming devices in general belongs to a device object, a
+separate design that is not built. Who can write the device's registers is
+decided as before, by who is given its window.
+
+- **What it is.** A fact about the console the kernel keeps: the claimant's
+  record and its pid, so a reused record is never taken for the claimant.
+  Neither op takes an argument, and each answers a status alone.
+- **It belongs to the claimant process.** It ends at `ConsoleRelease` and at
+  the claimant's teardown, whatever ended it, a kill included. A panic and
+  every stop of the machine take the console back over it (§9a). Giving a
+  System handle away neither moves nor strands it.
+- **Their answers, in the order they are decided.** For `ConsoleClaim`: a word
+  that names nothing is the `BadHandle` fault and a handle without
+  `SystemRight.Console` is `AccessDenied`, on §5.7's dispatch order; a caller
+  that already holds the claim is the `BadState` fault; a claim another process
+  holds answers `Claimed`, a status because the caller could not have known.
+  `ConsoleRelease` needs no right, because giving the console back is never
+  authority: a word that names nothing is the `BadHandle` fault, and a caller
+  that does not hold the claim is the `BadState` fault. So a claimant can
+  always end its claim through whatever System handle it holds.
+- **`Claimed` is one fact from two sides.** It answers a second claimant, and
+  it answers every `DebugPrint` while the claim stands, the claimant's
+  included: a driver prints its own lines through the device it drives, or
+  through the debug print once it has released.
+- **The right.** `root_system_rights()` carries `SystemRight.Console`: root is
+  the launcher that decides which process writes the console. §12's
+  convention mask leaves it out; a launcher gives it to its console's driver
+  alone.
 
 **The machine's limits.** Every limit the kernel keeps is set or derived, and
 raising a set number raises what is derived from it.
@@ -2717,7 +2761,8 @@ names its clients through the sender handle (§2.1), which asks no System right.
   and its quota rows (`ProcessOp.QuotaGet`, likewise);
   with `Wait`, the §8 status word, through `GetStatus` or a Waiter. Nothing
   else: the observe set carries no right to map into, start, give to, create
-  through, exit, restrict or kill the process (kill, §8), and
+  through, exit, restrict or kill the process (kill, §8), nor to read how it
+  died (its death record, §8), and
   neither `Transfer` nor `Mint`. Like any handle naming a process, it can serve
   as a ceiling source to `ProcessCreate`, which only ever restricts (§2.7). The
   kernel records no name, image, argument or parent for a process, so a `ps`
@@ -3717,13 +3762,15 @@ object, §2.10, a sender handle asked of a dead sender, §2.1, and a lookup of a
 pid the record table does not hold or holds for a process not yet started,
 §2.8), `PeerClosed` and
 `WouldBlock` (§2.1), `TimedOut` (12: a wakeable park's deadline came first, or
-had passed at the op, §7) and `Woken` (13: another thread of the process ended
-a wakeable park, or a wake was latched at the op, §7) — with `Unknown` the
-userspace mapping artifact. A dynamic resource condition answers with a
-status; broken code faults. `TimedOut` and `Woken` are statuses because the
-clock or another thread decided, and neither consumes what the op waited for.
-They are not `WouldBlock`, which is a poll op's "not now" with no park, nor
-`Revoked` (what was waited on is gone), nor `PeerClosed` (the far end gone).
+had passed at the op, §7), `Woken` (13: another thread of the process ended
+a wakeable park, or a wake was latched at the op, §7) and `Claimed` (14: the
+console held by a process, answering the debug print while a claim stands and
+a second claimant, §2.8, §9a) — with `Unknown` the userspace mapping artifact.
+A dynamic resource condition answers with a status; broken code faults.
+`TimedOut` and `Woken` are statuses because the clock or another thread
+decided, and neither consumes what the op waited for. They are not
+`WouldBlock`, which is a poll op's "not now" with no park, nor `Revoked` (what
+was waited on is gone), nor `PeerClosed` (the far end gone).
 
 **Dispatch** is §3's shape verbatim: handle-table lookup → object type → op
 table → rights check → op. The System object (§2.8) is minted to root at boot,
@@ -4698,6 +4745,11 @@ arm their own.
 - **Uniprocessor kernel in v1**, both profiles (the P4 is dual-core and
   QEMU can do SMP; SMP is its own future design — locking model,
   per-core queues — and nothing above precludes it).
+- **A panic stops every other core before it prints or takes any device
+  back**, by a stop interrupt the other core cannot mask, a bounded wait for
+  each core's acknowledgement, and the core held in reset where the board can
+  do that. On one core there is nothing to stop, and the kernel's panic path
+  (§9a) relies on that today.
 
 ## 8. Thread & process lifecycle
 
@@ -4730,12 +4782,18 @@ preemption points included).
 
 **The fault rule, and how teardown ends.** A thread fault kills its process and
 the teardown runs unconditionally; what happens after forks. Process 0 — root,
-the one image the kernel loads (§12) — stops the machine. **Any other process
-reschedules**: its threads are removed from the ready lists (leaving everybody
-else's), the objects bound to it are invalidated, its handles are released, its
-protection rows go back and its body is freed (§2.10), and the path ends in the
-scheduler rather than in a stopped machine. Children die with the machine when
-root ends, uncounted. A supervisor may read `get_status` through the handle it
+the one image the kernel loads (§12) — stops the machine. Root's panic, its
+faults (a syscall fault, a trap, a delivery's fault) and its kill are kernel
+panics: like a panic in the kernel, each takes the console back over any claim
+and writes root's lines, its panic text included, before the machine stops
+(§9a), with the failing status of the kernel's own vocabulary each already
+stopped with. Root's exit stays what it is, its teardown line and then the
+stop with its code; it is a stop, so under a claim it too takes the console
+back first. **Any other process reschedules**: its threads are removed from
+the ready lists (leaving everybody else's), the objects bound to it are
+invalidated, its handles are released, its protection rows go back and its
+body is freed (§2.10), and the path ends in the scheduler rather than in a
+stopped machine. Children die with the machine when root ends, uncounted. A supervisor may read `get_status` through the handle it
 holds — which outlives the child, because the teardown closes the handles in
 the dead process's table and not in its creator's — or be woken by the death
 (below). The teardown (`end_process`) lives in the scheduler module beside
@@ -4883,16 +4941,59 @@ counters in its body's row until a create reuses the body.
 - **`process.get_status()`**, gated on the wait right: one fixed-width status
   word — kind in the high bits (`Exited | Faulted | Killed`), code in the low 16
   bits (exit code, or a fault-cause tag; a deadlock ends no process and is not
-  one), so an exit code wider than that is read as its low 16 bits. The kernel's
-  fault report prints the faulting PC and address on the console (`epc=`,
-  `tval=`); fault forensics a supervisor can read is a later design. `Killed` is
+  one), so an exit code wider than that is read as its low 16 bits. `Killed` is
   written only by a kill, with the code its killer passed (below).
+- **`process.death()`**, `ProcessOp.Death`, gated on `ProcessRight.Death`:
+  the death record (below), the rest of how the process ended.
 - **`process.kill(code:)`**, gated on `ProcessRight.Kill` (below).
   Cooperative-first teardown stays the norm; kill is the capability-gated
   escape hatch that makes userspace supervision real against wedged/hostile
   processes. This answers §4's kill-tree question: kill is
   process-granular only, with no kernel trees — supervision topology is
   userspace's.
+
+**The death record.** The kernel keeps, for every death, what a supervisor needs
+to say how the process ended beyond the status word, and `ProcessOp.Death`
+answers it through a copy-out record, as `Stats` does (§2.7). It is read
+through a `Gone` process's handle, which is what it is for.
+
+- **The right.** `ProcessRight.Death`, a bit of its own and not `Wait`'s,
+  because the record says more than whether a process is alive: a panic's
+  text is the process's own words. It is in the one Process default set
+  (§2.7), so a launcher's handle onto its child carries it, root's and the
+  handle `ProcessSelf` mints too, and a launcher reports its children's ends.
+  It is never in the observe set, so a server's sender handle (§2.1) and the
+  handle a walk or a lookup answers (§2.8) learn that a process died, through
+  `Wait`, and not how. It moves as every right does.
+
+- **The record**, sixteen doublewords and then the text: the §8 status word,
+  the pid, the cause (`DeathCause`: exited, killed, a fault, a trap, a panic,
+  or a lock wait naming another process's thread), whether the kernel printed
+  the death's lines itself (below), a trap's cause word, pc and address in the
+  HAL's terms, the pid of the process whose thread owned the lock a wait
+  named, the teardown's counts as its line prints them, and the panic text's
+  length; then the text, `PANIC_TEXT_BYTES` of room, as the kernel's line
+  prints it: printable ASCII, every other byte `?`, a final line break
+  dropped, cut at the bound, or `text unreadable:` and the copy door's reason
+  for a text the door refused. A live process, `Created` or running, reads the
+  `Running` word, its pid, and nothing else.
+- **Where it is written.** Where each line about the death is decided, at
+  every death, whether or not the console is claimed, so there is one path:
+  the panic op copies the checked text into the record and the line prints it
+  from there. It lives in the process record, which outlives the body for as
+  long as a handle names it (§2.7), and a create empties it.
+- **`printed`** says which way the console went: set when the kernel wrote the
+  death's lines, clear when a console claim held them back (§9a), so a
+  supervisor that prints the record knows whether it is the only one that
+  will.
+- **Its answers, in order.** A word that names nothing is `BadHandle` and a
+  handle without `Death` is `AccessDenied`, on §5.7's dispatch order; a
+  capacity below the record's size is the `BadArg` fault; a buffer the copy
+  door refuses ends the caller, as for every record. It allocates nothing and
+  charges no quota.
+- **A death nobody can read.** A process whose last name is gone at its death
+  has a record no handle can reach, reclaimed as its teardown ends (§2.7). Its
+  lines are printed, or counted as held back under a claim (§9a).
 
 **Kill.** `ProcessOp.Kill(code)`, gated by `ProcessRight.Kill` on the handle
 used, ends the process that handle names. It is the one way a process ends
@@ -5223,9 +5324,9 @@ through a pipe protocol (§2.1) and hold no device authority at all.
 
 ### 9a. The console handover protocol
 
-Both v1 machines have one console UART, and both the kernel and a driver
-process can drive it. Unstated, that is a flaky-test mystery — two writers on
-one device interleave mid-word and neither is wrong.
+Every machine has one console UART, and both the kernel and a driver process
+can drive it. Unstated, that is a flaky-test mystery — two writers on one
+device interleave mid-word and neither is wrong.
 
 - **Boot**: the kernel owns the device outright and narrates.
 - **Handover**: entering user mode writes one marker line, and it is the
@@ -5244,6 +5345,47 @@ The one bounded exception is a harness kernel that turns the report on
 (`enable_tick_report`), whose first few ticks are narrated after handover —
 which is why a case whose transcript matters after handover boots an image
 whose boot flags turn the tick off.
+
+**The console claim.** A driver that drives the console's device itself claims
+the console (`SystemOp.ConsoleClaim`, §2.8), and the third phase is suspended:
+from the claim until the claimant releases it or dies, the kernel writes
+nothing to the console but what a stop of the machine writes.
+
+- **The debug print answers `Claimed`** to every caller, the claimant
+  included, after its rights check, and writes nothing.
+- **The routine lines are held back and counted**: a process's exit line, its
+  fault, trap, panic and lock-wait lines, its teardown line, a line nothing is
+  bound to, the first spurious interrupt, a thread's first floating-point use,
+  the tick report. A death's lines are kept in its death record (§8), whose
+  `printed` says they were not written, and a supervisor prints them from
+  there. Each line decides once, at its first byte, whether it prints; a line
+  is written inside one kernel entry with no preemption point, and the claim,
+  the release and the teardown that ends a claim are kernel entries too, so
+  no line is ever half on each side of a claim.
+- **A line about the claimant itself is printed.** Every such line comes from
+  its fault or its end, so the kernel ends the claim first and then writes.
+- **When the console comes back**, at the release or at the claimant's death,
+  the kernel writes one line if it held anything back, `SOS: console
+  returned, lines held=N, debug bytes refused=M`, so a line nobody else
+  printed is never lost without a trace.
+- **A panic and every stop of the machine take the console back.** The fatal
+  reports (a kernel fault, a broken kernel invariant, a deadlock), root's end
+  and its kill (§8), the runtime's abort in the kernel, `Shutdown`, and each
+  stop a HAL makes on its own end the claim over the claimant's head, mask the
+  console's interrupt line at the controller (`hal.console_reclaim`, so the
+  state is the same whatever the stop does next), write the held-back line,
+  and then write as before. No FIFO is reset: the bytes the claimant stored
+  are the run's last output and go out first, and the kernel's lines follow
+  them; what was still in the claimant's own buffer is lost, since no process
+  runs again. The kernel runs to a stop with interrupts masked, so no driver
+  code runs again. A HAL's own stop that reports with nothing compiled from
+  Saw beneath it (the ESP32-S3's kernel-mode trap) writes its line first and
+  then takes the console back.
+- **The takeover relies on one core.** Nothing else runs while the kernel
+  panics: the kernel is uniprocessor (§7), and on the ESP32-S3 the second
+  core is held in reset with its clock gated on the part and polls ROM code
+  on the emulator. A kernel on several cores stops every other core first
+  (§7).
 
 ## 9b. Kernel sync primitives: IntrSpinLock
 

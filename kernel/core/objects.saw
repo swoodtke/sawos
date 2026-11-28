@@ -2200,6 +2200,11 @@ public(package) struct PipeSlot {
     public(package) inlet_refs: UInt16,
     /// The server end's column, counted the same way.
     public(package) outlet_refs: UInt16,
+    /// How many staged messages have been handed over, by a `Take` or by a
+    /// delivery under a consuming attach: `stage_pop`, both ways' one door,
+    /// adds one. It wraps, and a reader compares two readings for equality
+    /// only (`PipeInletOp.Taken`).
+    public(package) taken: UInt,
 }
 
 /// `MAX_PIPES` is the inline extent; a `SlabKind.Pipes` donation adds
@@ -2208,7 +2213,7 @@ public(package) struct PipeSlot {
 public(package) unsafe static var PIPES: Slab<PipeSlot, MAX_PIPES> = Slab<PipeSlot, MAX_PIPES>(
     inline: [PipeSlot(state: SlotState.Free, process: 0, staged: 0,
                       inlet_attachment: 0, outlet_attachment: 0,
-                      inlet_refs: 0, outlet_refs: 0);
+                      inlet_refs: 0, outlet_refs: 0, taken: 0);
              MAX_PIPES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
@@ -2687,6 +2692,7 @@ public(package) func stage_pop(c: Int) unsafe {
     }
     PIPES[c].staged = EXCHANGES[head - 1].next
     EXCHANGES[head - 1].next = 0
+    PIPES[c].taken = PIPES[c].taken &+ 1
 }
 
 /// Is every ring slot of connection `c` free, with no exchange left in it?
@@ -2731,7 +2737,7 @@ public(package) func free_pipe(slot: Int) unsafe {
     let owner = PIPES[slot].process
     PIPES[slot] = PipeSlot(state: SlotState.Free, process: 0, staged: 0,
                            inlet_attachment: 0, outlet_attachment: 0,
-                           inlet_refs: 0, outlet_refs: 0)
+                           inlet_refs: 0, outlet_refs: 0, taken: 0)
     credit_shared(owner, QuotaKind.Pipe)
 }
 

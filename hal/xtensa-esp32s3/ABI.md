@@ -522,6 +522,19 @@ each store: the console (`lib.saw`) without a bound, and `kernel_fault`
 (`sink.c`) with one, so that a UART which never drains cannot keep the
 report from reaching its halt.
 
+**A console claim** (spec §9a) is taken back at every stop through `kcore`'s
+`sos_console_stop`: `exit_pass`, `exit_fail`, `sos_rt_abort`, the
+out-of-CPU-interrupts stop and the refused windowed call call it before they
+write, and `kernel_fault` after its line, through `sos_fault_console_stop`,
+which bounds the console's polls as `kernel_fault`'s own are, so that the
+report reaches the console whatever the Saw side's state and a UART that never
+drains cannot keep it from the halt. With a claim standing it calls
+`console_reclaim`, which disables the CPU interrupt UART0's source (27) is
+routed to, leaving the route as `irq_mask` does, and touches no UART
+register: the write path is a count read and a store, which need no enable
+bit, and no FIFO is reset, so the claimant's stored bytes go out ahead of the
+kernel's.
+
 **USB-Serial-JTAG** (0x6003_8000, `misc.esp32c3.usb_serial_jtag`): probed by
 writing `USJ: hello\n` byte by byte to `+0x00` (EP1) and 1 to `+0x04`
 (EP1_CONF, write-done). Nothing appeared on UART0's chardev or on three more
@@ -2145,7 +2158,7 @@ flash (offset, instruction window, data window)
 
 RAM
 IRAM 0x4037_8000 - 0x4037_BFFF  kernel vectors + trap path
-DRAM 0x3FC8_C000 - 0x3FCA_FFFF  kernel .data + .bss (arena, 64K stack)
+DRAM 0x3FC8_C000 - 0x3FCA_FFFF  kernel .data + .bss (arena, 16K stack)
 DRAM 0x3FCB_0000 - 0x3FCC_7FFF  root's region: writable data + arena, the
                                 top 16 KiB its stack
 DRAM 0x3FCC_8000 - ...          the other processes' regions, the same shape

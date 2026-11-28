@@ -896,6 +896,13 @@ CHILD_KILL_CALLER_PKG = os.path.join(TESTS_DIR, "child-kill-caller")
 PROCESS_KILL_CALLS_PKG = os.path.join(TESTS_DIR, "process-kill-calls")
 PROCESS_KILL_CREATED_PKG = os.path.join(TESTS_DIR, "process-kill-created")
 PROCESS_KILL_ROOT_PKG = os.path.join(TESTS_DIR, "process-kill-root")
+# The death record and the console claim (spec §8, §9a): `child-ends` ends in
+# the way its role names, or meets the claim the way it names, and each root
+# launches it once per role, one at a time.
+CHILD_ENDS_PKG = os.path.join(TESTS_DIR, "child-ends")
+DEATH_RECORD_PKG = os.path.join(TESTS_DIR, "death-record")
+CONSOLE_CLAIM_PKG = os.path.join(TESTS_DIR, "console-claim")
+PIPE_TAKEN_PKG = os.path.join(TESTS_DIR, "pipe-taken")
 # `ProcessOp.Kill` on a child in a chosen state (spec §8). `child-kill-victim`
 # is a role-driven target; `kill-churn` kills one per round over many rounds
 # and `kill-runnable` kills one that is runnable and not running.
@@ -2012,6 +2019,8 @@ def expectations(arch):
         "twenty_nine": f"0x{29:0{width}x}",
         "thirty_four": f"0x{34:0{width}x}",
         "forty_one": f"0x{41:0{width}x}",
+        "forty_two": f"0x{42:0{width}x}",
+        "forty_five": f"0x{45:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         # The map of a root built by Blade from a manifest that states
         # `normal = 2, high = 3`.
@@ -2166,6 +2175,20 @@ def _panic_fault(process, *pieces, open_end=False):
     return lines + [f" process={process}\n"]
 
 
+def _death_teardown(handles, events, waiters, process):
+    """A teardown line, as `expectations` spells its words, for a process with
+    one thread and none of the other counted kinds but `events` and
+    `waiters`."""
+    return (f"SOS: process teardown handles={{{handles}}} threads={{one}} "
+            f"events={{{events}}} waiters={{{waiters}}} interrupts={{zero}} "
+            f"timers={{zero}} process={{{process}}}\n")
+
+
+# `child-ends`' panic text as the kernel keeps and prints it: the byte at `i`
+# is `'a' + i % 26`, cut at the kernel's 256.
+_DEATH_TEXT = "".join(chr(0x61 + i % 26) for i in range(256))
+
+
 def _heap_refused(round, reason, rows=0):
     """What a `heap_refusals` round prints: the child's two blocks, each
     refused and `info()` reading `reason`, the `Mapping` rows the two
@@ -2221,7 +2244,8 @@ def _stock_stop(name, plan, says, status=EXIT_ROOT_STOPPED, **keys):
 # Every right of `SystemRight`, in the order `tests/stockkit` prints them.
 _SYSTEM_RIGHTS = ("Transfer", "Mint", "Debug", "Shutdown", "ClockGet",
                   "ProcessCreate", "ProcessSelf", "SlabDonate", "TierGet",
-                  "StatsRegionMap", "InterruptBind", "ProcessObserve")
+                  "StatsRegionMap", "InterruptBind", "ProcessObserve",
+                  "Console")
 
 # The launch convention's mask: what a child whose declaration names no
 # rights keeps.
@@ -2505,7 +2529,7 @@ def _console_print_cases(files):
                 "root: default ended status=65536",
                 # The line's two pieces and the `Sync`.
                 "SOS console drv: served=3 refused=0 unsupported=0 "
-                "printed=209",
+                "printed=221",
                 "root: console ended status=65536"],
             "expect_clean_exit": True,
         },
@@ -2985,6 +3009,35 @@ TEST_CASES = [
                        "SOS M2: entering U-mode",
                        "SOS: external irq {irq_line}"],
         "expect_clean_exit": True,
+    },
+    {
+        # The kernel's own lines under a console claim (spec §9a): a line
+        # nothing is bound to and the tick report are held back, and the
+        # payload's `Shutdown`, a stop, takes the console back. The held-back
+        # line follows the handover marker with nothing between; its count
+        # follows the ticks the host let through, so it is not asserted.
+        "name": "console_held",
+        "src": os.path.join(TESTS_DIR, "console_held.saw"),
+        "asm": "payload_spin.S",
+        "expect_out": ["SOS M2: raised external irq {irq_line}",
+                       "SOS M2: claimed, entering U-mode\n"
+                       "SOS: console handover\n"
+                       "SOS: console returned, lines held=",
+                       "SOS: kernel stack peak="],
+        "expect_clean_exit": True,
+    },
+    {
+        # A kernel-mode trap under a console claim (spec §9a): the harness
+        # kernel claims for a process that does not exist, has one of its own
+        # lines held back and reads an address it cannot reach. The HAL's
+        # kernel-fault stop takes the console back, so the held-back line,
+        # one line and no byte, follows the kernel's last line before it.
+        "name": "console_fault",
+        "src": os.path.join(TESTS_DIR, "console_fault.saw"),
+        "expect_out": ["SOS M2: claiming, then faulting\n"
+                       "SOS: console returned, lines held={one}, debug bytes "
+                       "refused={zero}\n"],
+        "expect_clean_exit": False,
     },
     # --- kernel interruptibility -------------------------------------------
     # The cases above show that an interrupt that comes due while the kernel
@@ -3658,7 +3711,8 @@ TEST_CASES = [
             "process={one}",
             "SOS levelkill: doom: M\n",
             "SOS levelkill: P\n",
-            "SOS levelkill: doom ended status=131083\n",
+            "SOS levelkill: doom ended status=131083\n"
+            "SOS levelkill: doom's record: cause=2 printed=1\n",
             "SOS levelraw: denied: starting at band 8 without Start\n",
             "SOS: process fault: access denied process={one}",
             "SOS levelkill: denied ended status=131075\n",
@@ -6167,7 +6221,7 @@ TEST_CASES = [
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
         # mint (1795 is Transfer, Mint and the three Event bits, 5635
-        # Transfer, Mint, Map, MapExecute and Physical, 16776963 the Process
+        # Transfer, Mint, Map, MapExecute and Physical, 33554179 the Process
         # set); a
         # sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
@@ -6185,7 +6239,7 @@ TEST_CASES = [
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
                        "SOS handleinfo: memory rights=5635",
-                       "SOS handleinfo: process rights=16776963",
+                       "SOS handleinfo: process rights=33554179",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
                        "SOS handleinfo: a keep bit the source lacks is not "
@@ -6268,7 +6322,7 @@ TEST_CASES = [
         # (`pool_rights()`, the Memory default set 5635, `PoolRight.Extend` and
         # `PoolRight.Allocate`), what it allocates reads 515, the Mapping
         # that installs that 258 (the
-        # Mapping default set is 770), and the process it creates 16760579,
+        # Mapping default set is 770), and the process it creates 33537795,
         # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -6280,7 +6334,7 @@ TEST_CASES = [
                        "SOS ceilderived: pool rights=73219",
                        "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
-                       "SOS ceilderived: created process rights=16760579",
+                       "SOS ceilderived: created process rights=33537795",
                        "SOS ceilderived: done"],
         "expect_clean_exit": True,
     },
@@ -14169,6 +14223,228 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # `ProcessOp.Death` (spec §8), with no console claim. Root launches
+        # `child-ends` once per role and reads each death record after the
+        # wait: an exit and its code; a live process, which reads `Running`
+        # (0) and nothing else, then killed with 0x2B (196651); a syscall
+        # fault (`BadHandle`, 131073); a trap (`Faulted` with code 0), whose
+        # recorded pc is the address the child called into; a panic on 300
+        # bytes, whose text is cut at 256 (`Panic` 14, 131086); a lock wait
+        # naming root's thread, whose holder is root's pid (`BadArg`,
+        # 131081); the op through a handle carrying the observe set and no
+        # `ProcessRight.Death` (`AccessDenied`), and into a short buffer
+        # (`BadArg`); and the same op through a server's sender handle onto
+        # root and through the handle `ProcessByPid` answers for root, which
+        # carry the observe set too (`AccessDenied`, 131075). Root reads every
+        # record through the handle `ProcessCreate` answered, which carries
+        # the right. Every record says the kernel printed the death's lines,
+        # and its teardown counts are the kernel's teardown line's, which
+        # stands beside it unchanged. The lock wait's record is the panic's,
+        # reused, and its empty text says a create emptied it. The trap's
+        # cause word, pc and address read as the kernel's trap line prints
+        # them (`expect_regex`).
+        "name": "death_record",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEATH_RECORD_PKG,
+        "children": [CHILD_ENDS_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: process exit: code={forty_two} process={one}\n"
+            + _death_teardown("three", "zero", "zero", "one")
+            + "SOS deathrec: exit: status=65578 pid=2 cause=Exited "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: exit: handles=3 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS deathrec: running: status=0 pid=3 cause=Exited printed=0\n"
+            + _death_teardown("five", "one", "one", "two")
+            + "SOS deathrec: killed: status=196651 pid=3 cause=Killed "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: killed: handles=5 threads=1 events=1 waiters=1 "
+            "interrupts=0 timers=0\n"
+            "SOS: process fault: bad handle process={three}\n"
+            + _death_teardown("three", "zero", "zero", "three")
+            + "SOS deathrec: fault: status=131073 pid=4 cause=Fault "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: fault: handles=3 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS: fault ",
+            # The trap's line names the HAL's cause, so it is matched from
+            # its teardown line on.
+            _death_teardown("four", "zero", "zero", "four")
+            + "SOS deathrec: trap: status=131072 pid=5 cause=Trap "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: trap: handles=4 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS deathrec: trap: the pc is the address it called: yes\n"
+            "SOS deathrec: trap: cause=",
+            "SOS: process fault: the program panicked process={four} text="
+            + _DEATH_TEXT + "\n"
+            + _death_teardown("three", "zero", "zero", "four")
+            + "SOS deathrec: panic: status=131086 pid=6 cause=Panic "
+            "printed=1 holder_pid=0 text_len=256\n"
+            "SOS deathrec: panic: handles=3 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS deathrec: panic: text_len=256, the alphabet cut at the "
+            "bound: yes\n"
+            "SOS: lock wait: the owner is a thread of another process "
+            "waiter={four} holder={zero}\n"
+            "SOS: process fault: argument outside its domain process={four}\n"
+            + _death_teardown("four", "zero", "zero", "four")
+            + "SOS deathrec: lock: status=131081 pid=7 cause=LockOwner "
+            "printed=1 holder_pid=1 text_len=0\n"
+            "SOS deathrec: lock: handles=4 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS: process fault: access denied process={five}\n"
+            + _death_teardown("four", "zero", "zero", "five")
+            + "SOS deathrec: denied: status=131075 pid=8 cause=Fault "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: denied: handles=4 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n"
+            "SOS: process fault: argument outside its domain process={six}\n"
+            + _death_teardown("four", "zero", "zero", "six")
+            + "SOS deathrec: short: status=131081 pid=9 cause=Fault "
+            "printed=1 holder_pid=0 text_len=0\n"
+            "SOS deathrec: short: handles=4 threads=1 events=0 waiters=0 "
+            "interrupts=0 timers=0\n",
+            "SOS deathrec: sender: status=131075 ",
+            "SOS deathrec: lookup: status=131075 ",
+            "SOS deathrec: done"],
+        # The trap's three words in the record read as the kernel's trap line
+        # prints them, whatever they are on the profile.
+        "expect_regex": [
+            r"SOS: fault \S+ cause=(0x[0-9a-f]+) epc=(0x[0-9a-f]+) "
+            r"tval=(0x[0-9a-f]+)\n(?:.*\n)*?SOS deathrec: trap: cause=\1 "
+            r"pc=\2 addr=\3\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The console claim (spec §9a). Root claims the console, which its
+        # System handle allows, says so first, and holds it while
+        # `child-ends` panics, traps, waits on a lock naming root's thread,
+        # claims (given `Console`: `Claimed`, so it exits 0x2C, 65580),
+        # releases a claim it does not hold (`BadState`, 131077) and claims
+        # without the right (`AccessDenied`, 131075), and while root's own
+        # debug print is refused. Root releases, and the kernel's held-back
+        # line follows root's last line before the claim with nothing
+        # between: two lines for each death and three for the lock wait's,
+        # and one byte. The panic's record kept its text and says the kernel
+        # did not print it.
+        #
+        # Then a child given `Console` claims, has its own debug print
+        # refused, and claims again: the `BadState` fault ends its claim, so
+        # the kernel writes the held-back line (no lines, one byte) and then
+        # its own lines, and records that it did. A child that claims and
+        # parks is killed while root's byte is refused: the kill's teardown
+        # gives the console back, the held-back line and the teardown line
+        # follow, and the record says printed. Root's claim and release
+        # answer `Ok` after each. A claimant releases through a sibling of its
+        # System handle without `Console` and claims and releases again (it
+        # exits 0x2D, 65581), and three claimants have a byte refused and
+        # exit, trap or panic holding the claim: each end gives the console
+        # back, so the held-back line (one byte) comes before the end's own
+        # lines, and each record says printed. Last, a child claims and parks,
+        # and root,
+        # its byte refused, panics: a stop takes the console back over the
+        # claimant's head, so the held-back line comes before root's panic
+        # line, and the machine stops with the panic status.
+        "name": "console_claim",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CONSOLE_CLAIM_PKG,
+        "children": [CHILD_ENDS_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS consoleclaim: claiming\n"
+            "SOS: console returned, lines held={thirteen}, debug bytes "
+            "refused={one}\n"
+            "SOS consoleclaim: the debug print under the claim: the "
+            "console is claimed\n"
+            "SOS consoleclaim: a panic under the claim: status=131086 "
+            "cause=Panic printed=0\n"
+            "SOS consoleclaim: its teardown: handles=3 threads=1 events=0 "
+            "waiters=0 interrupts=0 timers=0\n"
+            "SOS consoleclaim: its text, kept: 256 bytes beginning "
+            "abcdefghijklmnopqrstuvwxyz\n"
+            "SOS consoleclaim: a trap under the claim: status=131072\n"
+            "SOS consoleclaim: a lock wait under the claim: "
+            "status=131081\n"
+            "SOS consoleclaim: a second claimant: status=65580\n"
+            "SOS consoleclaim: a release without the claim: "
+            "status=131077\n"
+            "SOS consoleclaim: a claim without the right: "
+            "status=131075\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            "SOS: process fault: object in the wrong state "
+            "process={one}\n"
+            + _death_teardown("three", "zero", "zero", "one")
+            + "SOS consoleclaim: a claimant that claimed twice: "
+            "status=131077 cause=Fault printed=1\n"
+            "SOS consoleclaim: a claim after the claimant's death: Ok\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            + _death_teardown("five", "one", "one", "one")
+            + "SOS consoleclaim: the debug print beside the parked "
+            "claimant: the console is claimed\n"
+            "SOS consoleclaim: a claimant killed holding the claim: "
+            "status=196651 cause=Killed printed=1\n"
+            "SOS consoleclaim: a claim after the kill: Ok\n"
+            "SOS: process exit: code={forty_five} process={one}\n"
+            + _death_teardown("three", "zero", "zero", "one")
+            + "SOS consoleclaim: a release through a handle without Console: "
+            "status=65581\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            "SOS: process exit: code={forty_two} process={one}\n"
+            + _death_teardown("four", "zero", "zero", "one")
+            + "SOS consoleclaim: a claimant that exits holding the claim: "
+            "status=65578 cause=Exited printed=1\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            "SOS: fault ",
+            # The trap's line names the HAL's cause; it is matched from its
+            # teardown line on.
+            _death_teardown("four", "zero", "zero", "one")
+            + "SOS consoleclaim: a claimant that traps holding the claim: "
+            "status=131072 cause=Trap printed=1\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            "SOS: process fault: the program panicked process={one} text="
+            + _DEATH_TEXT + "\n"
+            + _death_teardown("four", "zero", "zero", "one")
+            + "SOS consoleclaim: a claimant that panics holding the claim: "
+            "status=131086 cause=Panic printed=1\n"
+            "SOS consoleclaim: done\n"
+            "SOS: console returned, lines held={zero}, debug bytes "
+            "refused={one}\n"
+            "SOS: process fault: the program panicked process={zero} "
+            "text=SOS consoleclaim: root panics while a child holds the "
+            "claim\n"
+            "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PANIC,
+    },
+    {
+        # `PipeInletOp.Taken` (spec §2.1): the count of messages a
+        # connection's server has taken, read through the client end. A post
+        # takes nothing; a `take` adds one; a delivery under a consuming
+        # attach, which is the take, adds one. Through a sibling inlet minted
+        # without `Post` the read is `AccessDenied` (131075).
+        "name": "pipe_taken",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_TAKEN_PKG,
+        "children": [CHILD_ENDS_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS pipetaken: a new connection: 0\n"
+            "SOS pipetaken: a message staged: 0\n"
+            "SOS pipetaken: taken: 1\n"
+            "SOS pipetaken: delivered: 2\n"
+            "SOS: process fault: access denied process={one}\n",
+            "SOS pipetaken: through an inlet without Post: status=131075\n"
+            "SOS pipetaken: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # Killing root stops the machine with a failing status of the
         # kernel's own (`ExitCode.KilledRoot`), whatever code the killer
         # passed, and root's teardown is the last thing on the console. Root
@@ -15326,7 +15602,7 @@ TEST_CASES = [
             "00020009 process={one}\n",
             "SOS mainstart: exit ended status=65545\n",
             "SOS mainchild: the System's rights 5377, the Process's "
-            "16776963\n",
+            "33554179\n",
             "SOS mainchild: took the Event under tag 43; a second take found "
             "nothing\n",
             *_panic_fault("{one}", "panic at lib.saw:",
@@ -19323,6 +19599,13 @@ def _check(case, arch, status, out, timed_out):
     # matched and the number never is.
     if case.get("stack_peak") and STACK_PEAK_PREFIX not in hay:
         return False, f"the report line {STACK_PEAK_PREFIX!r} is missing (got {out!r})"
+    # A case may hold one part of the transcript to another (`expect_regex`):
+    # each pattern must match somewhere, so a backreference states that a
+    # value the case cannot know in advance (a trap's registers) reads the
+    # same in two lines. The patterns are not formatted.
+    for pattern in case.get("expect_regex", ()):
+        if re.search(pattern, hay) is None:
+            return False, (f"no match for {pattern!r} (got {out!r})")
     # A case may say how the console ends: the transcript, trailing whitespace
     # aside, must end with this text. It asserts that nothing was written after
     # the last line a case expects, which matching in order cannot.
@@ -21806,6 +22089,39 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                            "SOS: external irq 0x0000001b",
                            halt_pass],
             "expect_clean_exit": True,
+        },
+        {
+            # The same line and the tick report under a console claim: held
+            # back, and the payload's stop takes the console back, with its
+            # line straight after the handover marker (the gate's
+            # `console_held`). The count follows the ticks the host let
+            # through, so it is not asserted.
+            "name": "console_held",
+            "src": os.path.join(TESTS_DIR, "console_held.saw"),
+            "asm": "payload_spin.S",
+            "expect_out": [rom, "SOS M2: raised external irq 0x0000001b",
+                           "SOS M2: claimed, entering U-mode\n"
+                           "SOS: console handover\n"
+                           "SOS: console returned, lines held=",
+                           "SOS: kernel stack peak=",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The gate's `console_fault`: the C reporter writes its line
+            # first, then takes the console back with its writes bounded, so
+            # the held-back line follows the fault's report.
+            "name": "console_fault",
+            "src": os.path.join(TESTS_DIR, "console_fault.saw"),
+            "expect_out": [rom,
+                           "SOS M2: claiming, then faulting\n"
+                           "SOS-S3: kernel fault vector=0x00000300 "
+                           "exccause=0x0000001c",
+                           "excvaddr=0x10000000",
+                           "\nSOS: console returned, lines held=0x00000001, "
+                           "debug bytes refused=0x00000000\n"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x300 >> 6),
         },
         {
             # CPU interrupts handed between lines by the HAL itself: a masked
@@ -24495,7 +24811,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "wait_word_refusals", "deadline_waiter", "deadline_join",
                      "deadline_lock", "deadline_park", "thread_wake",
                      "park_record_cleared", "deadline_timer_first",
-                     *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES]]
+                     *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES],
+                     "death_record", "console_claim", "pipe_taken"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

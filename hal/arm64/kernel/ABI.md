@@ -120,6 +120,12 @@ it), `sos_rt_abort`, `sos_kernel_fault` with its `report_str`/`report_hex`,
   calls. `cause` is `ESR_EL1`, `tval` is `FAR_EL1`. It returns the frame to
   resume: the same one for an ordinary return, another thread's for a switch.
   The trap entry does not know which happened and must not care.
+- `sos_console_stop()` — `kcore`'s end of a console claim for a stop (spec
+  §9a): with a claim standing it calls `console_reclaim`, which masks the
+  PL011's line (SPI 1, INTID 33), and writes what the kernel held back; with
+  none it does nothing. `exit_pass`, `exit_fail`, `sos_rt_abort`,
+  `sos_kernel_fault` and `grant_outside_window` call it before they write or
+  stop.
 
 ## Thread contexts
 

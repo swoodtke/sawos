@@ -195,6 +195,14 @@ u32 sos_board_image(void) {
 // room within the bound, and a dead one costs the bound once per byte before
 // the byte is stored anyway. The emulator reports an empty FIFO every time
 // (../ABI.md §4), so there the wait ends at the first poll.
+//
+// A console claim is ended after the line, not before it: the stop that ends
+// it is Saw, and the line must not wait on it. `sos_fault_console_stop`
+// (`lib.saw`) bounds the console's writes as this file's are, then has
+// `kcore` disable the console's interrupt and write what it held back while
+// the claim stood, so a claimant's stored bytes, then this line, then that
+// count are the run's last output, and a UART that never drains still cannot
+// keep the report from its halt.
 
 #define UART0_FIFO              ((volatile u32 *)0x60000000u)
 #define UART0_STATUS            ((volatile u32 *)0x6000001Cu)
@@ -227,6 +235,8 @@ static void fault_hex(u32 v) {
     }
 }
 
+void sos_fault_console_stop(void);
+
 void kernel_fault(u32 vector, u32 cause, u32 epc1, u32 vaddr, u32 depc)
     __attribute__((noreturn));
 
@@ -242,6 +252,7 @@ void kernel_fault(u32 vector, u32 cause, u32 epc1, u32 vaddr, u32 depc) {
     fault_str(" depc=0x");
     fault_hex(depc);
     fault_str("\n");
+    sos_fault_console_stop();
     sos_sim_exit(0x80 | (vector >> 6));
     for (;;) {
     }

@@ -37,6 +37,7 @@ import sosabi.{
     thread_rights,
     NO_HANDLE,
     ROOT_SYSTEM_HANDLE,
+    empty_death_record,
 }
 import kcore.limits.{
     BodyIndex,
@@ -222,6 +223,9 @@ unsafe static var NEXT_PID: UInt64 = 2
 /// never reaches it and spends no pid. A counter that has run out would have
 /// to assign a pid a second time, which no later reader could detect, so the
 /// machine stops instead.
+///
+/// The record's death record is emptied with it: the pid is the start of a
+/// new process's life in the record, and the last occupant's death is not its.
 public(package) func assign_pid(p: ProcessIndex) unsafe -> UInt64 {
     let pid = NEXT_PID
     if pid == UInt64.max {
@@ -229,7 +233,10 @@ public(package) func assign_pid(p: ProcessIndex) unsafe -> UInt64 {
         return 0
     }
     NEXT_PID = pid + 1
-    process_records().at(p).pid = pid
+    borrow var record = process_records().at(p) {
+        record.pid = pid
+        record.death = empty_death_record()
+    }
     pid
 }
 

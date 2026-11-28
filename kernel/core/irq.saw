@@ -14,7 +14,7 @@
 import hal
 import sosabi.{SosStatus}
 import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT, ThreadIndex}
-import kcore.diag.{console}
+import kcore.diag.{console, console_line}
 import kcore.threads.{
     NEED_RESCHED,
     SLICE_ENDED,
@@ -259,7 +259,7 @@ func on_timer_tick(pc: UInt) unsafe {
         }
     }
 
-    if not TICK_REPORT || TIMER_TICKS > TICK_REPORT_LIMIT {
+    if not TICK_REPORT || TIMER_TICKS > TICK_REPORT_LIMIT || not console_line() {
         return
     }
     let uart = console()
@@ -297,10 +297,12 @@ static IDLE_PC: UInt = 0
 func on_external_irq(line: UInt) unsafe {
     let irq = interrupt_by_line(line)
     if irq == NO_INTERRUPT {
-        let uart = console()
-        uart.write_str("SOS: external irq ")
-        uart.write_hex(line)
-        uart.write_str("\n")
+        if console_line() {
+            let uart = console()
+            uart.write_str("SOS: external irq ")
+            uart.write_hex(line)
+            uart.write_str("\n")
+        }
         return
     }
     INTERRUPTS[irq].fired_at = hal.timer_now_ns()
@@ -336,7 +338,7 @@ func deliver_line(line: UInt, pc: UInt) unsafe {
 func service_claimed_line(line: UInt, pc: UInt) unsafe {
     if line == hal.IRQ_NONE {
         SPURIOUS_IRQS = SPURIOUS_IRQS &+ 1
-        if SPURIOUS_IRQS == 1 {
+        if SPURIOUS_IRQS == 1 && console_line() {
             console().write_str("SOS: spurious interrupt\n")
         }
         return

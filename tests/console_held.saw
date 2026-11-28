@@ -1,0 +1,62 @@
+// The kernel's own lines under a console claim (spec §9a): a line nothing is
+// bound to and the tick report are held back and counted, and a stop takes
+// the console back.
+//
+// The harness kernel turns the tick report on, raises a device line nothing
+// is bound to, and claims the console for the process it is about to start,
+// root's record and pid, before it enters user mode. Every line the kernel
+// would write while the payload spins (the external line's, each tick's) is
+// held back. The payload's `Shutdown` is a stop: it ends the claim, and the
+// held-back line comes straight after the handover marker, so nothing was
+// written between, the stop's own stack report included, which this kernel
+// turns on so that it follows the held-back line. How many lines it counts
+// depends on how many ticks the host let through, so the count is printed
+// and not asserted.
+
+import kcore.{console, console_claim, align_up, start_process, start_tick,
+    enable_tick_report, paint_kernel_stack, enable_stack_report}
+import hal
+import imgformat.{SegFlag}
+import sosabi.{NO_USER_STACK}
+
+static PAYLOAD_REGION: UInt = 0
+static TICK_PERIOD_US: UInt = 1000
+
+/// Root's record and pid, which `start_process` gives the payload.
+static ROOT_RECORD: Int = 0
+static ROOT_PID: UInt64 = 1
+
+@export("kmain")
+func kmain() {
+    paint_kernel_stack()
+    enable_stack_report()
+    let uart = console()
+    uart.write_str("SOS M2: console claim check on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    hal.intc_init()
+    enable_tick_report()
+    start_tick(TICK_PERIOD_US)
+    let line = hal.irq_raise_selftest_line()
+    uart.write_str("SOS M2: raised external irq ")
+    uart.write_hex(line)
+    uart.write_str("\n")
+
+    let base = hal.payload_start()
+    let top = align_up(hal.payload_end(), hal.PROT_GRAIN)
+
+    hal.prot_reset()
+    hal.prot_region(PAYLOAD_REGION, base, top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_commit()
+
+    uart.write_str("SOS M2: claimed, entering U-mode\n")
+    claim()
+    start_process(base, NO_USER_STACK, top)
+}
+
+/// Claim the console for the payload.
+func claim() unsafe {
+    console_claim(ROOT_RECORD, ROOT_PID)
+}

@@ -59,11 +59,16 @@ hang:
  * the emulator exits non-zero carrying the fault cause.
  *
  * `trap.S` jumps here when the mode witness says the trap came from the kernel
- * itself. It is board code (a device write), so the shared half takes it as a
- * symbol. */
+ * itself, with `sp` the kernel stack again. It is board code (a device write),
+ * so the shared half takes it as a symbol.
+ *
+ * It is a stop, so it first ends a console claim through `kcore`'s
+ * `sos_console_stop` (spec §9a), which with no claim returns at once; mcause
+ * is read after it, from the CSR, which the call leaves as it was. */
     .section .text.fault, "ax", @progbits
     .globl kernel_fault
 kernel_fault:
+    call    sos_console_stop
     csrr    t0, mcause
     slli    t0, t0, 16
     li      t1, FINISHER_FAIL
