@@ -1,0 +1,33 @@
+// The lock seams are not recursive (spec §7, §10.1), on a thread with no
+// block. The program exports its own `_start`, so its thread has none, and
+// its ID comes from the kernel at each take. It takes the lock, and takes it
+// again, which panics, naming the lock, before it waits. The kernel's fault
+// line carries the panic's text:
+//
+//   SOS: process fault: the program panicked ... text=panic at exec.saw:...:
+//   sos: the lock at ... is held by the calling thread ...
+//
+// An acquire with no self check would wait on a word naming itself, which the
+// kernel refuses as a lock taken twice, and the text would differ.
+
+import sos.{System}
+
+extern "C" {
+    func __saw_rt_lock_acquire(state: UnsafePointer<Int>)
+}
+
+/// The lock's word.
+unsafe static var LOCK: Int = 0
+
+func take() unsafe {
+    __saw_rt_lock_acquire((&var LOCK) as UnsafePointer<Int>)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    // The runtime's seams come with `sos`; a use of it links them.
+    let system = System(boot_handle: boot_handle)
+    take()
+    take()
+    let _ = system.debug_print("SOS lockrecursion: this line is never written\n")
+}

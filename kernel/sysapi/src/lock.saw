@@ -19,9 +19,9 @@
 //! The C floor is `sos_lock_take` and `sos_lock_give`, over the word's
 //! address; `Lock` is the same two calls on a word of its own.
 
-import sosabi.{SosStatus, LOCK_WAITERS_BIT}
-import sos.floor.{checked, sos_lock_wait, sos_lock_wake}
-import sos.rt.{own_thread_id}
+import sosabi.{SosStatus}
+import sos.floor.{checked}
+import sos.exec.{lock_take, lock_give, NOT_HELD}
 
 static STATUS_OK: UInt = SosStatus.Ok as UInt
 
@@ -108,15 +108,7 @@ extension Lock {
 /// process.
 @export("sos_lock_take")
 public func sos_lock_take(lock: UInt) unsafe -> UInt {
-    let word = lock as UnsafePointer<Atomic<Int>>
-    let me = Int.from(truncating: own_thread_id())
-    while not word[0].compare_exchange(0, me) {
-        let status = sos_lock_wait(lock)
-        if status != STATUS_OK {
-            return status
-        }
-    }
-    STATUS_OK
+    lock_take(lock)
 }
 
 /// Give back the lock whose word is at `lock` (spec §7): swap the word from
@@ -130,14 +122,9 @@ public func sos_lock_take(lock: UInt) unsafe -> UInt {
 /// or another thread's.
 @export("sos_lock_give")
 public func sos_lock_give(lock: UInt) unsafe -> UInt {
-    let word = lock as UnsafePointer<Atomic<Int>>
-    let me = own_thread_id()
-    if word[0].compare_exchange(Int.from(truncating: me), 0) {
-        return STATUS_OK
-    }
-    let waited = Int.from(truncating: me | LOCK_WAITERS_BIT)
-    if not word[0].compare_exchange(waited, 0) {
+    let status = lock_give(lock)
+    if status == NOT_HELD {
         panic("sos: Lock.give: the calling thread does not hold the lock")
     }
-    sos_lock_wake(lock)
+    status
 }

@@ -4661,8 +4661,8 @@ arm their own.
   answers `Revoked` and an invalid one is the `BadArg` fault, with no line.
   A wake answers only the waker's own process's threads.
 - **The runtime's lock seams.** Saw's runtime lock seams
-  (`__saw_rt_lock_acquire` and `__saw_rt_lock_release`, which std's
-  channels take) are this lock on the word std gives each lock, with the
+  (`__saw_rt_lock_acquire` and `__saw_rt_lock_release`, which std's channels
+  and `Mutex` take) are this lock on the word std gives each lock, with the
   calling thread's ID, from its block or, on a thread with no block, from
   `THREAD_ID_OP`. They keep these rules:
   - **No re-take.** An acquire that finds the caller's own ID in the word,
@@ -4674,8 +4674,9 @@ arm their own.
   - **A plain wait.** The seam's wait runs with the thread's wait word at 0,
     so the park is plain: it answers only `Ok` or `Revoked`, never `Woken`
     or `TimedOut`, and a wake made meanwhile stays latched for the thread's
-    next wakeable park. The seam writes the word to 0 for its wait and puts
-    back what was there after.
+    next wakeable park. The seam never writes the word: it is 0 whenever a
+    seam runs, since a driving wrapper (§10.1) writes it only around its own
+    op, after the tasks it ran have run.
   - **No give of a lock not held.** A release that finds neither the
     caller's ID nor its ID with the bit panics, naming the lock.
 - **The lock's `sos` side.** `sos.Lock` is one word of its own, taken and
@@ -5668,7 +5669,12 @@ since the wrappers drive (below).
     from its park is latched (§7), so that thread's next wakeable park
     returns early, which a poll is allowed to do.
 - **`lock_acquire` / `lock_release`:** §7's lock, over the word std gives
-  each lock, by the rules §7's "The runtime's lock seams" gives.
+  each lock, built as the take and give `sos.Lock` makes: the same two
+  functions, so the seams and `sos.Lock` cannot differ. The rules of the
+  seams' panics and wait are §7's "The runtime's lock seams". The identity
+  is the thread's ID, from its block, or from `THREAD_ID_OP` on a thread with
+  no block; a panic names the lock by its address. Neither seam drives, and
+  neither makes anything but floor ops and atomics.
 
 **The drive in the typed wrappers.** Each wrapper that parks for a program
 drives the thread's tasks around its op: `Waiter.wait`,
@@ -5870,12 +5876,6 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **The task executor's lock** (§10.1): the runtime's lock seams over §7's
-  lock, by §7's rules for them. `sos.exec`'s seams, the background entries'
-  declarations, the close at a thread's end (§8), the drive in the typed
-  wrappers and `send`'s fallback are built, so a program spawns and runs
-  tasks and a wait runs them, but a channel fails at link, naming
-  `__saw_rt_lock_acquire`.
 - **The thread gate** (§10.1). A `Channel.receive` made in thread context,
   outside any task, and a `TaskGroup(threads:)` reach std's thread gate, the
   `__saw_rt_pthread_*` mutex and condition-variable seams, and a

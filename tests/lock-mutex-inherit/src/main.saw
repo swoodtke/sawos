@@ -1,0 +1,95 @@
+// Inheritance through std's `Mutex` across threads (spec §7, §10.1). The
+// mutex's lock is the runtime's lock seams, so a waiter above its holder
+// raises it, and holds the lock once the holder's window closes. The manifest
+// puts `Low` at level 1, `Normal` at 2 and `High` at 3; the main thread runs
+// at 2, and the image arms no tick, so every switch is one a thread makes.
+//
+// H (`Low`) and G (`Low`) are started in that order and `main` joins G, so
+// they run at level 1 in start order: H takes the mutex and yields inside its
+// window, G exits, and the join wakes `main`, which runs above H. H is ready,
+// at level 1, inside its window. Then `main` starts W (`High`), which runs
+// before the start returns, finds the mutex held and waits for it, raising H
+// to 3. H runs ahead of `main`, which is ready at 2, prints a line and closes
+// its window, which answers W and lowers H; W runs, takes the mutex and
+// prints. Only then does the start return in `main`:
+//
+//   SOS lockmutex: H holds the mutex: true
+//   SOS lockmutex: H runs above the main thread, inside its window: true
+//   SOS lockmutex: W holds the mutex, and H's window closed: true
+//   SOS lockmutex: the main thread after W's start
+//   SOS lockmutex: done
+//
+// Were H not raised, `main` would print its line before H's. Were H's close
+// not to answer W, W would wait for good, and the kernel would report the
+// deadlock.
+
+import sos.{SosStatus, Priority}
+import sosmain
+import std.mutex.{Mutex}
+
+extern "C" {
+    func __saw_rt_thread_yield()
+}
+
+/// The mutex, over the number of windows that have closed.
+static GUARD: Mutex<Int>
+
+/// Whether H is inside its window, which `main` reads without the mutex.
+static H_INSIDE: Atomic<Int> = Atomic(0)
+
+/// The threads' stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_H: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_G: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_W: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_of(base: UnsafePointer<UInt>) unsafe -> UInt {
+    (base as UInt) + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func h_run(arg: UInt) unsafe sync -> UInt {
+    borrow var closed = GUARD.lock() {
+        H_INSIDE.store(1)
+        __saw_rt_thread_yield()
+        print("SOS lockmutex: H runs above the main thread, inside its window: {}",
+              H_INSIDE.load() == 1)
+        H_INSIDE.store(0)
+        closed = closed + 1
+    }
+    0
+}
+
+func g_run(arg: UInt) sync -> UInt {
+    0
+}
+
+func w_run(arg: UInt) unsafe sync -> UInt {
+    borrow var closed = GUARD.lock() {
+        print("SOS lockmutex: W holds the mutex, and H's window closed: {}",
+              closed == 1 && H_INSIDE.load() == 0)
+        closed = closed + 1
+    }
+    0
+}
+
+func main() unsafe -> Result<Void, SosStatus> {
+    let h = try sosmain.context().process().thread_create(
+        run: h_run, arg: 0,
+        stack_top: top_of((&var STACK_H) as UnsafePointer<UInt>))
+    let g = try sosmain.context().process().thread_create(
+        run: g_run, arg: 0,
+        stack_top: top_of((&var STACK_G) as UnsafePointer<UInt>))
+    let w = try sosmain.context().process().thread_create(
+        run: w_run, arg: 0,
+        stack_top: top_of((&var STACK_W) as UnsafePointer<UInt>))
+    try h.start(band: Priority.Low)
+    try g.start(band: Priority.Low)
+    let _ = try g.join()
+    print("SOS lockmutex: H holds the mutex: {}", H_INSIDE.load() == 1)
+    try w.start(band: Priority.High)
+    print("SOS lockmutex: the main thread after W's start")
+    let _ = try w.join()
+    let _ = try h.join()
+    print("SOS lockmutex: done")
+    return
+}

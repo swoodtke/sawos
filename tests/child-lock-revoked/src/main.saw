@@ -1,0 +1,49 @@
+// The lock seams when the holder exits holding the lock (spec §7, §10.1). A
+// thread takes the lock and returns, which ends it with the lock still held.
+// The main thread joins it and takes the lock: the word names the dead
+// holder, the wait answers `Revoked`, and the acquire panics, naming the
+// lock. The kernel's fault line carries the panic's text:
+//
+//   SOS: process fault: the program panicked ... text=panic at exec.saw:...:
+//   sos: the lock at ...: its holder exited holding it
+//
+// An acquire that went on after `Revoked` would wait again and be answered
+// the same for good, and the harness's timeout would end the case.
+
+import sos.{SosStatus}
+import sosmain
+
+extern "C" {
+    func __saw_rt_lock_acquire(state: UnsafePointer<Int>)
+}
+
+/// The lock's word.
+unsafe static var LOCK: Int = 0
+
+/// The holder's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func take() unsafe {
+    __saw_rt_lock_acquire((&var LOCK) as UnsafePointer<Int>)
+}
+
+func holds(arg: UInt) unsafe sync -> UInt {
+    take()
+    0
+}
+
+func main() -> Result<Void, SosStatus> {
+    let holder = try sosmain.context().process().thread_create(
+        run: holds, arg: 0, stack_top: top())
+    try holder.start()
+    let _ = try holder.join()
+    take()
+    print("SOS lockrevoked: this line is never written")
+    return
+}

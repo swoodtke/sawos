@@ -294,6 +294,13 @@ TASK_TWO_THREADS_PKG = os.path.join(TESTS_DIR, "task-two-threads")
 TASK_CROSS_THREAD_WAKE_PKG = os.path.join(TESTS_DIR, "task-cross-thread-wake")
 SLEEP_NS_DIRECT_PKG = os.path.join(TESTS_DIR, "sleep-ns-direct")
 REACTOR_FIRST_POLL_PKG = os.path.join(TESTS_DIR, "reactor-first-poll")
+TASK_CHANNEL_WAKE_PKG = os.path.join(TESTS_DIR, "task-channel-wake")
+LOCK_MUTEX_INHERIT_PKG = os.path.join(TESTS_DIR, "lock-mutex-inherit")
+LOCK_LAUNCH_PKG = os.path.join(TESTS_DIR, "lock-launch")
+CHILD_LOCK_RECURSION_PKG = os.path.join(TESTS_DIR, "child-lock-recursion")
+CHILD_LOCK_RECURSION_BARE_PKG = os.path.join(TESTS_DIR,
+                                             "child-lock-recursion-bare")
+CHILD_LOCK_REVOKED_PKG = os.path.join(TESTS_DIR, "child-lock-revoked")
 TASK_BOUNDED_WAITS_PKG = os.path.join(TESTS_DIR, "task-bounded-waits")
 BOUNDED_SEND_ROOT_PKG = os.path.join(TESTS_DIR, "bounded-send-root")
 BOUNDED_SEND_CHILD_PKG = os.path.join(TESTS_DIR, "bounded-send-child")
@@ -5131,6 +5138,91 @@ TEST_CASES = [
                        "SOS tasktwo: T joined X: 42\n",
                        "SOS tasktwo: T exited with 0\n",
                        "SOS tasktwo: main joined M: 7\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # std's channel between two tasks of one thread: a receive that waits
+        # is answered by a send, through the runtime's lock seams.
+        # `tests/task-channel-wake` says how.
+        "name": "task_channel_wake",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_CHANNEL_WAKE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS taskchan: the receive that waited got 7\n",
+                       "SOS taskchan: a second send and receive: 8\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # std's Mutex between three threads: a waiter above the holder, which
+        # is inside its window, raises it through the lock seams, and holds
+        # the mutex once the window closes. `tests/lock-mutex-inherit` says
+        # how the raise is made by construction.
+        "name": "lockseam_mutex_inherit",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_MUTEX_INHERIT_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS lockmutex: H holds the mutex: true\n",
+            "SOS lockmutex: H runs above the main thread, inside its "
+            "window: true\n",
+            "SOS lockmutex: W holds the mutex, and H's window closed: "
+            "true\n",
+            "SOS lockmutex: the main thread after W's start\n",
+            "SOS lockmutex: done\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A thread with a block takes the lock it holds: the acquire panics,
+        # naming the lock. `tests/child-lock-recursion` says how.
+        "name": "lockseam_recursion",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_LAUNCH_PKG,
+        "children": [CHILD_LOCK_RECURSION_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       *_panic_fault("{one}", "panic at exec.saw:",
+                                     ": sos: the lock at ",
+                                     " is held by the calling thread, which "
+                                     "cannot take it again"),
+                       f"SOS heaplaunch: lock ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same on a thread with no block. `tests/child-lock-recursion-bare`
+        # says how.
+        "name": "lockseam_recursion_bare",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_LAUNCH_PKG,
+        "children": [CHILD_LOCK_RECURSION_BARE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       *_panic_fault("{one}", "panic at exec.saw:",
+                                     ": sos: the lock at ",
+                                     " is held by the calling thread, which "
+                                     "cannot take it again"),
+                       f"SOS heaplaunch: lock ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The lock's holder exits holding it, and a waiter's wait answers
+        # `Revoked`: the acquire panics, naming the lock.
+        # `tests/child-lock-revoked` says how.
+        "name": "lockseam_revoked",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_LAUNCH_PKG,
+        "children": [CHILD_LOCK_REVOKED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       *_panic_fault("{one}", "panic at exec.saw:",
+                                     ": sos: the lock at ",
+                                     ": its holder exited holding it"),
+                       f"SOS heaplaunch: lock ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
         "expect_clean_exit": True,
     },
     {
@@ -26356,6 +26448,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "task_cross_thread_wake", "sleep_ns_direct",
                      "reactor_first_poll", "task_bounded_waits",
                      "bounded_send_table_full", "bounded_send_room",
+                     "task_channel_wake", "lockseam_mutex_inherit",
+                     "lockseam_recursion", "lockseam_recursion_bare",
+                     "lockseam_revoked",
                      *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES],
                      "death_record", "console_claim", "pipe_taken"]
     by_name = {c["name"]: c for c in TEST_CASES}

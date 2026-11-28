@@ -20,11 +20,13 @@
 //! this module keeps.
 
 import sosabi.{SosStatus, ClockType, ClockRight, SystemRight, HandleInfo,
+               LOCK_WAITERS_BIT,
                HandleKind, NO_HANDLE}
 import sos.floor.{SYSTEM_HANDLE, checked, background_close, background_drive,
                   sos_handle_info,
                   sos_handle_release, sos_system_clock_get, sos_clock_now,
-                  sos_wait_word, sos_thread_wake, sos_park, sos_thread_id}
+                  sos_wait_word, sos_thread_wake, sos_park, sos_thread_id,
+                  sos_lock_wait, sos_lock_wake}
 
 // The calling thread's own word: the thread register, read and written by the
 // user HAL (`hal/<arch>/user/syscall.c`). The kernel keeps it per thread and
@@ -679,5 +681,114 @@ func rt_reactor_wake(r: Int) unsafe {
             let _ = sos_thread_wake(UInt.from(truncating: rec[R_ID].load()))
         }
         at = UInt.from(truncating: rec[R_NEXT].load())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The word locks
+// -----------------------------------------------------------------------------
+//
+// A lock is one word (spec §7): 0 while free, else the holder's thread ID,
+// with the waiters bit the kernel sets once a thread waits. `sos.Lock` and
+// std's lock seams take and give it through the two functions below.
+
+/// The calling thread's ID (spec §7): the one its block keeps, read at the
+/// thread's start, or for a thread with no block, the kernel's answer now.
+public(package) func own_thread_id() unsafe -> UInt {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        return sos_thread_id()
+    }
+    block[0].id
+}
+
+/// What `lock_give` answers for a lock the caller does not hold: no status
+/// word is this large.
+public(package) static NOT_HELD: UInt = UInt.max
+
+/// Take the lock whose word is at `lock`: swap the word from 0 to the
+/// caller's ID, and while another thread holds it, wait in the kernel
+/// (`sos_lock_wait`), which sets the waiters bit and raises the holder, then
+/// swap again. Answers `SosStatus.Ok` once the caller holds it, and the
+/// kernel's refusal otherwise: `Revoked` for a holder that exited, and on a
+/// wakeable wait word `Woken` or `TimedOut`. A lock the caller holds ends the
+/// process. The wait word is left as the thread has it.
+public(package) func lock_take(lock: UInt) unsafe -> UInt {
+    let word = lock as UnsafePointer<Atomic<Int>>
+    let me = Int.from(truncating: own_thread_id())
+    while not word[0].compare_exchange(0, me) {
+        let status = sos_lock_wait(lock)
+        if status != (SosStatus.Ok as UInt) {
+            return status
+        }
+    }
+    SosStatus.Ok as UInt
+}
+
+/// Give back the lock whose word is at `lock`: swap the word from the
+/// caller's ID to 0 with no trap, or, when the kernel has set the waiters
+/// bit, from the caller's ID with the bit to 0 and then trap once to answer
+/// the waiters (`sos_lock_wake`). Answers the wake's status, or `NOT_HELD`
+/// when the caller does not hold the lock, which the caller reports in its
+/// own words.
+///
+/// Only the kernel sets the bit, and only in a word naming the holder, so a
+/// first swap that fails leaves the word either the caller's ID with the bit
+/// or another thread's.
+public(package) func lock_give(lock: UInt) unsafe -> UInt {
+    let word = lock as UnsafePointer<Atomic<Int>>
+    let me = own_thread_id()
+    if word[0].compare_exchange(Int.from(truncating: me), 0) {
+        return SosStatus.Ok as UInt
+    }
+    let waited = Int.from(truncating: me | LOCK_WAITERS_BIT)
+    if not word[0].compare_exchange(waited, 0) {
+        return NOT_HELD
+    }
+    sos_lock_wake(lock)
+}
+
+/// std's lock seam: take the one-word lock at `state` (spec §7).
+///
+/// A thread that finds its own ID in the word panics, naming the lock, before
+/// it waits, whether it has a block or not. A wait that answers `Revoked`,
+/// the holder having exited holding the lock, panics too, as does any other
+/// refusal. The wait is made with the wait word as the thread left it, 0
+/// outside a driving wrapper, so the park is plain.
+@export("__saw_rt_lock_acquire")
+func rt_lock_acquire(state: UnsafePointer<Int>) unsafe {
+    let lock = state as UInt
+    let word = lock as UnsafePointer<Atomic<Int>>
+    let holder = UInt.from(truncating: word[0].load()) & ~LOCK_WAITERS_BIT
+    if holder == own_thread_id() {
+        panic("sos: the lock at {} is held by the calling thread, which cannot take it again",
+              lock)
+    }
+    let status = lock_take(lock)
+    if status == (SosStatus.Ok as UInt) {
+        return
+    }
+    if status == (SosStatus.Revoked as UInt) {
+        panic("sos: the lock at {}: its holder exited holding it", lock)
+    }
+    try checked(status) catch {
+        panic("sos: the lock at {}: the wait answered {}", lock, error)
+    }
+    panic("sos: the lock at {}: the wait answered Ok", lock)
+}
+
+/// std's lock seam: give the one-word lock at `state` back, answering the
+/// threads waiting for it. A thread that does not hold it panics, naming the
+/// lock.
+@export("__saw_rt_lock_release")
+func rt_lock_release(state: UnsafePointer<Int>) unsafe {
+    let status = lock_give(state as UInt)
+    if status == NOT_HELD {
+        panic("sos: the lock at {} is not held by the calling thread",
+              state as UInt)
+    }
+    try checked(status) catch {
+        panic("sos: the lock at {}: the wake answered {}", state as UInt,
+              error)
     }
 }

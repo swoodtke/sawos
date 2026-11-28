@@ -1,0 +1,37 @@
+// A std channel between two tasks of one thread (spec §10.1, §7). std's
+// channel takes the runtime's lock seams at each send and receive, so
+// the case shows the lock seams exist and work: a program that uses a channel
+// fails at link without them.
+//
+// `main` spawns the receiver first and the sender second, and joins the
+// receiver, which parks `main`'s thread and drives its tasks in spawn order:
+// the receiver finds the channel empty and waits, then the sender sends, which
+// answers the receiver's wait:
+//
+//   SOS taskchan: the receive that waited got 7
+//   SOS taskchan: a second send and receive: 8
+//
+// The second line is a send before its receive, so the lock is taken and
+// given back again after the first pair. A lock a send or a receive left
+// held would panic at the next take, naming the lock.
+
+import sosmain
+import std.channel.{Channel}
+
+func receive_one(ch: Channel<Int>) -> Int {
+    try! ch.receive()
+}
+
+func send_one(ch: Channel<Int>, value: Int) {
+    try! ch.send(value)
+}
+
+func main() {
+    let ch = try! Channel<Int>()
+    let receiver = Task.spawn(receive_one(ch))
+    let sender = Task.spawn(send_one(ch, 7))
+    print("SOS taskchan: the receive that waited got {}", receiver.join())
+    sender.join()
+    try! ch.send(8)
+    print("SOS taskchan: a second send and receive: {}", try! ch.receive())
+}
