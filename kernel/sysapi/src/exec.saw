@@ -1,0 +1,595 @@
+//! The task executor's seams, process side (spec §10.1).
+//!
+//! Saw's cooperative executor lives in std, and reaches the machine through
+//! the "freestanding executor set" of sawlang's runtime/ABI.md: the thread's
+//! executor word, the monotonic clock, a sleep, and a reactor to poll and
+//! wake. This module writes those eight bodies over the kernel's wait word
+//! (spec §7): a thread parks with `PARK_OP` until its word's deadline or a
+//! wake, and another thread ends that park with `THREAD_WAKE_OP`. Each body
+//! makes floor ops, atomics and calls to the runtime's allocator, and nothing
+//! else: no seam runs program code, so none calls a typed wrapper, and none
+//! drives or closes the thread's tasks.
+//!
+//! It also keeps a thread's block, which the thread register names: the
+//! thread's own Thread handle, its ID, the executor word, its runtime record
+//! and its wait word. `sos.rt` makes the blocks, and re-exports
+//! `ThreadBlock` and `enter_thread_block` for a start-up to make its own.
+//!
+//! It sits directly above the floor, because the wrappers that park drive the
+//! thread's tasks around their wait, and each of them writes the wait word
+//! this module keeps.
+
+import sosabi.{SosStatus, ClockType, ClockRight, SystemRight, HandleInfo,
+               HandleKind, NO_HANDLE}
+import sos.floor.{SYSTEM_HANDLE, checked, background_close, sos_handle_info,
+                  sos_handle_release, sos_system_clock_get, sos_clock_now,
+                  sos_wait_word, sos_thread_wake, sos_park, sos_thread_id}
+
+// The calling thread's own word: the thread register, read and written by the
+// user HAL (`hal/<arch>/user/syscall.c`). The kernel keeps it per thread and
+// starts every thread with it zero.
+//
+// Its low bit says what it holds. Zero is nothing yet. An odd word is a
+// number the lock-owner hook in `sos.rt` handed out. An even word that is not
+// zero is the address of the thread's block (`ThreadBlock`), which the thread
+// wrote before it took its first lock. A thread's word is written once and
+// never changes after, so a lock never sees its holder's identity change. A
+// program that writes the register itself breaks all of this.
+//
+// The runtime's allocator is `sosrt`'s seam, reached by its C name because
+// the body is module-private there.
+extern "C" {
+    func sos_thread_word() -> UInt
+    func sos_set_thread_word(word: UInt)
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+}
+
+/// The calling thread's word, as `sos.rt`'s hooks read it.
+public(package) func thread_word() unsafe -> UInt {
+    sos_thread_word()
+}
+
+/// Write the calling thread's word: `sos.rt`'s lock-owner hook gives a thread
+/// with no block its number this way.
+public(package) func set_thread_word(word: UInt) unsafe {
+    sos_set_thread_word(word)
+}
+
+// -----------------------------------------------------------------------------
+// The thread's block
+// -----------------------------------------------------------------------------
+
+/// A thread's block: the per-thread place its thread register names.
+///
+///   - `thread`: the thread's own Thread handle, through which a section's
+///     last leave yields;
+///   - `id`: its ID, which it takes locks and is woken with;
+///   - `executor`: the word std keeps the address of the thread's executor
+///     record in;
+///   - `record`: the address of its runtime record, once it has one, with
+///     `CLOCKED` set once its wait word is registered with the process's
+///     Clock;
+///   - `wait`: its wait word, which the kernel reads at each park.
+///
+/// The block lives for its thread's life wherever the thread put it: the main
+/// thread's in `sosmain`'s start-up frame, and a `thread_create(run:)`
+/// thread's at the head of its start record, at the top of its stack. Its
+/// address is word-aligned and nonzero, so it serves as the thread's
+/// lock-owner identity as it is, and its wait word is eight-aligned because
+/// the block is.
+public struct ThreadBlock {
+    public(package) thread: UInt,
+    public(package) id: UInt,
+    public(package) executor: UInt,
+    public(package) record: UInt,
+    public(package) wait: UInt64,
+}
+
+extension ThreadBlock {
+    /// A block holding no handle yet. `enter_thread_block` writes the rest.
+    public init() -> ThreadBlock {
+        ThreadBlock(thread: NO_HANDLE, id: 0, executor: 0, record: 0, wait: 0)
+    }
+
+    /// A block holding `thread`, for a start record.
+    public(package) init(thread: UInt) -> ThreadBlock {
+        ThreadBlock(thread: thread, id: 0, executor: 0, record: 0, wait: 0)
+    }
+}
+
+/// The bit of a block's `record` word that says its wait word is registered
+/// with the process's Clock. A record is word-aligned, so the bit is free.
+static CLOCKED: UInt = 1
+
+/// A wait word that names no instant and parks wakeable (spec §7).
+static NEVER_NS: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// Make `block` the calling thread's block: write the thread's ID into it,
+/// register its wait word, and write its address into the thread register.
+///
+/// It is made once per thread, before the thread takes its first lock, so the
+/// thread's lock-owner identity is the block's address from the start, and
+/// its ID is read once; and `block` stays where it is for the rest of the
+/// thread's life. The wait word is registered with the process's Clock when
+/// the runtime holds it by then, and with none otherwise, so a program that
+/// never runs a task needs no `ClockGet`: a word registered with none still
+/// serves the unbounded and the wakeable-forever parks, and the thread
+/// registers again, with the Clock, before it writes a finite deadline.
+public func enter_thread_block(block: UnsafePointer<ThreadBlock>) unsafe {
+    block[0].id = sos_thread_id()
+    block[0].executor = 0
+    block[0].record = 0
+    block[0].wait = 0
+    let clock = UInt.from(truncating: CLOCK.load())
+    register_word(block, clock)
+    if clock != NO_HANDLE {
+        block[0].record = CLOCKED
+    }
+    sos_set_thread_word(block as UInt)
+}
+
+/// The calling thread's block, or a null pointer for a thread with none.
+public(package) func own_block() unsafe -> UnsafePointer<ThreadBlock> {
+    let word = sos_thread_word()
+    let at = if (word & 1) != 0 { 0 } else { word }
+    at as UnsafePointer<ThreadBlock>
+}
+
+/// Register the wait word of `block` with `clock`, a Clock handle or
+/// `NO_HANDLE`. The word is the block's own memory and the Clock was read
+/// before it was kept, so the kernel answers `Ok` or ends the process.
+func register_word(block: UnsafePointer<ThreadBlock>, clock: UInt) unsafe {
+    let word = ((&block[0].wait) as UnsafePointer<UInt64>) as UInt
+    try checked(sos_wait_word(word, clock)) catch {
+        panic("sos: the wait word's registration was refused: {}", error)
+    }
+}
+
+/// Register the wait word of `block` with the process's Clock, getting the
+/// Clock first when the process holds none, unless it is registered with it
+/// already. It is made before the thread writes a finite word, so the kernel
+/// never meets a deadline from a thread registered with no Clock.
+func clock_the_word(block: UnsafePointer<ThreadBlock>) unsafe {
+    if (block[0].record & CLOCKED) != 0 {
+        return
+    }
+    register_word(block, process_clock())
+    block[0].record = block[0].record | CLOCKED
+}
+
+// -----------------------------------------------------------------------------
+// The process-wide state
+// -----------------------------------------------------------------------------
+
+/// The process's Monotonic Clock handle, or `NO_HANDLE` until the runtime
+/// first needs one.
+static CLOCK: Atomic<Int> = Atomic(0)
+
+/// The reactor's wake generation: `reactor_wake` moves it, and a poll that
+/// finds it moved since it last looked returns at once. `reactor_create`
+/// hands out its address.
+static REACTOR: Atomic<Int> = Atomic(0)
+
+/// The first runtime record, or 0. The list only grows.
+static RECORDS: Atomic<Int> = Atomic(0)
+
+/// The process's Clock, got with `ClockGet` the first time it is asked for
+/// and published by compare-and-swap; a thread that loses the race releases
+/// its spare.
+///
+/// Before asking, it reads the parked System handle's kind and rights
+/// (`INFO_OP`, which no right gates), and panics naming `ClockGet` when the
+/// handle is no System holding it; it reads the minted Clock's rights the
+/// same way, and panics naming `Read` when a narrowed ceiling left it out. A
+/// refused `ClockGet` (the quota, a full table) panics naming the refusal.
+public(package) func process_clock() unsafe -> UInt {
+    let held = CLOCK.load()
+    if held != 0 {
+        return UInt.from(truncating: held)
+    }
+    let system = SYSTEM_HANDLE
+    let named = if system == NO_HANDLE { 0 } else {
+        info(system, HandleInfo.Kind)
+    }
+    if system == NO_HANDLE || named != (HandleKind.System as UInt) {
+        panic("sos: the task executor reads the time, and this process holds no System to ask with SystemRight.ClockGet")
+    }
+    if (info(system, HandleInfo.Rights) & (SystemRight.ClockGet as UInt)) == 0 {
+        panic("sos: the task executor reads the time, and the System handle lacks SystemRight.ClockGet")
+    }
+    var minted: UInt = NO_HANDLE
+    let got = sos_system_clock_get(system, ClockType.Monotonic as UInt,
+                                   (&var minted) as UnsafePointer<UInt>)
+    try checked(got) catch {
+        panic("sos: the task executor's ClockGet was refused: {}", error)
+    }
+    if (info(minted, HandleInfo.Rights) & (ClockRight.Read as UInt)) == 0 {
+        panic("sos: the task executor's Clock lacks ClockRight.Read")
+    }
+    if CLOCK.compare_exchange(0, Int.from(truncating: minted)) {
+        return minted
+    }
+    let _ = sos_handle_release(minted)
+    UInt.from(truncating: CLOCK.load())
+}
+
+/// What `INFO_OP` answers for `handle` and `selector`.
+func info(handle: UInt, selector: HandleInfo) unsafe -> UInt {
+    var value: UInt = 0
+    let _ = sos_handle_info(handle, selector as UInt,
+                            (&var value) as UnsafePointer<UInt>)
+    value
+}
+
+/// The Monotonic clock's reading through `clock`, in nanoseconds: one trap.
+func read_clock(clock: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    try checked(sos_clock_now(clock, (&var rec) as UnsafePointer<UInt64>,
+                              8)) catch {
+        panic("sos: the task executor's clock read was refused: {}", error)
+    }
+    rec[0]
+}
+
+/// `now` plus `ns`, or `NEVER_NS` when the sum would pass it: no clock
+/// reaches that instant.
+func deadline_after(now: UInt64, ns: UInt64) -> UInt64 {
+    if ns >= NEVER_NS - now {
+        return NEVER_NS
+    }
+    now + ns
+}
+
+// -----------------------------------------------------------------------------
+// The runtime records
+// -----------------------------------------------------------------------------
+//
+// A record is a few words a thread with a block takes the first time it
+// parks through the runtime, keeps the address of in its block, and gives
+// back at its close. Records live on a process-wide list that only grows: a
+// thread takes a free one, or makes one with the runtime's allocator. A
+// record is never freed, so a stale address another thread holds always
+// lands in a valid record; at worst it wakes the record's next owner, which a
+// poll allows.
+
+/// The words of a record, each an `Atomic<Int>`.
+static R_NEXT: Int = 0
+/// Nonzero while a thread holds the record.
+static R_CLAIMED: Int = 1
+/// The holder's thread ID.
+static R_ID: Int = 2
+/// Nonzero while the holder is in a park a reactor wake should end.
+static R_PARKED: Int = 3
+/// The wake generation the holder last saw.
+static R_SEEN: Int = 4
+static RECORD_WORDS: Int = 5
+
+func words(record: UInt) unsafe -> UnsafePointer<Atomic<Int>> {
+    record as UnsafePointer<Atomic<Int>>
+}
+
+/// The record of the thread whose block is `block`, taken now if it holds
+/// none.
+func own_record(block: UnsafePointer<ThreadBlock>) unsafe -> UInt {
+    let held = block[0].record & ~CLOCKED
+    if held != 0 {
+        return held
+    }
+    let record = take_record(block[0].id)
+    block[0].record = record | (block[0].record & CLOCKED)
+    record
+}
+
+/// A free record, or a fresh one added to the list, claimed for the thread
+/// `id` (`claim`).
+func take_record(id: UInt) unsafe -> UInt {
+    var at = UInt.from(truncating: RECORDS.load())
+    while at != 0 {
+        let rec = words(at)
+        if rec[R_CLAIMED].compare_exchange(0, 1) {
+            claim(rec, id)
+            return at
+        }
+        at = UInt.from(truncating: rec[R_NEXT].load())
+    }
+    let size = RECORD_WORDS * sizeof<Int>()
+    guard let block = __saw_rt_alloc(size, sizeof<Int>()) else {
+        panic("sos: no memory for a thread's runtime record")
+    }
+    let fresh = block as UInt
+    let rec = words(fresh)
+    rec[R_CLAIMED].store(1)
+    claim(rec, id)
+    while true {
+        let head = RECORDS.load()
+        rec[R_NEXT].store(head)
+        if RECORDS.compare_exchange(head, Int.from(truncating: fresh)) {
+            break
+        }
+    }
+    fresh
+}
+
+/// Write the holder's ID into a claimed record, clear `parked`, and mark the
+/// generation unseen, so the holder's first poll answers at once: a wake made
+/// before the claim, while the thread held no record or the record had
+/// another owner, then reaches it, which an early answer is allowed to cost.
+func claim(rec: UnsafePointer<Atomic<Int>>, id: UInt) unsafe {
+    rec[R_ID].store(Int.from(truncating: id))
+    rec[R_PARKED].store(0)
+    rec[R_SEEN].store(REACTOR.load() &- 1)
+}
+
+/// Close the calling thread's tasks as the thread ends, and give its runtime
+/// record back (spec §8).
+///
+/// It cancels every task the thread's background group still holds, then
+/// joins them, which runs their code to their ends; it does nothing on a
+/// thread that never spawned. `sosmain` calls it after `main` returns, and
+/// `thread_create(run:)` after `run` returns. A program that exports its own
+/// `_start` calls it as each thread's last Saw code; a thread that ends
+/// without it abandons its tasks. Called inside a task's turn it panics, since
+/// the tasks are then on the thread's stack.
+public func end_thread_tasks() {
+    background_close()
+    give_record_back()
+}
+
+func give_record_back() unsafe {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        return
+    }
+    let record = block[0].record & ~CLOCKED
+    if record == 0 {
+        return
+    }
+    block[0].record = block[0].record & CLOCKED
+    words(record)[R_CLAIMED].store(0)
+}
+
+// -----------------------------------------------------------------------------
+// The counts
+// -----------------------------------------------------------------------------
+//
+// Each only grows, from the process's start, and a stalled host cannot lower
+// one, so a test may wait for one to move.
+
+static PARKS: Atomic<Int> = Atomic(0)
+static PARKS_WOKEN: Atomic<Int> = Atomic(0)
+static SEND_FALLBACKS: Atomic<Int> = Atomic(0)
+
+/// How many bare parks (`PARK_OP`) the runtime has entered: one is counted
+/// just before its trap, so a thread that reads it moved knows another is
+/// parked, or past its park.
+@export("sos_exec_parked_parks")
+public func exec_parked_parks() -> Int {
+    PARKS.load()
+}
+
+/// How many of those parks a wake ended (`Woken`).
+@export("sos_exec_parks_woken")
+public func exec_parks_woken() -> Int {
+    PARKS_WOKEN.load()
+}
+
+/// How many bounded sends found no row for their claim and went out as a
+/// plain `Call` instead, losing only their bound (spec §10.1).
+@export("sos_exec_send_fallbacks")
+public func exec_send_fallbacks() -> Int {
+    SEND_FALLBACKS.load()
+}
+
+/// Count one send that fell back to a plain `Call`.
+public(package) func count_send_fallback() {
+    let _ = SEND_FALLBACKS.fetch_add(1)
+}
+
+/// Make one bare park, counted, and answer its status word: `TimedOut` or
+/// `Woken`.
+func counted_park() unsafe -> UInt {
+    let _ = PARKS.fetch_add(1)
+    let answer = sos_park()
+    if answer == (SosStatus.Woken as UInt) {
+        let _ = PARKS_WOKEN.fetch_add(1)
+        return answer
+    }
+    if answer != (SosStatus.TimedOut as UInt) {
+        try checked(answer) catch {
+            panic("sos: the task executor's park answered {}", error)
+        }
+        panic("sos: the task executor's park answered Ok")
+    }
+    answer
+}
+
+// -----------------------------------------------------------------------------
+// The seams
+// -----------------------------------------------------------------------------
+//
+// Each signature is checked against sawlang's runtime/ABI.md when the image
+// compiles. A seam is never called from an interrupt handler: SOS has none in
+// user mode.
+
+/// The calling thread's executor word, or 0 on a thread with no block.
+@export("__saw_rt_thread_executor")
+func rt_thread_executor() unsafe -> Int {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        return 0
+    }
+    Int.from(truncating: block[0].executor)
+}
+
+/// Keep `record` as the calling thread's executor word. A thread with no
+/// block has nowhere to keep it, and panics, naming the fix: std asks only
+/// when the thread spawns its first task.
+@export("__saw_rt_set_thread_executor")
+func rt_set_thread_executor(record: Int) unsafe -> Int {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        panic("sos: this thread has no block; a thread that runs tasks enters one with sos.rt.enter_thread_block before it spawns")
+    }
+    block[0].executor = UInt.from(truncating: record)
+    0
+}
+
+/// The Monotonic clock's reading, in nanoseconds: `ClockOp.Now` on the
+/// process's Clock, one trap once the process holds it.
+@export("__saw_rt_clock_monotonic_nanos")
+func rt_clock_monotonic_nanos() unsafe -> Int64 {
+    Int64.from(truncating: read_clock(process_clock()))
+}
+
+/// Park the calling thread until `ns` nanoseconds have passed on the
+/// Monotonic clock; zero returns at once.
+///
+/// The thread sets `parked` and writes the deadline, the clock's reading plus
+/// `ns`, saturating, to its wait word, and parks on nothing until the park
+/// answers `TimedOut`. A `Woken` answer is a reactor wake: nothing cuts the
+/// sleep short, so the thread parks again with the same deadline, and marks
+/// the generation unseen, so its next poll returns at once and the wake is
+/// not lost. A thread with no block registers a word on its own stack for the
+/// sleep, and unregisters it after; it has no other word to overwrite.
+@export("__saw_rt_sleep_ns")
+func rt_sleep_ns(ns: UInt64) unsafe {
+    if ns == 0 {
+        return
+    }
+    let block = own_block()
+    if (block as UInt) == 0 {
+        sleep_with_no_block(ns)
+        return
+    }
+    let rec = words(own_record(block))
+    clock_the_word(block)
+    let deadline = deadline_after(read_clock(process_clock()), ns)
+    rec[R_PARKED].store(1)
+    block[0].wait = deadline
+    while counted_park() == (SosStatus.Woken as UInt) {
+        rec[R_SEEN].store(REACTOR.load() &- 1)
+    }
+    block[0].wait = 0
+    rec[R_PARKED].store(0)
+}
+
+/// `rt_sleep_ns` on a thread with no block. Only a wake made by its ID can
+/// end such a park early, and the sleep parks again.
+func sleep_with_no_block(ns: UInt64) unsafe {
+    let clock = process_clock()
+    var word: [UInt64; 1] = [deadline_after(read_clock(clock), ns); 1]
+    let at = ((&var word) as UnsafePointer<UInt64>) as UInt
+    try checked(sos_wait_word(at, clock)) catch {
+        panic("sos: the sleep's wait word was refused: {}", error)
+    }
+    while counted_park() == (SosStatus.Woken as UInt) {
+    }
+    try checked(sos_wait_word(0, NO_HANDLE)) catch {
+        panic("sos: the sleep's wait word was not given back: {}", error)
+    }
+}
+
+/// Make the process's reactor: the address of its wake generation, which
+/// already exists. It makes nothing and cannot fail.
+@export("__saw_rt_reactor_create")
+func rt_reactor_create(r_out: UnsafePointer<Int>) unsafe -> Int {
+    r_out[0] = Int.from(truncating: ((&REACTOR) as UnsafePointer<Atomic<Int>>) as UInt)
+    0
+}
+
+/// Nothing: the reactor is a static.
+@export("__saw_rt_reactor_destroy")
+func rt_reactor_destroy(r: Int) {
+}
+
+/// Wait for a reactor wake, up to `timeout_ms` milliseconds, forever when it
+/// is negative. Stores 1 through `count_out` for a wake and 0 for a timeout,
+/// and answers 0.
+///
+///   1. A generation moved since the thread last looked answers at once.
+///   2. A timeout of 0 answers no wake, with no trap: the drive's poll.
+///   3. The thread sets `parked`, then reads the generation again, and
+///      answers at once if it moved: the two make a Dekker pair with
+///      `reactor_wake`, which moves the generation and then reads `parked`,
+///      so at least one sees the other.
+///   4. It writes its wait word, the deadline or `NEVER_NS`, parks on
+///      nothing, and clears the word and `parked`.
+///   5. It marks the generation seen as it then stands, and answers 1 when
+///      the park ended `Woken` or the generation moved since step 1: a wake
+///      whose waker read `parked` after the clear made no trap and left no
+///      latch, and is counted all the same.
+///
+/// A wake that lands as the thread leaves its park is latched by the kernel,
+/// so its next wakeable park returns early, which a poll may do.
+@export("__saw_rt_reactor_poll")
+func rt_reactor_poll(r: Int, timeout_ms: Int,
+                     count_out: UnsafePointer<Int>) unsafe -> Int {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        panic("sos: this thread has no block; a thread that runs tasks enters one with sos.rt.enter_thread_block before it spawns")
+    }
+    let rec = words(own_record(block))
+    let seen = rec[R_SEEN].load()
+    let gen = REACTOR.load()
+    if gen != seen {
+        rec[R_SEEN].store(gen)
+        count_out[0] = 1
+        return 0
+    }
+    if timeout_ms == 0 {
+        count_out[0] = 0
+        return 0
+    }
+    rec[R_PARKED].store(1)
+    let moved = REACTOR.load()
+    if moved != seen {
+        rec[R_PARKED].store(0)
+        rec[R_SEEN].store(moved)
+        count_out[0] = 1
+        return 0
+    }
+    var deadline = NEVER_NS
+    if timeout_ms > 0 {
+        clock_the_word(block)
+        let ms = UInt64.from(truncating: timeout_ms)
+        deadline = deadline_after(read_clock(process_clock()),
+                                  millis_in_nanos(ms))
+    }
+    block[0].wait = deadline
+    let answer = counted_park()
+    block[0].wait = 0
+    rec[R_PARKED].store(0)
+    let after = REACTOR.load()
+    rec[R_SEEN].store(after)
+    let woken = answer == (SosStatus.Woken as UInt) || after != seen
+    count_out[0] = if woken { 1 } else { 0 }
+    0
+}
+
+static NANOS_PER_MILLI: UInt64 = 1_000_000
+
+/// `ms` milliseconds in nanoseconds, or `NEVER_NS` past it.
+func millis_in_nanos(ms: UInt64) -> UInt64 {
+    if ms > NEVER_NS / NANOS_PER_MILLI {
+        return NEVER_NS
+    }
+    ms * NANOS_PER_MILLI
+}
+
+/// Wake every thread waiting in the reactor: move the generation, then make
+/// `THREAD_WAKE_OP` with the ID of every record whose holder is parked, one
+/// trap each. A `Revoked` answer is a thread that has gone, and is passed
+/// over. Any thread may call it, one with no block included, since it touches
+/// no record of its own.
+@export("__saw_rt_reactor_wake")
+func rt_reactor_wake(r: Int) unsafe {
+    let _ = REACTOR.fetch_add(1)
+    var at = UInt.from(truncating: RECORDS.load())
+    while at != 0 {
+        let rec = words(at)
+        if rec[R_PARKED].load() != 0 {
+            let _ = sos_thread_wake(UInt.from(truncating: rec[R_ID].load()))
+        }
+        at = UInt.from(truncating: rec[R_NEXT].load())
+    }
+}

@@ -1,0 +1,46 @@
+// The close at a thread's end (spec §8, §10.1). A `thread_create(run:)`
+// thread spawns a task, detaches it and returns at once; the task runs until
+// it is cancelled. Nothing on the thread drives its tasks, so the task's only
+// turn is inside the close the runtime makes after `run` returns, which
+// cancels the task and then joins it. `main` joins the thread after:
+//
+//   SOS taskclose: the task saw its cancel
+//   SOS taskclose: the thread joined with 5
+//
+// Without the close, the thread exits with the task never run, and only the
+// second line is printed.
+
+import sos.{SosStatus}
+import std.task.{yield_now}
+import sosmain
+
+/// The thread's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func until_cancelled() {
+    while not cancelled() {
+        yield_now()
+    }
+    print("SOS taskclose: the task saw its cancel")
+}
+
+func spawner(arg: UInt) sync -> UInt {
+    let task = Task.spawn(until_cancelled())
+    task.detach()
+    arg
+}
+
+func main() -> Result<Void, SosStatus> {
+    let thread = try sosmain.context().process().thread_create(
+        run: spawner, arg: 5, stack_top: top())
+    try thread.start()
+    let code = try thread.join()
+    print("SOS taskclose: the thread joined with {}", code)
+    return
+}

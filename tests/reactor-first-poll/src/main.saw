@@ -1,0 +1,87 @@
+// A reactor wake made before a thread holds a runtime record is not lost: the
+// thread's first poll, with no deadline, answers it at once (spec §10.1). A
+// thread takes its record at its first poll or sleep, so a wake made before
+// then moved the generation while no record of its could see it.
+//
+//   1. Thread T polls once with a zero timeout, which takes the first record
+//      there is, and returns; its close gives the record back.
+//   2. `main`, which holds no record yet, wakes the reactor and then polls:
+//      it takes T's record, the only one, given back.
+//   3. Thread U wakes the reactor and then polls: `main` holds the one
+//      record, so U makes a fresh one.
+//
+//   SOS firstpoll: T took a record and gave it back
+//   SOS firstpoll: a reused record's first poll found the wake: 1
+//   SOS firstpoll: a fresh record's first poll found the wake: 1
+//   SOS firstpoll: U exited with 0
+//
+// Each poll that missed its wake would park with nothing left to wake it, and
+// the kernel would report the deadlock. The image arms no tick, and each
+// thread is joined before the next step.
+
+import sos.{SosStatus}
+import sosmain
+
+extern "C" {
+    func __saw_rt_reactor_create(r_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_poll(r: Int, timeout_ms: Int,
+                               count_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_wake(r: Int)
+}
+
+/// The threads' stack, used by one thread at a time. A thread that prints
+/// wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func reactor() unsafe -> Int {
+    var r = 0
+    let _ = __saw_rt_reactor_create((&var r) as UnsafePointer<Int>)
+    r
+}
+
+/// Poll the reactor for up to `ms` milliseconds, forever when negative, and
+/// answer the count it stores.
+func poll_for(ms: Int) unsafe -> Int {
+    var count = 0
+    let _ = __saw_rt_reactor_poll(reactor(), ms,
+                                  (&var count) as UnsafePointer<Int>)
+    count
+}
+
+func t_run(arg: UInt) unsafe sync -> UInt {
+    let _ = poll_for(0)
+    arg
+}
+
+func u_run(arg: UInt) unsafe sync -> UInt {
+    __saw_rt_reactor_wake(reactor())
+    print("SOS firstpoll: a fresh record's first poll found the wake: {}",
+          poll_for(-1))
+    arg
+}
+
+/// Make a thread that runs `run`, start it and join it, answering its exit
+/// code.
+func run_thread(run: FuncPointer<(UInt) sync -> UInt>) -> Result<UInt, SosStatus> {
+    let thread = try sosmain.context().process().thread_create(
+        run: run, arg: 0, stack_top: top())
+    try thread.start()
+    thread.join()
+}
+
+func main() -> Result<Void, SosStatus> {
+    let _ = try run_thread(t_run)
+    print("SOS firstpoll: T took a record and gave it back")
+    __saw_rt_reactor_wake(reactor())
+    print("SOS firstpoll: a reused record's first poll found the wake: {}",
+          poll_for(-1))
+    let code = try run_thread(u_run)
+    print("SOS firstpoll: U exited with {}", code)
+    return
+}

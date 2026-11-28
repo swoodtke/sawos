@@ -278,6 +278,14 @@ DEADLINE_CLAIM_GIVE_PKG = os.path.join(TESTS_DIR, "deadline-claim-give")
 DEADLINE_CLAIM_REWRITE_PKG = os.path.join(TESTS_DIR, "deadline-claim-rewrite")
 DEADLINE_QUOTA_ROOT_PKG = os.path.join(TESTS_DIR, "deadline-quota-root")
 DEADLINE_QUOTA_CHILD_PKG = os.path.join(TESTS_DIR, "deadline-quota-child")
+# The task executor's seams (spec §10.1).
+TASK_SPAWN_JOIN_PKG = os.path.join(TESTS_DIR, "task-spawn-join")
+TASK_SLEEP_FLOOR_PKG = os.path.join(TESTS_DIR, "task-sleep-floor")
+TASK_CLOSE_THREAD_END_PKG = os.path.join(TESTS_DIR, "task-close-thread-end")
+TASK_TWO_THREADS_PKG = os.path.join(TESTS_DIR, "task-two-threads")
+TASK_CROSS_THREAD_WAKE_PKG = os.path.join(TESTS_DIR, "task-cross-thread-wake")
+SLEEP_NS_DIRECT_PKG = os.path.join(TESTS_DIR, "sleep-ns-direct")
+REACTOR_FIRST_POLL_PKG = os.path.join(TESTS_DIR, "reactor-first-poll")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -2873,6 +2881,16 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The kernel compiles no module that declares the background group's
+        # entries (`sos.floor` does, and the kernel never compiles `sos`), so
+        # a `Task.spawn` in a kernel source is refused at compile time.
+        "name": "kernel_spawn_refused",
+        "src": os.path.join(TESTS_DIR, "kernel_spawn.saw"),
+        "expect_build_error": "spawn.freestanding",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    {
         "name": "panic_seam",
         "src": os.path.join(TESTS_DIR, "panic.saw"),
         "expect_out": "SOS M0: deliberate panic",
@@ -4336,6 +4354,94 @@ TEST_CASES = [
             "SOS threadwake: U, in T's slot: true, parks: TimedOut",
             "SOS threadwake: done",
         ],
+        "expect_clean_exit": True,
+    },
+    # The task executor (spec §10.1): `sos.exec`'s seams under std's
+    # cooperative executor, in programs written with `main`. Every image arms
+    # no tick, so every switch is one a thread makes, and each order is made
+    # by construction. A sleep's line says only that at least its delay
+    # passed on the kernel's Clock.
+    {
+        # A task spawned and joined in `main`: the executor word is kept in
+        # the main thread's block. `tests/task-spawn-join` says how.
+        "name": "task_spawn_join",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_SPAWN_JOIN_PKG,
+        "expect_out": ["{banner}", "SOS taskjoin: joined 42\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A task's sleep lasts at least its delay on the kernel's Clock.
+        # `tests/task-sleep-floor` says how.
+        "name": "task_sleep_floor",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_SLEEP_FLOOR_PKG,
+        "expect_out": ["{banner}",
+                       "SOS tasksleep: slept at least 20 ms: true\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `thread_create(run:)` thread's tasks are cancelled and joined
+        # after `run` returns. `tests/task-close-thread-end` says how.
+        "name": "task_close_at_thread_end",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_CLOSE_THREAD_END_PKG,
+        "expect_out": ["{banner}",
+                       "SOS taskclose: the task saw its cancel\n",
+                       "SOS taskclose: the thread joined with 5\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Each thread drives and closes its own group: the executor word is
+        # per thread, through each HAL's thread register.
+        # `tests/task-two-threads` says how.
+        "name": "task_two_threads",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_TWO_THREADS_PKG,
+        "expect_out": ["{banner}",
+                       "SOS tasktwo: T joined X: 42\n",
+                       "SOS tasktwo: T exited with 0\n",
+                       "SOS tasktwo: main joined M: 7\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A reactor wake from another thread ends a poll with no deadline.
+        # `tests/task-cross-thread-wake` says how.
+        "name": "task_cross_thread_wake",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_CROSS_THREAD_WAKE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS taskwake: T's poll ended with a wake: 1\n",
+                       "SOS taskwake: T exited with 0\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime's sleep, called directly: it lasts its whole delay on
+        # the kernel's Clock, a wake ends its kernel park, and the wake is
+        # kept for the next poll. `tests/sleep-ns-direct` says how.
+        "name": "sleep_ns_direct",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SLEEP_NS_DIRECT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS sleepns: slept at least 50 ms: true\n",
+                       "SOS sleepns: a wake ended a park: true\n",
+                       "SOS sleepns: the poll found the wake kept: 1\n",
+                       "SOS sleepns: W exited with 0\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A reactor wake made before a thread holds a runtime record reaches
+        # its first poll, on a record another thread gave back and on a fresh
+        # one. `tests/reactor-first-poll` says how each is made.
+        "name": "reactor_first_poll",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": REACTOR_FIRST_POLL_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS firstpoll: T took a record and gave it back\n",
+            "SOS firstpoll: a reused record's first poll found the wake: 1\n",
+            "SOS firstpoll: a fresh record's first poll found the wake: 1\n",
+            "SOS firstpoll: U exited with 0\n"],
         "expect_clean_exit": True,
     },
     {
@@ -25018,6 +25124,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "deadline_call", "deadline_claim_refusals",
                      "deadline_claim_give", "deadline_claim_rewrite",
                      "deadline_call_quota",
+                     "task_spawn_join", "task_sleep_floor",
+                     "task_close_at_thread_end", "task_two_threads",
+                     "task_cross_thread_wake", "sleep_ns_direct",
+                     "reactor_first_poll",
                      *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES],
                      "death_record", "console_claim", "pipe_taken"]
     by_name = {c["name"]: c for c in TEST_CASES}

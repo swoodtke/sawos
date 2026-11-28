@@ -1,0 +1,67 @@
+// A reactor wake from another thread ends a poll with no deadline (spec
+// §10.1). Thread T polls the reactor once with a zero timeout, which takes
+// its runtime record and answers the unseen mark a claim leaves, then polls
+// with a negative timeout, the sweep's idle wait when every task waits on
+// something with no deadline, in thread context and with no task. `main`
+// waits until T is counted parked
+// (`sos_exec_parked_parks`), then wakes the reactor, which wakes T by its ID,
+// and joins T:
+//
+//   SOS taskwake: T's poll ended with a wake: 1
+//   SOS taskwake: T exited with 0
+//
+// The image arms no tick, so every switch is one a thread makes: `main`
+// yields until T has entered its park, and T runs until it parks. Were the
+// wake to reach no parked thread, T would park for good and `main` with it in
+// the join, and the kernel would report the deadlock.
+
+import sos.{SosStatus}
+import sosmain
+
+extern "C" {
+    func __saw_rt_reactor_create(r_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_poll(r: Int, timeout_ms: Int,
+                               count_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_wake(r: Int)
+    func __saw_rt_thread_yield()
+    func sos_exec_parked_parks() -> Int
+}
+
+/// T's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func reactor() unsafe -> Int {
+    var r = 0
+    let _ = __saw_rt_reactor_create((&var r) as UnsafePointer<Int>)
+    r
+}
+
+func t_run(arg: UInt) unsafe sync -> UInt {
+    var first = 0
+    let _ = __saw_rt_reactor_poll(reactor(), 0,
+                                  (&var first) as UnsafePointer<Int>)
+    var count = 0
+    let _ = __saw_rt_reactor_poll(reactor(), -1,
+                                  (&var count) as UnsafePointer<Int>)
+    print("SOS taskwake: T's poll ended with a wake: {}", count)
+    arg
+}
+
+func main() -> Result<Void, SosStatus> {
+    let thread = try sosmain.context().process().thread_create(
+        run: t_run, arg: 0, stack_top: top())
+    try thread.start()
+    while sos_exec_parked_parks() < 1 {
+        __saw_rt_thread_yield()
+    }
+    __saw_rt_reactor_wake(reactor())
+    let code = try thread.join()
+    print("SOS taskwake: T exited with {}", code)
+    return
+}

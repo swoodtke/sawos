@@ -5425,7 +5425,9 @@ nothing to the console but what a stop of the machine writes.
 
 ### 10.1 The task executor
 
-Not built yet (§11): what follows specifies it.
+Partly built (§11): the entries' declarations, the seams and the close are
+built, and the drive in the typed wrappers, `send`'s fallback and the one-word
+lock are specified here and not built yet.
 
 Saw's tasks run on a cooperative executor in std, which reaches the machine
 through a set of runtime seams (sawlang's `runtime/ABI.md` at the pinned
@@ -5476,9 +5478,13 @@ kernel object. Records live on a process-wide list that only grows: a thread
 takes a free one, or makes one with the runtime's allocator, the first time
 it needs one, keeps its address in its block, and gives it back at its close
 (§8). A record is never freed, so a stale pointer another thread holds always
-lands in a valid record.
+lands in a valid record. A thread that takes a record, fresh or given back by
+another, takes it with `seen` set to none, so its first poll answers at once:
+a wake made before it held the record, while it held none or the record had
+another owner, is not lost, at the cost of one early answer, which a poll is
+allowed.
 
-**The process-wide state** is two words:
+**The process-wide state** is these words, each an atomic:
 
 - one Monotonic Clock handle, got with `ClockGet` the first time the runtime
   needs it and published by compare-and-swap; a thread that loses the race
@@ -5489,7 +5495,19 @@ lands in a valid record.
   way and panics, naming `ClockRight.Read`, if a narrowed ceiling left it
   out. Any other refusal of `ClockGet` (a full table, the quota) panics,
   naming the refusal;
-- `REACTOR`, a static wake generation.
+- `REACTOR`, a static wake generation;
+- `RECORDS`, the head of the record list, pushed by compare-and-swap;
+- three counts, each of which only grows from the process's start, so a test
+  may wait for one to move: the bare parks the runtime has entered
+  (`sos_exec_parked_parks()`, counted just before each `PARK_OP`), those a
+  wake ended (`sos_exec_parks_woken()`), and the sends that fell back to a
+  plain `Call` (`sos_exec_send_fallbacks()`, below).
+
+**Where it sits.** `sos.exec` is the module directly above `sos.floor`, below
+every typed wrapper: each wrapper that parks drives the thread's tasks around
+its wait and writes the wait word `sos.exec` keeps, `Thread.join` among them,
+so `sos.exec` imports no wrapper. The thread's block is `sos.exec`'s for the
+same reason, and `sos.rt` re-exports `ThreadBlock` and `enter_thread_block`.
 
 **The seams.** Each body makes floor ops, atomics and calls to the runtime's
 allocator, and nothing else. No seam runs program code (sawlang's rule, which
@@ -5526,7 +5544,17 @@ since the wrappers drive (below).
      negative timeout.
   5. Make `PARK_OP`.
   6. Write 0 to the word, clear `parked`, and set `seen` to the generation.
-  7. Answer a count of 1 for `Woken` and 0 for `TimedOut`.
+  7. Answer a count of 1 for `Woken`, or when step 6 found the generation
+     moved from the `seen` the poll started with, and 0 otherwise. A waker
+     that moved the generation before step 6 and read `parked` after it was
+     cleared made no trap and left no latch, and its wake is counted all the
+     same.
+
+  A thread with no block has no record to keep `parked` and `seen` in, and
+  its poll panics with `sos: this thread has no block; a thread that runs
+  tasks enters one with sos.rt.enter_thread_block before it spawns`; std
+  polls only on a thread that holds an executor record, which such a thread
+  cannot keep.
 
   It makes two traps, the clock read and the park, and none for a zero
   timeout.
@@ -5719,11 +5747,12 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **The task executor** (§10.1): `sos.exec`'s seams, the drive in the typed
-  wrappers, `send`'s fallback, the one-word lock (§7) and the close at a
-  thread's end (§8). Specified, not built yet; until it is, nothing in `sos`
-  declares the background entries, so a `Task.spawn` in a program is refused
-  at compile time (`spawn.freestanding`).
+- **The task executor's waits and locks** (§10.1): the drive in the typed
+  wrappers, `send`'s fallback and the one-word lock (§7). `sos.exec`'s seams,
+  the background entries' declarations and the close at a thread's end (§8)
+  are built, so a program spawns and runs tasks, but a typed wrapper's park
+  is plain and runs no task while it waits, and a channel fails at link,
+  naming `__saw_rt_lock_acquire`.
 - **The thread gate** (§10.1). A `Channel.receive` made in thread context,
   outside any task, and a `TaskGroup(threads:)` reach std's thread gate, the
   `__saw_rt_pthread_*` mutex and condition-variable seams, and a

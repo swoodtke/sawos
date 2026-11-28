@@ -1,0 +1,31 @@
+// A task's sleep, read on the kernel's Clock (spec §10.1). `main` reads the
+// Monotonic clock through a typed Clock, spawns a task that sleeps
+// `DELAY_MS`, joins it, and reads the clock again:
+//
+//   SOS tasksleep: slept at least 20 ms: true
+//
+// std holds the sleeper until its own clock seam reads past the deadline, so
+// the floor read on the kernel's Clock is what pins that seam's units. A
+// stalled host only lengthens the sleep, so the line holds on any host.
+
+import sos.{SosStatus}
+import sosmain
+
+static DELAY_MS: UInt64 = 20
+static NANOS_PER_MILLI: UInt64 = 1_000_000
+
+func nap() {
+    sleep(Duration.ms(DELAY_MS))
+}
+
+func main() -> Result<Void, SosStatus> {
+    let clock = try sosmain.context().system().clock_get()
+    let before = try clock.now()
+    let task = Task.spawn(nap())
+    task.join()
+    let after = try clock.now()
+    let floor = DELAY_MS * NANOS_PER_MILLI
+    print("SOS tasksleep: slept at least {} ms: {}", DELAY_MS,
+          after - before >= floor)
+    return
+}

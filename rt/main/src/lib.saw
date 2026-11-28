@@ -18,8 +18,9 @@
 //! It exports `_start`, the image entry, which adopts the boot word as the
 //! process's System, derives its Process handle and the main thread's own
 //! Thread handle, drains the boot set, gives the console to `print`, runs
-//! `main` through the compiler's `__saw_main` and ends the process with
-//! `main`'s status. A package that exports its own `_start` never imports this
+//! `main` through the compiler's `__saw_main`, closes the main thread's
+//! tasks (`sos.exec.end_thread_tasks`) and ends the process with `main`'s
+//! status. A package that exports its own `_start` never imports this
 //! one: two exports of one symbol are refused at compile time.
 //!
 //! The console is the record the image builder gives a process under
@@ -53,6 +54,7 @@ import sos.{System, Process, BootSet, SosStatus, HandleInfo, HandleKind,
             SystemRight, ProcessRight, ThreadRight, PIPE_BODY_BYTES,
             BOOT_SET_STORAGE_WORDS, sos_handle_info}
 import sos.rt.{ThreadBlock, enter_thread_block, adopt_console, console_sync}
+import sos.exec.{end_thread_tasks}
 import sosrt.{LINE_CHUNK}
 import bootplan.{CONSOLE_TAG}
 import uartproto.{BODY_BYTES, MAX_PAYLOAD, UartOp}
@@ -140,6 +142,9 @@ func _start(boot: UInt) unsafe -> Never {
     BOOT_AT = ((&var start) as UnsafePointer<Boot>) as UInt
 
     let status = __saw_main()
+    // `__saw_main` has closed what `main` spawned; this closes what ran after
+    // it on the thread, and gives the thread's runtime record back.
+    end_thread_tasks()
     // A console driver that is gone leaves nothing to flush to.
     let _ = flush()
     end(UInt.from(truncating: status), "main returned")

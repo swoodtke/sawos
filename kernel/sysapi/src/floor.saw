@@ -1738,3 +1738,37 @@ public(package) func park_system_handle(handle: UInt) unsafe {
     SYSTEM_HANDLE = handle
     PRINT_ANSWER.store(PRINT_UNASKED)
 }
+
+// =============================================================================
+// The background group
+// =============================================================================
+//
+// Saw's `Task.spawn` spawns into the calling thread's background group, which
+// a freestanding runtime owns by declaring both of the compiler's entries
+// below (sawlang's runtime/ABI.md, "The background group"). These two lines
+// are that claim, for every program built on `sos`: once they are declared,
+// the compiler defines both entries in the program's object, and a spawn
+// compiles. The kernel never compiles this package, so it declares neither,
+// and a spawn in a kernel source stays refused (`spawn.freestanding`).
+//
+// Neither entry is a runtime seam: each runs the thread's tasks, which is
+// program code. So no seam calls them. `sos.exec` closes the group as a
+// thread ends, and the typed wrappers that park drive it around their wait.
+extern "C" {
+    func __saw_background_drive() -> Int64
+    func __saw_background_close()
+}
+
+/// Run the calling thread's tasks for one bounded turn, and answer when to
+/// drive again: `-1` when no task is live, `0` when one can run now,
+/// `Int64.max` when every live task waits with no deadline, and otherwise the
+/// earliest deadline among them, on the Monotonic clock in nanoseconds.
+public(package) func background_drive() -> Int64 {
+    __saw_background_drive()
+}
+
+/// Cancel, then join, every task the calling thread's background group still
+/// holds. It does nothing on a thread that never spawned.
+public(package) func background_close() {
+    __saw_background_close()
+}

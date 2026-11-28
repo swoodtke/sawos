@@ -1,0 +1,86 @@
+// The runtime's sleep, called directly in thread context, with no task (spec
+// §10.1). Thread W, at `main`'s level, yields until `main` is counted parked
+// (`sos_exec_parked_parks`), then wakes the reactor, which ends `main`'s
+// park, and exits. `main` first polls once with a zero timeout, which takes
+// its runtime record and answers the unseen mark a claim leaves, so the
+// generation is seen; then it sleeps `DELAY_MS` through the seam, between
+// two readings of a typed Clock, and then polls the reactor with no deadline:
+//
+//   SOS sleepns: slept at least 50 ms: true
+//   SOS sleepns: a wake ended a park: true
+//   SOS sleepns: the poll found the wake kept: 1
+//   SOS sleepns: W exited with 0
+//
+// Nothing cuts a sleep short, so the wake that ended the kernel park is
+// absorbed: the sleep parks again until its deadline, and keeps the wake for
+// the thread's next poll, which returns at once. The image arms no tick, so
+// W runs only once `main` has parked. A stalled host only lengthens the
+// sleep, so the first line holds on any host.
+
+import sos.{SosStatus}
+import sosmain
+
+extern "C" {
+    func __saw_rt_sleep_ns(ns: UInt64)
+    func __saw_rt_reactor_create(r_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_poll(r: Int, timeout_ms: Int,
+                               count_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_wake(r: Int)
+    func __saw_rt_thread_yield()
+    func sos_exec_parked_parks() -> Int
+    func sos_exec_parks_woken() -> Int
+}
+
+static DELAY_MS: UInt64 = 50
+static NANOS_PER_MILLI: UInt64 = 1_000_000
+
+/// W's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func reactor() unsafe -> Int {
+    var r = 0
+    let _ = __saw_rt_reactor_create((&var r) as UnsafePointer<Int>)
+    r
+}
+
+/// Poll the reactor for up to `ms` milliseconds, forever when negative, and
+/// answer the count it stores.
+func poll_for(ms: Int) unsafe -> Int {
+    var count = 0
+    let _ = __saw_rt_reactor_poll(reactor(), ms,
+                                  (&var count) as UnsafePointer<Int>)
+    count
+}
+
+func waker(arg: UInt) unsafe sync -> UInt {
+    while sos_exec_parked_parks() < 1 {
+        __saw_rt_thread_yield()
+    }
+    __saw_rt_reactor_wake(reactor())
+    arg
+}
+
+func main() -> Result<Void, SosStatus> {
+    let clock = try sosmain.context().system().clock_get()
+    let thread = try sosmain.context().process().thread_create(
+        run: waker, arg: 0, stack_top: top())
+    try thread.start()
+    let delay = DELAY_MS * NANOS_PER_MILLI
+    let _ = poll_for(0)
+    let before = try clock.now()
+    __saw_rt_sleep_ns(delay)
+    let after = try clock.now()
+    print("SOS sleepns: slept at least {} ms: {}", DELAY_MS,
+          after - before >= delay)
+    print("SOS sleepns: a wake ended a park: {}", sos_exec_parks_woken() >= 1)
+    print("SOS sleepns: the poll found the wake kept: {}", poll_for(-1))
+    let code = try thread.join()
+    print("SOS sleepns: W exited with {}", code)
+    return
+}

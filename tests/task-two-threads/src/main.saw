@@ -1,0 +1,73 @@
+// Two threads, each with its own background group (spec §10.1). The executor
+// word is a field of each thread's block, which the thread register names,
+// so each HAL's per-thread register is what keeps the groups apart.
+//
+//   1. `main` spawns task M, which yields once and then answers 7, or -1 if
+//      it was cancelled. Nothing runs M yet: `main` has not waited on it.
+//   2. `main` starts thread T and joins it. T spawns task X, joins it, and
+//      prints X's answer; then `run` returns and T's close runs, which
+//      cancels and joins whatever T's group still holds.
+//   3. `main` joins M.
+//
+//   SOS tasktwo: T joined X: 42
+//   SOS tasktwo: T exited with 0
+//   SOS tasktwo: main joined M: 7
+//
+// Were the two threads to share one executor word, T would run M on its own
+// stack beside X, and T's close would cancel it: the last line would read -1.
+
+import std.task.{yield_now}
+import sosmain
+
+/// T's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func m_task() -> Int {
+    yield_now()
+    if cancelled() {
+        return -1
+    }
+    7
+}
+
+func work(n: Int) -> Int {
+    n * 2
+}
+
+/// T's tasks, in thread context: the join sweeps T's own group.
+func t_tasks() blocking {
+    let x = Task.spawn(work(21))
+    print("SOS tasktwo: T joined X: {}", x.join())
+}
+
+func t_run(arg: UInt) sync -> UInt {
+    t_tasks()
+    arg
+}
+
+func main() {
+    let m = Task.spawn(m_task())
+    print("SOS tasktwo: T exited with {}", run_t())
+    print("SOS tasktwo: main joined M: {}", m.join())
+}
+
+/// Make T, start it and join it, answering its exit code. A refusal panics,
+/// naming it.
+func run_t() -> UInt {
+    let thread = try sosmain.context().process().thread_create(
+        run: t_run, arg: 0, stack_top: top()) catch {
+        panic("SOS tasktwo: T's create was refused: {}", error)
+    }
+    try thread.start() catch {
+        panic("SOS tasktwo: T's start was refused: {}", error)
+    }
+    try thread.join() catch {
+        panic("SOS tasktwo: T's join was refused: {}", error)
+    }
+}

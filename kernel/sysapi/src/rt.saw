@@ -12,8 +12,8 @@
 //! pool's ops (the last section). If `panic()`
 //! could reach a UART from userspace, the user/kernel split would be claimed
 //! rather than real. Which thread asks, and the yield, it answers from the
-//! thread register, whose layout this file also keeps: the blocks, and the
-//! start record of a thread `thread_create(run:)` makes.
+//! thread register and the thread's block (`sos.exec`), and this file keeps
+//! the start record of a thread `thread_create(run:)` makes.
 //!
 //! They live here, not in `hal/<arch>/user/`, because they name no
 //! architecture: the System op and the panic op are the same ops on every
@@ -31,8 +31,13 @@ import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
                   sos_panic, sos_thread_yield, sos_thread_id, sos_lock_wait,
                   sos_lock_wake}
 import sos.thread.{Thread}
+import sos.exec.{own_block, thread_word, set_thread_word, end_thread_tasks}
 import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
                HandleKind, SystemRight}
+
+// A thread's block and its entry are `sos.exec`'s, which keeps the executor
+// word and the wait word in it; a start-up reaches them here.
+public import sos.exec.{ThreadBlock, enter_thread_block}
 
 /// Write `len` bytes at `ptr` to the console: `print`'s writer.
 ///
@@ -172,21 +177,6 @@ func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
     sos_panic(dst as UnsafePointer<Int8>, n)
 }
 
-// The calling thread's own word: the thread register, read and written by the
-// user HAL (`hal/<arch>/user/syscall.c`). The kernel keeps it per thread and
-// starts every thread with it zero.
-//
-// Its low bit says what it holds. Zero is nothing yet. An odd word is a
-// number the lock-owner hook below handed out. An even word that is not zero
-// is the address of the thread's block (`ThreadBlock`), which the thread
-// wrote before it took its first lock. A thread's word is written once and
-// never changes after, so a lock never sees its holder's identity change. A
-// program that writes the register itself breaks all of this.
-extern "C" {
-    func sos_thread_word() -> UInt
-    func sos_set_thread_word(word: UInt)
-}
-
 /// The last thread number this process handed out; zero names none.
 static LAST_OWNER: Atomic<Int> = Atomic(0)
 
@@ -203,13 +193,13 @@ static LAST_OWNER: Atomic<Int> = Atomic(0)
 /// there.
 @export("sos_rt_lock_owner")
 func rt_lock_owner() unsafe -> Int {
-    let word = sos_thread_word()
+    let word = thread_word()
     if word != 0 {
         return Int.from(truncating: word)
     }
     let number = LAST_OWNER.fetch_add(1) &+ 1
     let fresh = (UInt.from(truncating: number) << 1) | 1
-    sos_set_thread_word(fresh)
+    set_thread_word(fresh)
     Int.from(truncating: fresh)
 }
 
@@ -231,11 +221,11 @@ func rt_yield() unsafe {
 /// The calling thread's own Thread handle word, which its block holds, or
 /// `NO_HANDLE` for a thread with no block or a block holding no handle yet.
 func own_thread_handle() unsafe -> UInt {
-    let word = sos_thread_word()
-    if word == 0 || (word & 1) != 0 {
+    let block = own_block()
+    if (block as UInt) == 0 {
         return NO_HANDLE
     }
-    UnsafeMemory<ThreadBlock, Normal>(word).read().thread
+    block[0].thread
 }
 
 /// The output lock's ID hook: the calling thread's ID, which the lock's owner
@@ -263,55 +253,22 @@ func rt_lock_wake(lock: UInt) -> UInt {
 /// The calling thread's ID (spec §7): the one its block keeps, read at the
 /// thread's start, or for a thread with no block, the kernel's answer now.
 public(package) func own_thread_id() unsafe -> UInt {
-    let word = sos_thread_word()
-    if word == 0 || (word & 1) != 0 {
+    let block = own_block()
+    if (block as UInt) == 0 {
         return sos_thread_id()
     }
-    UnsafeMemory<ThreadBlock, Normal>(word).read().id
-}
-
-/// A thread's block: the per-thread place its thread register names, holding
-/// the thread's own Thread handle, through which a section's last leave
-/// yields, and its ID, which it takes locks with.
-///
-/// The block lives for its thread's life wherever the thread put it: the main
-/// thread's in `sosmain`'s start-up frame, and a `thread_create(run:)`
-/// thread's at the head of its start record, at the top of its stack. Its
-/// address is word-aligned and nonzero, so it serves as the thread's
-/// lock-owner identity as it is.
-public struct ThreadBlock {
-    private thread: UInt,
-    private id: UInt,
+    block[0].id
 }
 
 extension ThreadBlock {
-    /// A block holding no handle yet. `enter_thread_block` writes the ID.
-    public init() -> ThreadBlock {
-        ThreadBlock(thread: NO_HANDLE, id: 0)
-    }
-
-    /// Keep `thread`, the calling thread's own handle, for the rest of the
-    /// process's life: the wrapper is given up without a release, and the
-    /// process's end releases the handle.
+    /// Keep `thread`, the calling thread's own handle, in its block for the
+    /// rest of the process's life: the wrapper is given up without a release,
+    /// and the process's end releases the handle.
     public func keep(&var self, thread: Thread) {
         var own = move thread
         self.thread = own.handle
         own.handle = ThreadHandle(NO_HANDLE)
     }
-}
-
-/// Make `block` the calling thread's block: write its address into the
-/// thread register, and the thread's ID into the block.
-///
-/// It is made once per thread, before the thread takes its first lock, so the
-/// thread's lock-owner identity is the block's address from the start, and
-/// its ID is read once; and `block` stays where it is for the rest of the
-/// thread's life.
-public func enter_thread_block(block: UnsafePointer<ThreadBlock>) unsafe {
-    let id = sos_thread_id()
-    let held = UnsafeMemory<ThreadBlock, Normal>(block as UInt)
-    held.write(ThreadBlock(thread: held.read().thread, id: id))
-    sos_set_thread_word(block as UInt)
 }
 
 // -----------------------------------------------------------------------------
@@ -382,14 +339,14 @@ public(package) func create_thread(process: UInt, entry: UInt, arg: UInt,
     let minted = sos_handle_mint(created, ThreadRight.Control as UInt,
                                  (&var own) as UnsafePointer<UInt>)
     try checked(minted) catch {
-        record.write(StartRecord(block: ThreadBlock(thread: created, id: 0),
+        record.write(StartRecord(block: ThreadBlock(thread: created),
                                  entry: entry, arg: arg, abandon: 1))
         try checked(sos_thread_start(created)) catch {
             panic("sos: the unwound thread's start was refused: {}", error)
         }
         return error
     }
-    record.write(StartRecord(block: ThreadBlock(thread: own, id: 0),
+    record.write(StartRecord(block: ThreadBlock(thread: own),
                              entry: entry, arg: arg, abandon: 0))
     return Thread(handle: ThreadHandle(created))
 }
@@ -401,9 +358,10 @@ func thread_entry(at: UInt) sync -> Never {
 }
 
 /// Make the start record the calling thread's block before anything can take
-/// a lock, call the entry it names with its argument, and exit with what the
-/// entry returns, through the thread's own handle, which the exit releases.
-/// An abandoned record exits at once with 0.
+/// a lock, call the entry it names with its argument, close the tasks the
+/// thread still holds (`end_thread_tasks`), and exit with what the entry
+/// returned, through the thread's own handle, which the exit releases. An
+/// abandoned record exits at once with 0.
 func run_thread(at: UInt) unsafe sync -> Never {
     enter_thread_block(at as UnsafePointer<ThreadBlock>)
     let record = UnsafeMemory<StartRecord, Normal>(at).read()
@@ -412,6 +370,7 @@ func run_thread(at: UInt) unsafe sync -> Never {
         let run = FuncPointer<(UInt) sync -> UInt>.from_raw(
             record.entry as UnsafePointer<UInt8>)
         code = run(record.arg)
+        end_thread_tasks()
     }
     try checked(sos_thread_exit(record.block.thread, code)) catch {
         panic("sos: the thread's exit was refused: {}", error)
