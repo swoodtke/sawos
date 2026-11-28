@@ -177,6 +177,23 @@ side outright — the kernel never touches the receiver or the interrupt-enable
 register — and shares only the transmitter, where a kernel byte lands between
 two of the process's rather than inside one. See `kcore`'s `Console`.
 
+**The console claim.** The board's UART driver (`drivers/svc-uart-ns16550`)
+claims the console while it serves (spec §9a), so the kernel writes nothing of
+its own but a stop's lines until the driver releases it or dies. What the
+driver touches is IER (its receive, line-status and transmit enables), the
+holding register it stores to, and LSR and the receive buffer it reads; it
+never sets LCR's divisor latch and never writes FCR. So when its claim ends,
+however it ends, the kernel's polled write finds the transmitter as it was: LSR
+bit 5 says when the holding register is empty and THR takes the byte. The
+transmit enable a dying driver leaves in IER raises the device's line, which
+the Interrupt's teardown masks at the controller and `console_reclaim` masks at
+a stop, and which the polled write never reads; `console_reclaim` has nothing
+to put back. `uart_claimed_death` shows the polled write working after a driver
+dies holding the claim with its transmitter busy, the claim ended by its
+teardown. `console_reclaim` itself runs only at a stop while a claim stands,
+after which no case asserts a line; the registers it finds then are the ones
+the teardown finds.
+
 ## What is riscv32-specific here
 
 Only the register names and the `ecall` instruction, which are what

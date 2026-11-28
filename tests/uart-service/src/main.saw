@@ -37,6 +37,16 @@
 // served), which is how root knows its writes reached the console before it
 // prints a word of its own.
 //
+// # The console claim
+//
+// The driver claims the console when it first runs and releases it at its
+// end, and while it holds the claim the kernel's debug print answers
+// `Claimed`. Root runs above the driver, so its lines up to its first park
+// are printed before the driver has run at all; from the park to the
+// driver's end its words go through the driver, and the rest wait for the
+// release. The kernel holds back its lines about the client's end, and says
+// how many when the console returns.
+//
 // # The transcript, read as an order
 //
 //   SOS uartsvc: created                <- two children, one connection
@@ -46,6 +56,8 @@
 //   Zq7#                                <- the harness's phrase, echoed: the
 //                                          first byte by root through its own
 //                                          claim, the rest by the client
+//   SOS uartsvc: root wrote ...         <- root's round, through the driver
+//   SOS: console returned, ...          <- the driver's release
 //   SOS uartsvc drv: ...                <- the driver's accounting
 //   SOS uartsvc: root's claim answered byte 90
 //   ...
@@ -100,6 +112,10 @@ static KEY_DRIVER: UInt = 72
 /// being given.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The driver's mask: the client's, and the console claim, which a driver of
+/// the console UART takes while it serves.
+static DRIVER_SYSTEM: UInt32 = CHILD_SYSTEM | SystemRight.Console
 
 /// What a client may do with the end it is handed, decided once by a keep
 /// mask. It may post and hand the end on; it may not mint a narrower sibling of
@@ -188,7 +204,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // after this line), the connection's server end and the console's line,
     // which root binds and gives away. Root gives the window away without ever
     // mapping it, so the registers end up in exactly one address space.
-    let drv_system = try system.mint(rights: CHILD_SYSTEM)
+    let drv_system = try system.mint(rights: DRIVER_SYSTEM)
     try driver.give(system: move drv_system, tag: TAG_DRV_BOOT) catch {
         let (why, back) = move error
         let _ = move back
@@ -327,9 +343,6 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
               client_traps.syscalls, CLIENT_SYSCALLS)
         return BUG
     }
-    print("SOS uartsvc: root's claim answered byte {}\n", got)
-    print("SOS uartsvc: client traps={} for 3 reads and 3 writes\n",
-          client_traps.syscalls)
 
     // Hanging up is dropping the last inlet. The client's sibling went with its
     // teardown; this is the other one, and the connection's client count
@@ -346,6 +359,12 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
               DRIVER_STATUS)
         return BUG
     }
+    // The driver held the console from its start to its end, and the
+    // kernel's debug print answered `Claimed` all that time, so root's own
+    // lines about the round wait for the driver's release.
+    print("SOS uartsvc: root's claim answered byte {}\n", got)
+    print("SOS uartsvc: client traps={} for 3 reads and 3 writes\n",
+          client_traps.syscalls)
     let _ = system.debug_print("SOS uartsvc: the driver served two clients and ended clean\n")
 
     let _ = move client

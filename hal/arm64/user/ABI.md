@@ -171,6 +171,25 @@ side and its control register outright — the kernel writes only the data
 register, and only to transmit, so a driver that wants to receive must enable
 the device itself. See `kcore`'s `Console`.
 
+**The console claim.** The board's UART driver (`drivers/svc-uart-pl011`)
+claims the console while it serves (spec §9a), so the kernel writes nothing of
+its own but a stop's lines until the driver releases it or dies. What the
+driver writes is CR (the device, its transmitter and its receiver enabled, and
+never cleared), IMSC (its receive, receive-error and transmit causes), ICR and
+DR; it never writes LCR_H, the baud registers or IFLS, so the FIFOs stay as the
+kernel leaves them. So when its claim ends, however it ends, the kernel's
+polled write finds the transmitter as it was: FR's full flag says when DR takes
+a byte, and the transmitter is enabled. The transmit cause a dying driver
+leaves in IMSC raises the device's line, which the Interrupt's teardown masks
+at the controller and `console_reclaim` masks at a stop, and which the polled
+write never reads; `console_reclaim` has nothing to put back.
+`uart_claimed_death` shows the polled write working after a driver dies holding
+the claim with its transmitter busy, the claim ended by its teardown.
+`console_reclaim` itself runs only at a stop while a claim stands, after which
+no case asserts a line; the registers it finds then are the ones the teardown
+finds. The emulator cannot show a transmit enable left clear: QEMU's PL011
+transmits whatever CR holds, which is how the kernel prints from reset CR.
+
 ## What is arm64-specific here
 
 Only the register names and the `svc` instruction, which are what `syscall.c`

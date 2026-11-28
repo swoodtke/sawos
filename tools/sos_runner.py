@@ -891,6 +891,10 @@ UART_CANCEL_PKG = os.path.join(TESTS_DIR, "uart-cancel")
 UART_MISSING_PKG = os.path.join(TESTS_DIR, "uart-missing")
 SVC_UART_NS16550_PKG = os.path.join(DRIVERS_DIR, "svc-uart-ns16550")
 SVC_UART_PL011_PKG = os.path.join(DRIVERS_DIR, "svc-uart-pl011")
+# Each UART driver's shipping `uartconfig`, which a case naming the driver
+# gives it (`_resolve_case`).
+NS16550_CONFIG = {"uartconfig": "drivers/svc-uart-ns16550/config/default.saw"}
+PL011_CONFIG = {"uartconfig": "drivers/svc-uart-pl011/config/default.saw"}
 SVC_CLIENT_PKG = os.path.join(TESTS_DIR, "svc-client")
 # The root of the images built from descriptions, which launches every child
 # its image carries, and the child those images launch more than once.
@@ -2363,6 +2367,14 @@ _UART_CLIENT_AFTER_READ = [
     "SOS uartclient: a write with no handle to spare for its claim",
     "SOS uartclient: done",
 ]
+# What `tests/uart-lines-client` prints, in order: its four numbered lines,
+# then, after its `Sync`, the driver's `Stats` and the verdict on them.
+_UART_LINES = [
+    *[f"SOS uartlines: line {n} " + "=" * 77 for n in range(1, 5)],
+    "SOS uartlines: after the sync queued=400 sent=400",
+    "SOS uartlines: the sync was answered once every byte before it had left",
+]
+
 # The client's read, against the console driver, which has no input, and
 # against a UART driver, which holds it.
 _UART_CLIENT_CONSOLE = [
@@ -10243,6 +10255,9 @@ TEST_CASES = [
         "root_pkg": DRIVER_CHILD_PKG,
         "children": [CHILD_ECHO_NS16550_PKG],
         "device": True,
+        # Its board's defaults, which its hand-written description
+        # (`FROM_FILES`), stating no limits, is given: the two images are one.
+        "limits": BOARD_LIMITS,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
                        "root image ok segments={three}",
@@ -13409,14 +13424,29 @@ TEST_CASES = [
         #   root wrote ...   root's own round, after the client is dead: two
         #                    TELLs and a `Sync`, so a launcher's prose comes out
         #                    of a transmitter it does not own.
+        #   console returned the driver held the console claim from its first
+        #                    run to its release, so the kernel held back its
+        #                    two lines about the client's end, and root's own
+        #                    lines after its first park wait for the release.
         #   served=13 ...    the driver's own accounting, and every number in it
         #                    is deterministic: nothing abandoned, nothing
         #                    dropped.
         #   after the mark   the measured window: `Mark` opens it and the
-        #   ... traps=7      loop's end closes it, and there is no input left
-        #                    by then so no interrupt can fall inside it. Two
-        #                    answered messages at one trap each, two discarded
-        #                    at two each, plus the closing `stats()` read.
+        #                    loop's end closes it. The driver serves at `Rt0`,
+        #                    above root, so it takes each message as it is
+        #                    posted and parks only once the device has taken
+        #                    every byte: the four messages are answered at
+        #                    their take, a tell's answer landing before the
+        #                    claim is dropped, and none is held.
+        #   accounted for    every trap in the window is one of the loop's
+        #                    acts, counted as it is made: two per message
+        #                    answered at its take (the take and the
+        #                    `reply_wait`), two per transmit interrupt (the
+        #                    acknowledgement and the wait). How many
+        #                    interrupts the window holds is the emulator's
+        #                    transmitter's, so they and the traps are printed,
+        #                    and the accounting, which holds whatever they
+        #                    are, is asserted.
         #
         # `Zq7#` rules out everything at once: the give, the map, the bind, an
         # IRQ waking a process that is not root, a request crossing a process
@@ -13428,10 +13458,8 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_SERVICE_PKG,
         "children": [SVC_UART_NS16550_PKG, SVC_CLIENT_PKG],
+        "inputs": NS16550_CONFIG,
         "device": True,
-        # Its board's defaults, which its hand-written description
-        # (`FROM_FILES`), stating no limits, is given: the two images are one.
-        "limits": BOARD_LIMITS,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
                        "root image ok segments={three}",
@@ -13446,15 +13474,18 @@ TEST_CASES = [
                        ECHO_INPUT,
                        "SOS uartsvc: root wrote this line through the driver",
                        "SOS uartsvc: and root does not hold the device",
+                       "SOS: console returned, lines held={two}, debug bytes "
+                       "refused={zero}",
+                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=4 discarded=0 "
+                       "held=0 later=0 attaches=0 abandons=0 releases=0",
+                       "SOS uartsvc drv: every trap after the mark accounted for: two per "
+                       "answered message, three per discarded, two per held "
+                       "and per interrupt, one per other act",
                        # 0x5A is 'Z', the first byte of the phrase, which is
                        # the one root's own claim was answered with.
                        "SOS uartsvc: root's claim answered byte 90",
                        "SOS uartsvc: client traps=13 for 3 reads and 3 writes",
-                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
-                       "traps=7",
-                       "SOS uartsvc drv: one trap per answered message, two "
-                       "per discarded",
                        "SOS uartsvc: the driver served two clients and ended "
                        "clean",
                        "SOS uartsvc: done"],
@@ -13469,6 +13500,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_SERVICE_PKG,
         "children": [SVC_UART_PL011_PKG, SVC_CLIENT_PKG],
+        "inputs": PL011_CONFIG,
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
@@ -13482,13 +13514,16 @@ TEST_CASES = [
                        ECHO_INPUT,
                        "SOS uartsvc: root wrote this line through the driver",
                        "SOS uartsvc: and root does not hold the device",
+                       "SOS: console returned, lines held={two}, debug bytes "
+                       "refused={zero}",
+                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=4 discarded=0 "
+                       "held=0 later=0 attaches=0 abandons=0 releases=0",
+                       "SOS uartsvc drv: every trap after the mark accounted for: two per "
+                       "answered message, three per discarded, two per held "
+                       "and per interrupt, one per other act",
                        "SOS uartsvc: root's claim answered byte 90",
                        "SOS uartsvc: client traps=13 for 3 reads and 3 writes",
-                       "SOS uartsvc drv: served=13 abandoned=0 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
-                       "traps=7",
-                       "SOS uartsvc drv: one trap per answered message, two "
-                       "per discarded",
                        "SOS uartsvc: the driver served two clients and ended "
                        "clean",
                        "SOS uartsvc: done"],
@@ -13496,9 +13531,7 @@ TEST_CASES = [
     },
     {
         # One dead read cannot wedge a driver, and there is no stdin in this
-        # case, which makes it exact. The device never raises its line, so the
-        # whole run contains no interrupt and the driver's trap accounting is
-        # arithmetic rather than a measurement.
+        # case. The device raises its line only for its transmitter.
         #
         # Root asks for a byte nobody will type, times out on its own Waiter
         # with its own Timer (the kernel still does not know what a timeout is)
@@ -13512,15 +13545,17 @@ TEST_CASES = [
         # before the timer is looked at, and root's release wakes it there with
         # that record, before root's next message is even posted.
         #
-        # `served=5` is the read, the mark, two writes and the sync, and the
-        # window numbers are the ones the money shot prints, from the same
-        # driver program, which makes them about the loop rather than about a
-        # case.
+        # `served=7` is the read, root's two lines about the timeout and the
+        # drop (the driver holds the console claim, so root says them through
+        # it), the mark, two writes and the sync, and the window's accounting
+        # is the money shot's, from the same driver program, which makes it
+        # about the loop rather than about a case.
         "name": "uart_cancel_ns16550",
         "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_CANCEL_PKG,
         "children": [SVC_UART_NS16550_PKG],
+        "inputs": NS16550_CONFIG,
         "device": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
@@ -13534,11 +13569,12 @@ TEST_CASES = [
                        "SOS uartcancel: claim dropped",
                        "SOS uartcancel: root wrote this line through the driver",
                        "SOS uartcancel: one dead read did not wedge it",
-                       "SOS uartsvc drv: served=5 abandoned=1 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
-                       "traps=7",
-                       "SOS uartsvc drv: one trap per answered message, two "
-                       "per discarded",
+                       "SOS uartsvc drv: served=7 abandoned=1 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=4 discarded=0 "
+                       "held=0 later=0 attaches=0 abandons=0 releases=0",
+                       "SOS uartsvc drv: every trap after the mark accounted for: two per "
+                       "answered message, three per discarded, two per held "
+                       "and per interrupt, one per other act",
                        "SOS uartcancel: done"],
         "expect_clean_exit": True,
     },
@@ -13549,6 +13585,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_CANCEL_PKG,
         "children": [SVC_UART_PL011_PKG],
+        "inputs": PL011_CONFIG,
         "device": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
@@ -13559,11 +13596,12 @@ TEST_CASES = [
                        "SOS uartcancel: claim dropped",
                        "SOS uartcancel: root wrote this line through the driver",
                        "SOS uartcancel: one dead read did not wedge it",
-                       "SOS uartsvc drv: served=5 abandoned=1 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=2 discarded=2 "
-                       "traps=7",
-                       "SOS uartsvc drv: one trap per answered message, two "
-                       "per discarded",
+                       "SOS uartsvc drv: served=7 abandoned=1 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=4 discarded=0 "
+                       "held=0 later=0 attaches=0 abandons=0 releases=0",
+                       "SOS uartsvc drv: every trap after the mark accounted for: two per "
+                       "answered message, three per discarded, two per held "
+                       "and per interrupt, one per other act",
                        "SOS uartcancel: done"],
         "expect_clean_exit": True,
     },
@@ -13578,6 +13616,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": UART_MISSING_PKG,
         "children": [driver],
+        "inputs": config,
         "device": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
@@ -13593,9 +13632,10 @@ TEST_CASES = [
                        "SOS uartmissing: no line ended status=65537\n",
                        "SOS uartmissing: done"],
         "expect_clean_exit": True,
-    } for chip, arches, driver in (
-        ("ns16550", ["riscv32", "riscv32-flat"], SVC_UART_NS16550_PKG),
-        ("pl011", ["arm64"], SVC_UART_PL011_PKG))],
+    } for chip, arches, driver, config in (
+        ("ns16550", ["riscv32", "riscv32-flat"], SVC_UART_NS16550_PKG,
+         NS16550_CONFIG),
+        ("pl011", ["arm64"], SVC_UART_PL011_PKG, PL011_CONFIG))],
     {
         # The console driver under the stock root
         # (`tests/images/console_service*.toml`), with a client that writes,
@@ -13619,15 +13659,15 @@ TEST_CASES = [
                        # Every request; the eight `BadOp`s; the read; and
                        # the bytes of every `Write`. The traps run from the
                        # mark: one per byte printed, one per answer that
-                       # landed (nineteen: two of the burst's writes found
-                       # the ring full and one write found no handle for its
+                       # landed (twenty: two of the burst's writes found the
+                       # ring full and one write found no handle for its
                        # claim, and went as calls), two per tell whose `Ok`
                        # did not (fifty-six), one per handle the carrying
                        # `Sync` brought, released, and the closing `stats()`
                        # read.
-                       "SOS console drv: served=75 refused=8 unsupported=1 "
+                       "SOS console drv: served=76 refused=8 unsupported=1 "
                        "printed=945",
-                       "SOS console drv: after the mark traps=1081",
+                       "SOS console drv: after the mark traps=1082",
                        "root: console ended status=65536"],
         "expect_clean_exit": True,
     },
@@ -13637,7 +13677,10 @@ TEST_CASES = [
         # driver instead, and the client's text is the same but for its read,
         # which the driver holds, there being no input. The client has it hold
         # four, the most it will, has a fifth answered `Busy`, and drops the
-        # four. The driver's own lines say so (`abandoned=4`).
+        # four. The driver's own lines say so (`abandoned=4`). The driver
+        # claims the console while it serves, so its serve is the image's
+        # console: root's line about the client goes through it too, and the
+        # kernel's two about the client's end are held back.
         "name": "console_service_uart",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "console_service_ns16550.toml",
@@ -13646,19 +13689,24 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        *_UART_CLIENT_UART,
                        "root: client ended status=65536",
-                       # The four reads it held, dropped. Nineteen calls
-                       # answered (the fifth read's `Busy`, the two writes of
-                       # the burst that found the ring full and the write
-                       # that found no handle for its claim among them) and
-                       # fifty-seven tells whose `Ok` did not land; the
-                       # rest of the window's traps are each held read's
-                       # attach, the wait after it, the wait after its
-                       # abandonment and its release, the four handles the
-                       # carrying `Sync` brought, released, and the closing
-                       # `stats()` read.
-                       "SOS uartsvc drv: served=80 abandoned=4 dropped=0",
-                       "SOS uartsvc drv: after the mark answered=19 "
-                       "discarded=57 traps=154",
+                       # Root's first line met the claim at its first byte.
+                       "SOS: console returned, lines held={two}, debug bytes "
+                       "refused={one}",
+                       # Every request, root's line among them, and the four
+                       # reads it held, dropped. The driver serves above the
+                       # client, so every other message is answered at its
+                       # take and before its claim is dropped: the held reads
+                       # are the window's only holds, with an attach, an
+                       # abandonment and a release each, and the four handles
+                       # the carrying `Sync` brought are the other releases.
+                       # How many transmit interrupts the window holds is the
+                       # emulator's, and the accounting holds whatever it is.
+                       "SOS uartsvc drv: served=82 abandoned=4 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=78 discarded=0 "
+                       "held=4 later=0 attaches=4 abandons=4 releases=8",
+                       "SOS uartsvc drv: every trap after the mark accounted for: two per "
+                       "answered message, three per discarded, two per held "
+                       "and per interrupt, one per other act",
                        "root: console ended status=65536"],
         "expect_clean_exit": True,
     },
@@ -13667,9 +13715,10 @@ TEST_CASES = [
         # (`tests/images/console_tag_*.toml`): the builder gives the client,
         # which declares only its System record, an inlet of that connection
         # under `CONSOLE_TAG` after it. The client drains one record, takes
-        # the inlet from under the tag, and writes a line through it; the
-        # driver serves the write and the `Sync` after it, and ends once the
-        # client's inlet, its last client's, is gone.
+        # the inlet from under the tag, and writes two lines through it; the
+        # driver serves the writes, the `Sync` after them and root's line
+        # about the client, and ends once root's inlet, its last client's, is
+        # gone.
         "name": "console_tag",
         "arches": ["riscv32", "arm64"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -13679,7 +13728,7 @@ TEST_CASES = [
                        "SOS consoletag: one record, an inlet under CONSOLE_TAG",
                        "SOS consoletag: a line through the console's inlet",
                        "root: client ended status=65536",
-                       "SOS uartsvc drv: served=2 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: served=4 abandoned=0 dropped=0",
                        "root: console ended status=65536"],
         "expect_tail": "root: console ended status=65536",
         "expect_clean_exit": True,
@@ -13696,11 +13745,12 @@ TEST_CASES = [
         # buffer is the host's. The client therefore reads one byte and then
         # asks the driver, by `Pending`, until it holds another: it is the
         # only reader, so that byte is still buffered when it tells the
-        # dropped `Read`. The driver answers that read from its buffer and the
-        # reply goes nowhere, so none is held, none abandoned, and one byte is
-        # put back. How many times the client asked is the host's speed, so
-        # `served` and the counts after the mark are printed and not
-        # asserted. A `Sync` orders the rest, not a clock.
+        # dropped `Read`, from a thread above the driver's band, so the claim
+        # is gone before the driver takes the read. The driver answers that
+        # read from its buffer and the reply goes nowhere, so none is held,
+        # none abandoned, and one byte is put back. How many times the client
+        # asked is the host's speed, so `served` and the counts after the mark
+        # are printed and not asserted. A `Sync` orders the rest, not a clock.
         "name": "uart_dropped_read",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "uart_dropped_read.toml",
@@ -13714,6 +13764,81 @@ TEST_CASES = [
                        "abandoned=0 dropped=0",
                        "SOS uartsvc drv: bytes put back=1",
                        "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `Write` the driver's transmit ring has no room for is held
+        # (`tests/images/uart_hold_*.toml`): the driver is built with a
+        # 16-byte ring, and every line the client prints, and root's line
+        # about it, is longer, so every `Write` is held by construction and
+        # its remainder goes into the ring as the device takes bytes. While
+        # one is held the driver takes nothing, so the lines come out whole
+        # and in order. The driver's fixed line is printed only when it held
+        # a `Write` and sent every byte it queued.
+        "name": "uart_hold",
+        "arches": ["riscv32", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "uart_hold_ns16550.toml",
+                       "arm64": "uart_hold_pl011_arm64.toml"},
+        "expect_out": ["{banner}",
+                       *_UART_LINES,
+                       "root: client ended status=65536",
+                       "SOS: console returned, lines held={two}, debug bytes "
+                       "refused={one}",
+                       # The lines, the client's two after them and root's:
+                       # seven `Write`s, each longer than the ring.
+                       "SOS uartsvc drv: queued=554 sent=554 writes held=7",
+                       "SOS uartsvc drv: every write that did not fit was "
+                       "held, every byte sent",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A `Sync` is answered only once every byte queued before it has left
+        # the device (`tests/images/uart_sync_*.toml`). The client prints its
+        # lines, then `Sync`s and asks for the driver's `Stats`, from a thread
+        # at `High`, above the driver's `Normal`: the `Sync`'s answer runs the
+        # thread at once, so its `Stats` is posted before the driver takes
+        # another turn, and a `Sync` answered with bytes still to send would
+        # find fewer sent than queued. Every count is the bytes written, not a
+        # measurement.
+        "name": "uart_sync",
+        "arches": ["riscv32", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "uart_sync_ns16550.toml",
+                       "arm64": "uart_sync_pl011_arm64.toml"},
+        "expect_out": ["{banner}",
+                       *_UART_LINES,
+                       "root: client ended status=65536",
+                       "SOS: console returned, lines held={two}, debug bytes "
+                       "refused={one}",
+                       "SOS uartsvc drv: queued=554 sent=554 writes held=0",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The driver dies holding the console claim, with its transmitter
+        # busy (`tests/images/uart_claimed_death_*.toml`): it is built to
+        # panic once it has served three messages, the client's first three
+        # lines, of which the device has taken some. Its teardown ends the
+        # claim, and the kernel's lines about its own death are printed on the
+        # console the driver left, its transmit interrupt still enabled: the
+        # kernel's polled write needs nothing put back. Root's lines go
+        # through the debug print once the driver is gone, and the client,
+        # whose `Sync` finds the driver gone, ends with status 1.
+        "name": "uart_claimed_death",
+        "arches": ["riscv32", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "uart_claimed_death_ns16550.toml",
+                       "arm64": "uart_claimed_death_pl011_arm64.toml"},
+        "expect_out": ["{banner}",
+                       "SOS: process fault: the program panicked "
+                       "process={one} text=panic at main.saw:",
+                       "the driver was built to die after 3 messages\n"
+                       "SOS: process teardown handles=",
+                       "SOS: process exit: code={one} process={two}",
+                       "root: console ended status=131086",
+                       "root: client ended status=65537"],
         "expect_clean_exit": True,
     },
     {
@@ -15228,6 +15353,9 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_WALK_PKG,
         "children": [CHILD_BYE_PKG, CHILD_WALK_IDLE_PKG],
+        # Its board's defaults, which its hand-written description
+        # (`FROM_FILES`), stating no limits, is given: the two images are one.
+        "limits": BOARD_LIMITS,
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
                        "SOS bye: exiting",
@@ -21514,8 +21642,10 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
 # description links must be the case's, byte for byte, which holds the rows,
 # the limits and the link the two make apart. A match prints nothing.
 FROM_FILES = {
-    ("riscv32", "uart_service_ns16550"): "uart_service_ns16550.toml",
-    ("riscv32-flat", "uart_service_ns16550"): "uart_service_ns16550_flat.toml",
+    ("riscv32", "child_echo_ns16550"): "child_echo_ns16550.toml",
+    ("riscv32-flat", "child_echo_ns16550"): "child_echo_ns16550_flat.toml",
+    ("riscv32", "process_walk"): "process_walk.toml",
+    ("riscv32-flat", "process_walk"): "process_walk_flat.toml",
 }
 
 
@@ -27056,9 +27186,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_out": ["{banner}",
                            *_UART_CLIENT_CONSOLE,
                            "root: client ended status=65536",
-                           "SOS console drv: served=75 refused=8 "
+                           "SOS console drv: served=76 refused=8 "
                            "unsupported=1 printed=945",
-                           "SOS console drv: after the mark traps=1081",
+                           "SOS console drv: after the mark traps=1082",
                            "root: console ended status=65536"],
             "expect_clean_exit": True,
         },

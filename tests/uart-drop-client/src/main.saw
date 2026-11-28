@@ -12,8 +12,14 @@
 //!
 //! How many times it asks depends on how soon the emulator hands the device
 //! the next byte, and nothing here depends on that.
+//!
+//! The script runs on a thread at `Rt1`, which its declaration's full band map
+//! puts above the driver's `Rt0`. A post readies the driver below the poster,
+//! so the told `Read`'s claim is dropped before the driver takes it, and its
+//! answer goes nowhere; a driver above the poster would take it, and answer
+//! it, between the post and the drop.
 
-import sos.{System, BootSet, SosStatus}
+import sos.{System, BootSet, Priority, Process, SosStatus}
 import uartproto.{Uart, UartBody, UartError, UartOp}
 import uartpipe.{PipeTransport, uart}
 
@@ -54,6 +60,38 @@ func echo(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
     return
 }
 
+/// The thread's stack, in words.
+static STACK_WORDS: Int = 2048
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+/// What `_start` hands the thread, by its address: the client.
+struct Shared {
+    u: Uart<PipeTransport>,
+}
+
+extension Shared: NoCopy {}
+
+/// The thread: `at` is `_start`'s `Shared`.
+func script(at: UInt) unsafe sync -> UInt {
+    let s = at as UnsafePointer<Shared>
+    try echo(&var s[0].u) catch {
+        print("SOS uartdrop: stopped: {}", error)
+        return EXIT_FAILED
+    }
+    EXIT_OK
+}
+
+/// Runs `script` on a thread at `Rt1` and joins it; answers its exit code.
+func run(proc: &Process, shared: &var Shared) unsafe -> Result<UInt, SosStatus> {
+    let top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+              (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let entry: FuncPointer<(UInt) sync -> UInt> = script
+    let at = ((&var shared) as UnsafePointer<Shared>) as UInt
+    let thread = try proc.thread_create(run: entry, arg: at, stack_top: top)
+    try thread.start(band: Priority.Rt1)
+    thread.join()
+}
+
 @export("_start")
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
@@ -73,11 +111,11 @@ func _start(boot_handle: UInt) {
         let _ = proc.exit(EXIT_FAILED)
         return
     }
-    var u = uart(move inlet)
-    try echo(&var u) catch {
-        print("SOS uartdrop: stopped: {}", error)
+    var shared = Shared(u: uart(move inlet))
+    let code = try run(&proc, &var shared) catch {
+        print("SOS uartdrop: the thread: {}", error)
         let _ = proc.exit(EXIT_FAILED)
         return
     }
-    let _ = proc.exit(EXIT_OK)
+    let _ = proc.exit(code)
 }

@@ -122,8 +122,10 @@ it), `sos_rt_abort`, `sos_kernel_fault` with its `report_str`/`report_hex`,
   The trap entry does not know which happened and must not care.
 - `sos_console_stop()` — `kcore`'s end of a console claim for a stop (spec
   §9a): with a claim standing it calls `console_reclaim`, which masks the
-  PL011's line (SPI 1, INTID 33), and writes what the kernel held back; with
-  none it does nothing. `exit_pass`, `exit_fail`, `sos_rt_abort`,
+  PL011's line (SPI 1, INTID 33) and puts nothing else back, since the
+  board's driver leaves no register the polled write depends on
+  (`user/ABI.md`, the console claim), and writes what the kernel held back;
+  with none it does nothing. `exit_pass`, `exit_fail`, `sos_rt_abort`,
   `sos_kernel_fault` and `grant_outside_window` call it before they write or
   stop.
 

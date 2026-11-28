@@ -215,8 +215,9 @@ is held to no profile or HAL, and only its `[limits.default]` is planned
 `sosimage build` builds an image from a hand-written description
 (`tests/images/`). It builds each process's package itself, once where the
 process would go first, to measure it, then where the regions put it
-(`tools/sosimage/src/layout.saw`). Before `uart_service_ns16550` is linked on
-riscv32 and on riscv32-flat, the runner builds its description and gives the
+(`tools/sosimage/src/layout.saw`). Before `child_echo_ns16550` (one child
+and a device row) and `process_walk` (two children) are linked on riscv32
+and on riscv32-flat, the runner builds each one's description and gives the
 case the images and regions it placed; after the case passes, it fails the
 profile unless the description's ELF is the case's, byte for byte
 (`FROM_FILES`), which holds the rows, the limits and the link the two make
@@ -248,7 +249,7 @@ carry a hand-made `slab_block` the runner writes from the slab sizes
 boots at the kernel's floors and compiled quota defaults on every board; one
 whose `limits` is `BOARD_LIMITS` gets its board's `[limits.default]`, as a
 hand-written image that states none does (`board_limits`, and
-`uart_service_ns16550`, whose description states none). Per profile the
+`child_echo_ns16550`, whose description states none). Per profile the
 runner plans the board's `[limits.default]` against the shipping kernel
 (`sosimage defaults`) whether or not a case asks, and a refused default fails
 the profile. The C3 smoke would plan its board's against its own kernel,

@@ -674,9 +674,9 @@ with no added op, kind, right or status:
 - **Multiple clients cost no new mechanism and no second connection.** Two
   processes are clients of one service over one connection through minted
   sibling inlets — per-client authority as a keep mask rather than as a session
-  table — and each request carries its own reply obligation, so a
-  completion-queue server routes every answer to the claim that asked for it
-  with nothing on the wire to correlate. `tests/uart-service` pins two
+  table — and each request carries its own reply obligation, so the server
+  routes every answer to the claim that asked for it with nothing on the wire
+  to correlate. `tests/uart-service` pins two
   outstanding reads in a fixed order — the ring delivers in post order, so its
   FIFO decides it — and each answer lands at its own claim in its own table.
 - **What the namespace still owes is a path and nothing else.** A client finds
@@ -5420,10 +5420,22 @@ through a pipe protocol (§2.1) and hold no device authority at all.
   poll, a queue of its own, or a kernel notion of blocking I/O. §2.1's
   one-shot is the driver's only per-request state, and dropping one is how a
   client is told the answer will never come.
+- **A write the device cannot take yet is held too.** A `Write` is copied into
+  the driver's transmit ring and answered once queued; the device's transmit
+  interrupt tops the device up from the ring, and nothing spins on a ready
+  bit. A `Write` the ring has no room for is held, and while it is held the
+  driver takes no message: its outlet is attached by the borrowing attach,
+  as a level, and removed while intake is paused, so the connection's own
+  ring fills and its writers park, and every message is answered in the
+  order it was posted. A `Sync` is held until every byte queued before it has
+  left the device's transmit holding register or FIFO; the last of them may
+  still be in its shift register.
 - **The driver still owns the console alone**, which keeps §9a true with
   several processes in the machine: the clients write through the protocol,
   so exactly one address space names the transmitter and the handover
-  protocol's single-owner rule is unweakened by the number of writers.
+  protocol's single-owner rule is unweakened by the number of writers. A
+  driver of the console's own device claims the console while it serves
+  (§9a), so not even the kernel's routine lines land among its bytes.
 
 ### 9a. The console handover protocol
 
@@ -6472,8 +6484,9 @@ reserved.
   the console's process is the only child left and every line root posted
   is answered, root drops its inlet, so the driver sees its last client go.
   Before a stop, root waits for its lines' answers and then sends the driver
-  a `Sync` and waits for its answer, so its last line has left the device
-  before the halt line. An error that ends root's supervision after its lines
+  a `Sync` and waits for its answer, so its last line has left the device's
+  transmit holding register or FIFO before the halt line, and on a part only
+  its last byte may still be in the shift register. An error that ends root's supervision after its lines
   went to the driver kills the console's process first and writes what root
   holds through the debug print, so the error's own line is printed. A
   watchdog thread of root's, at `Rt1` (§7), wakes a second after each of its

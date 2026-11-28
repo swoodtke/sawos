@@ -1,0 +1,108 @@
+//! A client of an image's UART driver that prints numbered lines, then asks
+//! the driver to `Sync` and for its `Stats`, from a thread at `Rt1`.
+//!
+//! Its lines are printed through the console's record, the driver's serve,
+//! `LINE_BYTES` bytes each with the line break: more than a small transmit
+//! ring holds, so a driver built with one holds each of them. The `Sync` and
+//! the `Stats` go through its own client record, an inlet of the same
+//! connection, so they are served after every line. A `Sync` is answered once
+//! every byte queued before it has left the holding register, so the `Stats`
+//! after it reports every byte queued as sent; the client prints both counts,
+//! and says so when they are equal.
+//!
+//! The work runs on a thread at `Rt1`, which its declaration's full band map
+//! puts at level 5, above the driver's `Rt0`. So the driver's answer to the
+//! `Sync` runs the thread at once, and its `Stats` is posted before the driver
+//! takes another turn: a `Sync` answered before its bytes left would find the
+//! driver with bytes still to send. The thread blocks in each call it makes,
+//! so it holds the processor only between them.
+
+import sos.{Priority, SosStatus}
+import uartproto.{Uart, UartError}
+import uartpipe.{PipeTransport, uart}
+import sosmain
+
+/// The client end of the driver's connection, as `process.toml` declares it.
+static TAG_UART: UInt = 2
+
+/// How many lines, and the bytes of each with its line break.
+static LINES: Int = 4
+static LINE_BYTES: Int = 100
+
+/// What follows a line's number: `LINE_BYTES` less the line's head
+/// (`SOS uartlines: line N `, 22 bytes) and its break.
+func fill() -> String {
+    "============================================================================="
+}
+
+static_assert(LINE_BYTES == 22 + 77 + 1, "a line is its head, the fill and the break")
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The thread's stack, in words.
+static STACK_WORDS: Int = 2048
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+/// What `main` hands the thread, by its address: the client, which lives in
+/// `main`'s frame until the thread is joined.
+struct Shared {
+    u: Uart<PipeTransport>,
+}
+
+extension Shared: NoCopy {}
+
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_UART) else {
+        print("SOS uartlines: no record {}", TAG_UART)
+        return EXIT_FAILED as Int
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS uartlines: record {} is no inlet", TAG_UART)
+        return EXIT_FAILED as Int
+    }
+    var shared = Shared(u: uart(move inlet))
+    let code = try run(&var shared) catch {
+        print("SOS uartlines: the thread: {}", error)
+        return EXIT_FAILED as Int
+    }
+    code as Int
+}
+
+/// Starts the thread at `Rt1` and joins it; answers its exit code.
+func run(shared: &var Shared) unsafe -> Result<UInt, SosStatus> {
+    let top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+              (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let entry: FuncPointer<(UInt) sync -> UInt> = lines
+    let at = ((&var shared) as UnsafePointer<Shared>) as UInt
+    let thread = try sosmain.context().process().thread_create(run: entry, arg: at,
+                                                              stack_top: top)
+    try thread.start(band: Priority.Rt1)
+    thread.join()
+}
+
+/// The thread: `at` is `main`'s `Shared`.
+func lines(at: UInt) unsafe sync -> UInt {
+    let s = at as UnsafePointer<Shared>
+    try script(&var s[0].u) catch {
+        print("SOS uartlines: stopped: {}", error)
+        return EXIT_FAILED
+    }
+    EXIT_OK
+}
+
+func script(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    var n = 1
+    while n <= LINES {
+        print("SOS uartlines: line {} {}", n, fill())
+        n = n + 1
+    }
+    try u.sync()
+    let s = try u.stats()
+    print("SOS uartlines: after the sync queued={} sent={}", s.queued, s.sent)
+    if s.queued == s.sent {
+        print("SOS uartlines: the sync was answered once every byte before it had left")
+    }
+    return
+}

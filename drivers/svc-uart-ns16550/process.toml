@@ -3,16 +3,17 @@
 format = 1
 arena = 0x1000
 ram = "fast"                # it services the UART's interrupt
+bands = "full"              # its serving thread runs at `Rt0`
 
 # `debug` for its own lines, which it writes through the kernel's debug print
-# even when it serves an image's console, and `process-self` for its Process
-# handle. It names them because an image that names a console gives a record
-# naming none no `debug`.
+# once it has released the console, `process-self` for its Process handle,
+# and `console` for the claim, which the plan grants it only as the image's
+# console.
 [[boot]]
 name = "system"
 kind = "system"
 tag = 21
-rights = ["debug", "process-self"]
+rights = ["debug", "process-self", "console"]
 
 [[boot]]
 name = "uart"
@@ -31,3 +32,20 @@ name = "uart"
 kind = "line"
 type = "ns16550"
 tag = 24
+
+# Its handles while it serves: its System and Process, its main thread's own
+# Thread handle, the serving Thread, the Waiter, the Interrupt, the IoMemory
+# and its Mapping, and the outlet, which it keeps because its attachment
+# borrows it: nine. On top of those it may hold the `Read`s it holds (four),
+# the held `Write` (one), the held `Sync`s (four), and the request being taken
+# with the `PIPE_MSG_HANDLES` it carries (five): twenty-three. A row short of
+# that lets a client's request end the driver.
+[quota]
+threads = 2
+waiters = 1
+mappings = 1
+handles = 23
+
+[build]
+inputs = ["uartconfig"]
+defaults = { uartconfig = "config/default.saw" }

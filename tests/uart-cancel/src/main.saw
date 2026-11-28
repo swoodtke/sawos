@@ -25,8 +25,14 @@
 // is the case's subject and orders nothing: a Timer whose expiry has passed
 // answers the wait at once.
 //
-// The guest gets no serial input, so the device never raises its line: the
-// transcript contains no interrupt and the driver's trap accounting is exact.
+// The guest gets no serial input, so the device raises its line only for its
+// transmitter, and the driver's trap accounting counts each of those
+// interrupts.
+//
+// The driver claims the console when it first runs and releases it at its
+// end, and while it holds the claim the kernel's debug print answers
+// `Claimed`. So root's lines from its yield to the driver's end go through
+// the driver, and the rest wait for the release.
 
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply,
             PipeMsg, Clock, ClockType, Timer, Waiter, WaitResult, WaitPayload,
@@ -62,9 +68,11 @@ static KEY_DRIVER: UInt = 83
 /// holds the request before root looks at the clock.
 static PARK_NS: UInt64 = 20_000_000
 
-/// What a child of this launcher may ask its System object for.
+/// What a child of this launcher may ask its System object for: the console
+/// claim among it, which the driver takes while it serves.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
-                               | SystemRight.ClockGet | SystemRight.Transfer)
+                               | SystemRight.ClockGet | SystemRight.Transfer
+                               | SystemRight.Console)
 
 /// `Exited`(1) << 16 | 0: the driver's clean ending.
 static DRIVER_STATUS: UInt = 65536
@@ -163,7 +171,6 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         return BUG
     }
     let _ = move woke
-    let _ = system.debug_print("SOS uartcancel: timed out\n")
 
     // The cancellation, spelled as a drop. There is no `cancel()` verb: the
     // claim's last reference going is the whole of saying "never mind", and
@@ -172,13 +179,17 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // hanging up destroys the subscription as well as the handle (§2.1).
     try waiter.remove(KEY_CLAIM)
     let _ = move claim
-    let _ = system.debug_print("SOS uartcancel: claim dropped\n")
 
     // The loop serves the next request. Everything below is an ordinary round
-    // with the ordinary driver: the two lines come out of a transmitter root
-    // does not own, and the `Sync` that follows is answered, which it could not
-    // be if one dead read had wedged the server.
+    // with the ordinary driver: the lines come out of a transmitter root does
+    // not own, and the `Sync` that follows is answered, which it could not be
+    // if one dead read had wedged the server. The driver holds the console,
+    // so root says what it saw through it too.
     var u = uart(move inlet)
+    try say_cancelled(&var u) catch {
+        print("SOS uartcancel: root's report: {}\n", error)
+        return BUG
+    }
     try own_round(&var u) catch {
         print("SOS uartcancel: root's round: {}\n", error)
         return BUG
@@ -202,6 +213,14 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
 /// `Mark`, two `Write` tells and a `Sync`: the same round `uart-service` runs,
 /// with the same measured window on the driver's side.
+/// What root saw, through the driver: the Timer answered first, and the
+/// claim is gone.
+func say_cancelled(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    try u.write("SOS uartcancel: timed out\n")
+    try u.write("SOS uartcancel: claim dropped\n")
+    return
+}
+
 func own_round(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
     try u.mark()
     try u.write("SOS uartcancel: root wrote this line through the driver\n")

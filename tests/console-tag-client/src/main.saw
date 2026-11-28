@@ -5,9 +5,10 @@
 //! serving the console.
 //!
 //! Its declaration lists only its System record, which it is started with, so
-//! the drain meets exactly one record, and the client says so before it
-//! writes. A different set is printed through its System handle, and the
-//! client exits with `EXIT_FAILED`.
+//! the drain meets exactly one record, and the client says so through the
+//! inlet before it writes. A different set is printed through its System
+//! handle, and the client exits with `EXIT_FAILED`; the console's driver may
+//! hold the console claim by then, and the kernel counts what it refused.
 
 import sos.{System, Process, BootSet}
 import bootplan.{CONSOLE_TAG}
@@ -52,8 +53,12 @@ func _start(boot_handle: UInt) {
         fail(&proc, "the record under CONSOLE_TAG is no inlet")
         return
     }
-    print("SOS consoletag: one record, an inlet under CONSOLE_TAG")
     var u = uart(move inlet)
+    try u.write("SOS consoletag: one record, an inlet under CONSOLE_TAG\n") catch {
+        print("SOS consoletag: write: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
     try u.write("SOS consoletag: a line through the console's inlet\n") catch {
         print("SOS consoletag: write: {}", error)
         let _ = proc.exit(EXIT_FAILED)

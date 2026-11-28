@@ -41,7 +41,7 @@ own restore path.
 | `arch_name() -> String` | What the boot banner says this kernel is running on. |
 | `arch_tag() -> UInt8` | This profile's `sosimg` arch tag, read out of `imgformat`'s registry rather than spelled again. An image carrying another one is refused by the loader, not jumped into. |
 | `console_byte(b)` | Put one byte on the kernel's console. Byte-at-a-time on purpose: the arch-free half formats, this half places. |
-| `console_reclaim()` | Take the console back from a process that claimed it, for a stop (spec §9a): mask the console's line at the controller. Nothing else is put back and no FIFO is reset. |
+| `console_reclaim()` | Take the console back from a process that claimed it, for a stop (spec §9a): mask the console's line at the controller. Nothing else is put back and no FIFO is reset; the board's driver leaves no register the polled write depends on (`user/ABI.md`, the console claim). |
 | `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. Each first ends a console claim through `sos_console_stop` (below). |
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
 | `region_table_start()` / `region_table_end()` | Bounds of the build-emitted boot region table. Equal when there is none, which is zero regions and the ordinary state of an image that appends no child images. |

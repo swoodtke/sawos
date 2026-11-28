@@ -12,8 +12,10 @@
 //!   connection's ring holds, which its transport carries by waiting for the
 //!   driver;
 //! - `Write`s of no payload and of a full one, and a line split over two;
-//! - a `Stats` after them, whose queued and sent counts are the bytes they
-//!   wrote and whose loss and error counts are zero;
+//! - a `Sync`, then a `Stats`, whose queued and sent counts are the bytes
+//!   they wrote and whose loss and error counts are zero: a `Write` is
+//!   answered once its bytes are queued, and only an answered `Sync` says
+//!   they have all been sent;
 //! - a `Read`, posted, then a `Sync`. A connection is served in order, so once
 //!   the `Sync` is answered the driver has served the `Read`. A claim answered
 //!   by then was answered at once: `Unsupported` from a device with no input,
@@ -153,9 +155,11 @@ func writes(c: &var Client) -> Result<Void, SosStatus> {
 /// `Stats` after them reports as queued and as sent.
 static TOLD: UInt32 = 364
 
-/// A `Stats` counts the writes' bytes and none lost or damaged. The received
-/// count is the device's, not the script's, so it is not held.
+/// A `Stats` after a `Sync` counts the writes' bytes, every one sent, and
+/// none lost or damaged. The received count is the device's, not the
+/// script's, so it is not held.
 func stats(c: &var Client) -> Result<Void, SosStatus> {
+    try ok("sync before stats", c.u.sync())
     let s = try ok("stats", c.u.stats())
     if s.queued != TOLD || s.sent != TOLD {
         print("SOS uartclient: stats: queued {} sent {}, wanted {}",
