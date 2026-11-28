@@ -1,11 +1,11 @@
-// Test child for `lock` and `lock_foreign_wake`, at the C altitude: the owner
-// word a lock holds and the address handed to the lock's ops are its own to
-// pick, which the typed tier never lets a caller name, and its threads have
-// no block, so each asks the kernel for its ID at each take. It runs under
-// the simple map, alone but for `EXITED`'s, `FREED`'s and `UNSTARTED`'s
-// thread, but for `RAW THREAD` and `TORN`, which its launcher maps with
-// `Normal` at 7 and `Low` 1, `High` 3, `Rt0` 4. The role its launcher gives
-// it, as the bits of an Event under `TAG_ROLE`, says what it does:
+// Test child for `lock` and `lock_foreign_wake`, at the C altitude: the word a
+// lock holds and the address handed to the lock's ops are its own to pick,
+// which the typed tier never lets a caller name, and its threads have no block,
+// so each asks the kernel for its ID at each take. It runs under the simple
+// map, alone but for `EXITED`'s, `FREED`'s and `UNSTARTED`'s thread, but for
+// `RAW THREAD` and `TORN`, which its launcher maps with `Normal` at 7 and `Low`
+// 1, `High` 3, `Rt0` 4. The role its launcher gives it, as the bits of an Event
+// under `TAG_ROLE`, says what it does:
 //
 //   FREE WAIT  waits for a free lock: `Ok` at once, and the syscalls column
 //              moves by that one call
@@ -35,11 +35,21 @@
 //              `TAG_ROOT_ID`: the kernel's line naming both processes, then
 //              the `BadArg` fault
 //   UNALIGNED  a wait one byte past a word: the `BadAlign` fault
-//   READONLY   a wait for a pair inside a string literal: the `BadBuffer`
-//              fault, since the kernel writes the waiters flag
-//   STRADDLE   a wait for a pair whose first word is the last word of its
-//              writable segment's row, and whose second is past it: the
-//              `BadBuffer` fault, though only the first word is read
+//   READONLY   a wait for a word inside a string literal: the `BadBuffer`
+//              fault, since the kernel writes the waiters bit
+//   LAST WORD  a lock at the last word of its writable segment's row. This
+//              thread takes it and starts W, at its own level, and yields: W
+//              finds it held and waits, and the kernel's swap sets the
+//              waiters bit there, since a lock is one word and nothing past
+//              it is read or written. This thread's give answers W, which
+//              takes the lock and gives it back. The word is the arena's, and
+//              is put back after
+//   OWN BIT    a wait whose word is this thread's ID with the waiters bit:
+//              the `BadState` fault, the bit aside
+//   BIT ALONE  a wait whose word is the waiters bit alone, which names no
+//              thread: the `BadArg` fault
+//   WAKE READONLY  a wake for a word inside a string literal: the
+//              `BadBuffer` fault
 //   WAKE UNALIGNED  a wake one byte past a word: the `BadAlign` fault
 //   FOREIGN WAKE  a wake at the address under `TAG_ADDR`, in memory its
 //              launcher shares with it, where a thread of its launcher waits
@@ -75,7 +85,7 @@ import sos.{System, SosStatus, ThreadRight, ALL_RIGHTS, Priority,
             sos_thread_start_band, sos_thread_join, sos_thread_exit,
             sos_thread_id, sos_lock_wait, sos_lock_wake, sos_lock_take,
             sos_lock_give, sos_process_stats, sos_event_signal,
-            sos_process_thread_self}
+            sos_process_thread_self, sos_thread_yield, LOCK_WAITERS_BIT}
 
 static TAG_ROLE: UInt = 40
 static TAG_ROOT_ID: UInt = 41
@@ -93,7 +103,7 @@ static ROLE_WIDE: UInt = 8
 static ROLE_FOREIGN: UInt = 9
 static ROLE_UNALIGNED: UInt = 10
 static ROLE_READONLY: UInt = 11
-static ROLE_STRADDLE: UInt = 12
+static ROLE_LAST_WORD: UInt = 12
 static ROLE_WAKE_UNALIGNED: UInt = 13
 static ROLE_FOREIGN_WAKE: UInt = 14
 static ROLE_RAW_THREAD: UInt = 15
@@ -102,6 +112,9 @@ static ROLE_LAST_SLOT: UInt = 17
 static ROLE_DEAD_EXITED: UInt = 18
 static ROLE_ID_AND_EXIT: UInt = 19
 static ROLE_ID_AND_PARK: UInt = 20
+static ROLE_OWN_BIT: UInt = 21
+static ROLE_BIT_ALONE: UInt = 22
+static ROLE_WAKE_READONLY: UInt = 23
 
 /// The threads `LAST SLOT` makes and never starts, below T.
 static FILLERS: Int = 5
@@ -118,7 +131,7 @@ static NONE: UInt = 0
 
 /// The bits of a thread ID that carry its slot, as every board splits an ID
 /// today (`hal.THREAD_ID_INDEX_BITS`); one generation is the next bit up. A
-/// program never decodes an ID: this one builds owner words no thread has.
+/// program never decodes an ID: this one builds lock words no thread has.
 static ID_SLOT_BITS: Int = 12
 static ONE_GENERATION: UInt = 1 << ID_SLOT_BITS
 static ID_SLOT_MASK: UInt = ONE_GENERATION - 1
@@ -138,8 +151,8 @@ unsafe static var STACK_EVENT: UInt = 0
 /// image's, and this is how it tells itself from the first thread.
 unsafe static var PROC: UInt = 0
 
-/// A lock's pair, at a word or one byte past it, in this process's data.
-unsafe static var PAIR: [UInt; 3] = [0; 3]
+/// A lock's word, at a word or one byte past it, in this process's data.
+unsafe static var WORD: [UInt; 2] = [0; 2]
 
 /// The handle `T` exits through, and the ID it keeps before it does.
 unsafe static var EXIT_WORD: UInt = 0
@@ -201,25 +214,24 @@ func drain(proc: UInt) unsafe {
     }
 }
 
-func pair() unsafe -> UInt {
-    ((&var PAIR) as UnsafePointer<UInt>) as UInt
+func word() unsafe -> UInt {
+    ((&var WORD) as UnsafePointer<UInt>) as UInt
 }
 
-/// Set the pair's owner word.
+/// Set the lock's word.
 func own(owner: UInt) unsafe {
-    PAIR[0] = owner
+    WORD[0] = owner
 }
 
-/// Wait for the pair with `owner` as its owner word, and print the answer.
+/// Wait for the lock with `owner` as its word, and print the answer.
 func wait_for(round: String, owner: UInt) unsafe {
     own(owner)
-    let status = sos_lock_wait(pair())
+    let status = sos_lock_wait(word())
     print("SOS lockraw: {}: status={}", round, status)
 }
 
-/// A word-aligned address inside a string literal, in read-only data, with a
-/// pair's room after it.
-func readonly_pair() unsafe -> UInt {
+/// A word-aligned address inside a string literal, in read-only data.
+func readonly_word() unsafe -> UInt {
     let literal = "a string literal, which lives in this image's read-only data"
     let at = literal.c_string()! as UInt
     at - (at % word_bytes())
@@ -316,7 +328,7 @@ func syscalls(proc: UInt) unsafe -> UInt64 {
 func free_wait(proc: UInt) unsafe -> UInt {
     own(0)
     let before = syscalls(proc)
-    let status = sos_lock_wait(pair())
+    let status = sos_lock_wait(word())
     let after = syscalls(proc)
     // The second reading's own trap is counted in it.
     print("SOS lockraw: free wait: status={} syscalls={}", status,
@@ -402,11 +414,11 @@ func work(i: Int) unsafe sync -> Never {
     if i == WORKER_L {
         raw_l()
     } else if i == WORKER_W {
-        if sos_lock_take(pair()) != STATUS_OK {
+        if sos_lock_take(word()) != STATUS_OK {
             print("SOS lockraw: raw thread: W's take was refused")
         }
         print("SOS lockraw: raw thread: W took the lock")
-        let _ = sos_lock_give(pair())
+        let _ = sos_lock_give(word())
     } else {
         print("SOS lockraw: raw thread: M")
     }
@@ -417,13 +429,13 @@ func work(i: Int) unsafe sync -> Never {
 /// L: take A, then start W, which waits for it and raises L, and M, which
 /// does not take the processor from L so raised.
 func raw_l() unsafe sync {
-    if sos_lock_take(pair()) != STATUS_OK {
+    if sos_lock_take(word()) != STATUS_OK {
         print("SOS lockraw: raw thread: L's take was refused")
     }
     let _ = sos_thread_start_band(WORKER_MADE[WORKER_W], Priority.Rt0 as UInt)
     let _ = sos_thread_start_band(WORKER_MADE[WORKER_M], Priority.High as UInt)
     print("SOS lockraw: raw thread: L releases")
-    let _ = sos_lock_give(pair())
+    let _ = sos_lock_give(word())
     print("SOS lockraw: raw thread: L after")
 }
 
@@ -450,7 +462,7 @@ func torn(proc: UInt) unsafe -> UInt {
 func torn_w() unsafe -> Never {
     let _ = sos_event_signal(STACK_EVENT, sos_thread_id())
     print("SOS lockraw: torn: W waits for H's lock")
-    let status = sos_lock_wait(pair())
+    let status = sos_lock_wait(word())
     print("SOS lockraw: torn: W's wait answered {}", status)
     while { }
 }
@@ -517,6 +529,62 @@ func last_slot(proc: UInt) unsafe -> UInt {
     0
 }
 
+/// `LAST WORD`'s lock, and the sibling W exits through.
+unsafe static var LAST_AT: UInt = 0
+unsafe static var LAST_EXIT: UInt = 0
+
+/// `LAST WORD`: the word is the arena's, so it is put back after the round.
+func last_word(proc: UInt) unsafe -> UInt {
+    LAST_AT = last_writable_word()
+    let last = LAST_AT as UnsafePointer<UInt>
+    let kept = last[0]
+    last[0] = 0
+    var me: UInt = NONE
+    let at_me = (&var me) as UnsafePointer<UInt>
+    if sos_process_thread_self(proc, at_me) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if sos_lock_take(LAST_AT) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    let entry: FuncPointer<(UInt) sync -> Never> = last_word_w
+    let w = made_thread(proc, entry.address(), w_stack_top(), 0)
+    if w == NONE {
+        return EXIT_SETUP
+    }
+    LAST_EXIT = control_sibling(w)
+    if LAST_EXIT == NONE || sos_thread_start(w) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    let _ = sos_thread_yield(me)
+    print("SOS lockraw: last word: waited for, the waiters bit: {}",
+          (last[0] & LOCK_WAITERS_BIT) != 0)
+    if sos_lock_give(LAST_AT) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var code: UInt = 0
+    let _ = sos_thread_join(w, (&var code) as UnsafePointer<UInt>)
+    print("SOS lockraw: last word: given back, the word is {}", last[0])
+    last[0] = kept
+    0
+}
+
+/// `LAST WORD`'s W: take the lock, which waits, and give it back.
+func last_word_w(arg: UInt) sync -> Never {
+    last_word_w_body()
+}
+
+func last_word_w_body() unsafe sync -> Never {
+    print("SOS lockraw: last word: W takes the lock")
+    if sos_lock_take(LAST_AT) != STATUS_OK {
+        print("SOS lockraw: last word: W's take was refused")
+    }
+    print("SOS lockraw: last word: W took the lock")
+    let _ = sos_lock_give(LAST_AT)
+    let _ = sos_thread_exit(LAST_EXIT, 0)
+    while { }
+}
+
 /// `FOREIGN WAKE`.
 func foreign_wake() unsafe -> UInt {
     let status = sos_lock_wake(ADDR)
@@ -563,17 +631,25 @@ func _start(boot_handle: UInt) unsafe {
         wait_for("foreign", ROOT_ID)
         code = 0
     } else if ROLE == ROLE_UNALIGNED {
-        print("SOS lockraw: unaligned: waiting for a pair one byte off")
-        let _ = sos_lock_wait(pair() + 1)
+        print("SOS lockraw: unaligned: waiting for a word one byte off")
+        let _ = sos_lock_wait(word() + 1)
     } else if ROLE == ROLE_READONLY {
-        print("SOS lockraw: readonly: waiting for a pair in a string literal")
-        let _ = sos_lock_wait(readonly_pair())
-    } else if ROLE == ROLE_STRADDLE {
-        print("SOS lockraw: straddle: waiting for a pair past its row's end")
-        let _ = sos_lock_wait(last_writable_word())
+        print("SOS lockraw: readonly: waiting for a word in a string literal")
+        let _ = sos_lock_wait(readonly_word())
+    } else if ROLE == ROLE_LAST_WORD {
+        code = last_word(proc)
+    } else if ROLE == ROLE_OWN_BIT {
+        print("SOS lockraw: own bit: this thread's ID with the waiters bit")
+        wait_for("own bit", sos_thread_id() | LOCK_WAITERS_BIT)
+    } else if ROLE == ROLE_BIT_ALONE {
+        print("SOS lockraw: bit alone: a word holding the waiters bit alone")
+        wait_for("bit alone", LOCK_WAITERS_BIT)
+    } else if ROLE == ROLE_WAKE_READONLY {
+        print("SOS lockraw: wake readonly: waking a word in a string literal")
+        let _ = sos_lock_wake(readonly_word())
     } else if ROLE == ROLE_WAKE_UNALIGNED {
-        print("SOS lockraw: wake unaligned: waking a pair one byte off")
-        let _ = sos_lock_wake(pair() + 1)
+        print("SOS lockraw: wake unaligned: waking a word one byte off")
+        let _ = sos_lock_wake(word() + 1)
     } else if ROLE == ROLE_FOREIGN_WAKE {
         code = foreign_wake()
     } else if ROLE == ROLE_RAW_THREAD {

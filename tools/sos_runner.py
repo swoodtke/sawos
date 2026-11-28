@@ -269,6 +269,7 @@ SECTION_OTHER_PKG = os.path.join(TESTS_DIR, "section-other")
 LOCK_ROOT_PKG = os.path.join(TESTS_DIR, "lock-root")
 LOCK_CHILD_PKG = os.path.join(TESTS_DIR, "lock-child")
 LOCK_RAW_PKG = os.path.join(TESTS_DIR, "lock-raw")
+LOCK_WORD_PKG = os.path.join(TESTS_DIR, "lock-word")
 WAIT_WORD_ROOT_PKG = os.path.join(TESTS_DIR, "wait-word-root")
 WAIT_WORD_CHILD_PKG = os.path.join(TESTS_DIR, "wait-word-child")
 DEADLINE_WAITER_PKG = os.path.join(TESTS_DIR, "deadline-waiter")
@@ -4636,6 +4637,51 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The one-word lock (spec §7), with no tick, played by root's own
+        # threads: `tests/lock-word` says how each round's order is made. A
+        # lock given back while its holder holds another is handed on at
+        # once; an acyclic lock order makes no fault; a holder with no block
+        # is raised like any; a holder's exit answers its waiter `Revoked`;
+        # the word is the holder's ID, with the waiters bit once a thread
+        # waits, and a give with the bit clear makes no trap.
+        "name": "lock_word",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_WORD_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS lockword: nested: W waits for B\n",
+            "SOS lockword: nested: T gives B back, holding A\n",
+            "SOS lockword: nested: W took B\n",
+            "SOS lockword: nested: after B's give, W got B: true\n",
+            "SOS lockword: acyclic: W holds M3 and waits for M2\n",
+            "SOS lockword: acyclic: T gives M2 back, holding M1\n",
+            "SOS lockword: acyclic: W took M2\n",
+            "SOS lockword: acyclic: T takes M3\n",
+            "SOS lockword: acyclic: T took M3\n",
+            "SOS lockword: acyclic: every thread finished\n",
+            "SOS lockword: no block: L releases\n",
+            "SOS lockword: no block: W took the lock\n",
+            "SOS lockword: no block: M\n",
+            "SOS lockword: no block: L after\n",
+            "SOS lockword: holder exits: W waits for the lock L holds\n",
+            "SOS lockword: holder exits: L exits holding the lock\n",
+            "SOS lockword: holder exits: W's take answered Revoked\n",
+            "SOS lockword: waiters bit: the main thread's ID has the bit: "
+            "false\n",
+            "SOS lockword: waiters bit: held, the word is the holder's ID: "
+            "true\n",
+            "SOS lockword: waiters bit: W's ID has the bit: false\n",
+            "SOS lockword: waiters bit: waited for, the holder's ID: true\n",
+            "SOS lockword: waiters bit: waited for, with the bit: true\n",
+            "SOS lockword: waiters bit: W took the lock\n",
+            "SOS lockword: waiters bit: given back, the word is 0\n",
+            "SOS lockword: waiters bit: 100 takes and gives made 0 "
+            "syscalls\n",
+            "SOS lockword: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
         # The inheritance lock (spec §7), with no tick: every switch is one a
         # thread makes, and each scene is set by a driver thread that runs
         # only while every other thread is parked. `tests/lock-root` says
@@ -4753,28 +4799,40 @@ TEST_CASES = [
             "SOS: process fault: argument outside its domain "
             "process={one}",
             "SOS lock: wide ended status=131081\n",
+            "SOS lockraw: own bit: this thread's ID with the waiters bit\n",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS lock: own bit ended status=131077\n",
+            "SOS lockraw: bit alone: a word holding the waiters bit alone\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: bit alone ended status=131081\n",
             "SOS lockraw: foreign: an owner naming the launcher's thread\n",
             "SOS: lock wait: the owner is a thread of another process "
             "waiter={one} holder={zero}\n",
             "SOS: process fault: argument outside its domain "
             "process={one}",
             "SOS lock: foreign ended status=131081\n",
-            "SOS lockraw: unaligned: waiting for a pair one byte off\n",
+            "SOS lockraw: unaligned: waiting for a word one byte off\n",
             "SOS: process fault: buffer is not word-aligned "
             "process={one}",
             "SOS lock: unaligned ended status=131082\n",
-            "SOS lockraw: readonly: waiting for a pair in a string literal\n",
+            "SOS lockraw: readonly: waiting for a word in a string literal\n",
             "SOS: process fault: buffer is outside the process's memory "
             "process={one}",
             "SOS lock: readonly ended status=131083\n",
-            "SOS lockraw: straddle: waiting for a pair past its row's end\n",
-            "SOS: process fault: buffer is outside the process's memory "
-            "process={one}",
-            "SOS lock: straddle ended status=131083\n",
-            "SOS lockraw: wake unaligned: waking a pair one byte off\n",
+            "SOS lockraw: last word: W takes the lock\n",
+            "SOS lockraw: last word: waited for, the waiters bit: true\n",
+            "SOS lockraw: last word: W took the lock\n",
+            "SOS lockraw: last word: given back, the word is 0\n",
+            "SOS lock: last word ended status=65536\n",
+            "SOS lockraw: wake unaligned: waking a word one byte off\n",
             "SOS: process fault: buffer is not word-aligned "
             "process={one}",
             "SOS lock: wake unaligned ended status=131082\n",
+            "SOS lockraw: wake readonly: waking a word in a string literal\n",
+            "SOS: process fault: buffer is outside the process's memory "
+            "process={one}",
+            "SOS lock: wake readonly ended status=131083\n",
             "SOS lockraw: raw thread: L releases\n",
             "SOS lockraw: raw thread: W took the lock\n",
             "SOS lockraw: raw thread: M\n",
@@ -4787,8 +4845,8 @@ TEST_CASES = [
     {
         # A wake answers only threads of the waker's process (spec §7): root
         # and `lock-raw` share a piece of the pool, root's thread W waits on
-        # a lock there, and the child wakes the lock's words at its own
-        # address for them, which on riscv32 and the flat profile is W's. W
+        # a lock there, and the child wakes the lock's word at its own
+        # address for it, which on riscv32 and the flat profile is W's. W
         # stays parked until root gives the lock back. Then `torn`: a thread
         # parked on a lock, whose process is killed while root holds its
         # handle, names no holder, so the exit of the next thread in its
@@ -16919,7 +16977,7 @@ TEST_CASES = [
         # initial thread takes the lock and prints, a worker's `print` then
         # waits for it, and the initial thread prints again and gives it
         # back before the worker's line arrives. Neither thread has a block:
-        # each asks the kernel for its ID, which is the lock's owner word, and
+        # each asks the kernel for its ID, which the lock's word holds, and
         # the worker parks on the lock and is answered at the give. The tick
         # moves the processor and the lock makes the order, so nothing here
         # depends on how many ticks pass.
@@ -26163,6 +26221,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     #                      signal and a Timer's interrupt, and a child's map
     #   section            the section word: a wake, a Timer's fire and another
     #                      process's thread held off a sibling, and its faults
+    #   lock_word          the one-word lock: the kernel's compare-and-swap
+    #                      of the waiters bit into a process's word
     #   timer_oneshot      a Timer fire through a Waiter, with the kernel idle
     #                      on `irq_poll` in between
     #   tier_word          the platform says `Flat`
@@ -26257,6 +26317,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     # check below refuses one named here by mistake, with the gate's reason.
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
                      "lock_owner", "levels", "section", "lock_inherit",
+                     "lock_word",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",

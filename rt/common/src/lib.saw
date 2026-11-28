@@ -495,22 +495,22 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
 // are each written whole under it, so no other thread's output lands inside
 // them.
 //
-// It is the inheritance lock of spec §7: two words, an owner and a waiters
-// flag. The owner is the holder's thread ID, which every thread has
-// (`sos_rt_thread_id`, a per-side hook), and the waiters flag is the kernel's.
+// It is the inheritance lock of spec §7: one word, 0 while free, else the
+// holder's thread ID, which every thread has (`sos_rt_thread_id`, a per-side
+// hook), with the waiters bit, the word's top bit, which the kernel sets.
 // Taking a free lock and giving back one nobody waits for are a
 // compare-and-swap each with no trap. A thread that finds the lock held
-// parks through the `sos_rt_lock_wait` hook, which raises the holder to the
-// waiter's level and answers when the holder gives the lock back; the last
-// give of a lock whose flag is set answers its waiters through
-// `sos_rt_lock_wake`. Every waiter parks, a thread with no block included.
-// This is `sos.Lock`'s protocol, written here because `sos` sits above this
-// module.
+// parks through the `sos_rt_lock_wait` hook, which sets the bit, raises the
+// holder to the waiter's level and answers when the holder gives the lock
+// back; the last give of a lock whose bit is set swaps the word to 0 and
+// answers its waiters through `sos_rt_lock_wake`. Every waiter parks, a
+// thread with no block included. This is `sos.Lock`'s protocol, written here
+// because `sos` sits above this module.
 //
 // The recursion depth is this module's, and only the holder touches it: a
-// thread that finds its own ID in the owner word counts a take, and the
-// give that brings the depth to zero frees the lock. A give by a thread that
-// does not hold the lock changes nothing.
+// thread that finds its own ID in the word, the bit aside, counts a take,
+// and the give that brings the depth to zero frees the lock. A give by a
+// thread that does not hold the lock changes nothing.
 //
 // A wait that finds the holder gone (`Revoked`: it exited holding the lock,
 // and nothing will give it back) panics, naming the lock. The panic sink
@@ -544,8 +544,8 @@ func rt_thread_yield() {
     sos_rt_yield()
 }
 
-/// The owner word, then the waiters flag.
-static OUTPUT: [Atomic<Int>; 2]
+/// The lock's word.
+static OUTPUT: Atomic<Int>
 
 /// How many times the holder has taken the lock; meaningful only while it
 /// holds it.
@@ -554,11 +554,17 @@ static OUTPUT_DEPTH: Atomic<Int>
 /// Nonzero once a wait has found the holder gone.
 static OUTPUT_REVOKED: Atomic<Int>
 
-static OUTPUT_OWNER: Int = 0
-static OUTPUT_WAITERS: Int = 1
+/// The word's waiters bit, its top bit. It is `LOCK_WAITERS_BIT` of the
+/// kernel's ABI, which this module sits below; `sos.rt` asserts the two equal
+/// at compile time.
+public static OUTPUT_WAITERS_BIT: UInt = UInt.max ^ (UInt.max >> 1)
 
-/// The lock's two words, which the kernel's ops take.
-func output_words() unsafe -> UInt {
+func waiters_bit() -> Int {
+    Int.from(truncating: OUTPUT_WAITERS_BIT)
+}
+
+/// The lock's word, which the kernel's ops take.
+func output_word() unsafe -> UInt {
     ((&OUTPUT) as UnsafePointer<Atomic<Int>>) as UInt
 }
 
@@ -567,12 +573,12 @@ func output_words() unsafe -> UInt {
 @export("__saw_rt_output_lock")
 public func rt_output_lock() unsafe {
     let me = sos_rt_thread_id()
-    if OUTPUT[OUTPUT_OWNER].load() == me {
+    if (OUTPUT.load() & ~waiters_bit()) == me {
         OUTPUT_DEPTH.store(OUTPUT_DEPTH.load() &+ 1)
         return
     }
-    while not OUTPUT[OUTPUT_OWNER].compare_exchange(0, me) {
-        if sos_rt_lock_wait(output_words()) != 0 {
+    while not OUTPUT.compare_exchange(0, me) {
+        if sos_rt_lock_wait(output_word()) != 0 {
             output_revoked()
             return
         }
@@ -589,12 +595,12 @@ func output_revoked() {
 }
 
 /// Give the output lock back once: the last give of a holder frees it, and
-/// answers the threads waiting for it. A give by a thread that does not hold
-/// the lock changes nothing.
+/// answers the threads waiting for it when the kernel has set the waiters
+/// bit. A give by a thread that does not hold the lock changes nothing.
 @export("__saw_rt_output_unlock")
 public func rt_output_unlock() unsafe {
     let me = sos_rt_thread_id()
-    if OUTPUT[OUTPUT_OWNER].load() != me {
+    if (OUTPUT.load() & ~waiters_bit()) != me {
         return
     }
     let depth = OUTPUT_DEPTH.load()
@@ -603,10 +609,12 @@ public func rt_output_unlock() unsafe {
         return
     }
     OUTPUT_DEPTH.store(0)
-    let _ = OUTPUT[OUTPUT_OWNER].compare_exchange(me, 0)
-    if OUTPUT[OUTPUT_WAITERS].load() != 0 {
-        let _ = sos_rt_lock_wake(output_words())
+    if OUTPUT.compare_exchange(me, 0) {
+        return
     }
+    // Only the kernel changes a held word, and only to set the bit.
+    let _ = OUTPUT.compare_exchange(me | waiters_bit(), 0)
+    let _ = sos_rt_lock_wake(output_word())
 }
 
 // -----------------------------------------------------------------------------

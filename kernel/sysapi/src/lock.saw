@@ -1,30 +1,27 @@
 //! `Lock`: a lock inside one process whose holder inherits the level of the
 //! threads waiting for it (spec §7).
 //!
-//! A lock is two machine words in the process's memory: the holder's thread
-//! ID, or 0 while it is free, and a waiters flag the kernel writes. Taking a
-//! free lock and giving back one nobody waits for are a compare-and-swap each,
-//! with no trap. A thread that finds the lock held parks in the kernel
-//! (`LOCK_WAIT_OP`), which raises the holder to the waiter's level until it
-//! gives the lock back; a give that finds the flag set traps once
-//! (`LOCK_WAKE_OP`) to answer the waiters. Both are made with no handle, so
-//! every thread can take a lock, one with no Thread handle of its own
-//! included.
+//! A lock is one machine word in the process's memory: 0 while it is free,
+//! else the holder's thread ID, with the waiters bit (`LOCK_WAITERS_BIT`, the
+//! word's top bit) set by the kernel once a thread waits. Taking a free lock
+//! and giving back one nobody waits for are a compare-and-swap each, with no
+//! trap. A thread that finds the lock held parks in the kernel
+//! (`LOCK_WAIT_OP`), which sets the bit and raises the holder to the waiter's
+//! level until it gives the lock back; a give that finds the bit set swaps
+//! the word to 0 and traps once (`LOCK_WAKE_OP`) to answer the waiters. Both
+//! are made with no handle, so every thread can take a lock, one with no
+//! Thread handle of its own included.
 //!
 //! A thread's identity here is its ID, which its block keeps, read once at
 //! the thread's start (every thread a `main` program or `thread_create(run:)`
 //! makes); a thread with no block asks the kernel for it at each take.
 //!
-//! The C floor is `sos_lock_take` and `sos_lock_give`, over the address of
-//! the two words; `Lock` is the same two calls on a pair of its own.
+//! The C floor is `sos_lock_take` and `sos_lock_give`, over the word's
+//! address; `Lock` is the same two calls on a word of its own.
 
-import sosabi.{SosStatus}
+import sosabi.{SosStatus, LOCK_WAITERS_BIT}
 import sos.floor.{checked, sos_lock_wait, sos_lock_wake}
 import sos.rt.{own_thread_id}
-
-/// The owner word, then the waiters flag.
-static OWNER: Int = 0
-static WAITERS: Int = 1
 
 static STATUS_OK: UInt = SosStatus.Ok as UInt
 
@@ -53,13 +50,13 @@ static STATUS_OK: UInt = SosStatus.Ok as UInt
 /// matters. The kernel keeps the address only while a thread waits, and a
 /// waiting thread is inside `take`, which borrows the lock for the whole
 /// wait. A move needs exclusive ownership, which no lock threads share
-/// through a reference has. A held lock nobody waits for may move: the owner
-/// word and the waiters flag move with it, and the give finds them at the new
-/// address. Being movable is what lets a lock be a field of a value that
-/// moves. The C floor (`sos_lock_take`, `sos_lock_give`) takes a bare
-/// address, so a C caller keeps the pair in place itself.
+/// through a reference has. A held lock nobody waits for may move: its word
+/// moves with it, and the give finds it at the new address. Being movable is
+/// what lets a lock be a field of a value that moves. The C floor
+/// (`sos_lock_take`, `sos_lock_give`) takes a bare address, so a C caller
+/// keeps the word in place itself.
 public struct Lock {
-    private words: [Atomic<Int>; 2],
+    private word: Atomic<Int>,
 }
 
 extension Lock: NoCopy {}
@@ -69,7 +66,7 @@ extension Lock: ZeroInit {}
 extension Lock {
     /// A free lock.
     public init() -> Lock {
-        Lock(words: [Atomic(0), Atomic(0)])
+        Lock(word: Atomic(0))
     }
 
     /// Take the lock, waiting while another thread holds it, raised to the
@@ -83,36 +80,37 @@ extension Lock {
     /// inside a held section, or waiting on a finite deadline after
     /// registering with no Clock (`AccessDenied`) ends the process.
     public func take(&self) -> Result<Void, SosStatus> {
-        checked(sos_lock_take(self.pair()))
+        checked(sos_lock_take(self.address()))
     }
 
     /// Give the lock back, answering the threads waiting for it. Giving back
     /// a lock the calling thread does not hold panics.
     public func give(&self) {
-        let status = sos_lock_give(self.pair())
+        let status = sos_lock_give(self.address())
         if status != STATUS_OK {
             panic("sos: Lock.give: the kernel refused the wake: {}", status)
         }
     }
 
-    /// The address of the two words.
-    func pair(&self) unsafe -> UInt {
-        ((&self.words) as UnsafePointer<Atomic<Int>>) as UInt
+    /// The address of the word.
+    func address(&self) unsafe -> UInt {
+        ((&self.word) as UnsafePointer<Atomic<Int>>) as UInt
     }
 }
 
-/// Take the lock whose two words are at `lock` (spec §7): swap the owner word
-/// from 0 to the caller's ID, and while another thread holds it, wait in the
-/// kernel (`sos_lock_wait`), which raises the holder. Answers `SosStatus.Ok`
-/// once the caller holds it, `SosStatus.Revoked` when its holder exited
-/// holding it, and, on a wakeable wait word, `SosStatus.Woken` or
-/// `SosStatus.TimedOut` without it, as `sos_lock_wait` answers them. Taking a
-/// lock the caller holds ends the process.
+/// Take the lock whose word is at `lock` (spec §7): swap the word from 0 to
+/// the caller's ID, and while another thread holds it, wait in the kernel
+/// (`sos_lock_wait`), which sets the waiters bit and raises the holder, then
+/// swap again. Answers `SosStatus.Ok` once the caller holds it,
+/// `SosStatus.Revoked` when its holder exited holding it, and, on a wakeable
+/// wait word, `SosStatus.Woken` or `SosStatus.TimedOut` without it, as
+/// `sos_lock_wait` answers them. Taking a lock the caller holds ends the
+/// process.
 @export("sos_lock_take")
 public func sos_lock_take(lock: UInt) unsafe -> UInt {
-    let words = lock as UnsafePointer<Atomic<Int>>
+    let word = lock as UnsafePointer<Atomic<Int>>
     let me = Int.from(truncating: own_thread_id())
-    while not words[OWNER].compare_exchange(0, me) {
+    while not word[0].compare_exchange(0, me) {
         let status = sos_lock_wait(lock)
         if status != STATUS_OK {
             return status
@@ -121,19 +119,25 @@ public func sos_lock_take(lock: UInt) unsafe -> UInt {
     STATUS_OK
 }
 
-/// Give back the lock whose two words are at `lock` (spec §7): swap the owner
-/// word from the caller's ID to 0, and if the waiters flag is set, trap once
-/// to answer the waiters (`sos_lock_wake`). Answers `SosStatus.Ok`. Giving
-/// back a lock the caller does not hold panics.
+/// Give back the lock whose word is at `lock` (spec §7): swap the word from
+/// the caller's ID to 0 with no trap, or, when the kernel has set the waiters
+/// bit, from the caller's ID with the bit to 0 and then trap once to answer
+/// the waiters (`sos_lock_wake`). Answers `SosStatus.Ok`. Giving back a lock
+/// the caller does not hold panics.
+///
+/// Only the kernel sets the bit, and only in a word naming the holder, so a
+/// first swap that fails leaves the word either the caller's ID with the bit
+/// or another thread's.
 @export("sos_lock_give")
 public func sos_lock_give(lock: UInt) unsafe -> UInt {
-    let words = lock as UnsafePointer<Atomic<Int>>
-    let me = Int.from(truncating: own_thread_id())
-    if not words[OWNER].compare_exchange(me, 0) {
-        panic("sos: Lock.give: the calling thread does not hold the lock")
-    }
-    if words[WAITERS].load() == 0 {
+    let word = lock as UnsafePointer<Atomic<Int>>
+    let me = own_thread_id()
+    if word[0].compare_exchange(Int.from(truncating: me), 0) {
         return STATUS_OK
+    }
+    let waited = Int.from(truncating: me | LOCK_WAITERS_BIT)
+    if not word[0].compare_exchange(waited, 0) {
+        panic("sos: Lock.give: the calling thread does not hold the lock")
     }
     sos_lock_wake(lock)
 }

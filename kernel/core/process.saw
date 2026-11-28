@@ -933,8 +933,10 @@ public(package) func clear_domain(p: ProcessIndex) unsafe {
 // event, so the termination lives above the scheduler and these functions
 // answer with the `FaultReason`. `None` means the buffer is good.
 //
-// These two doors are the only places the kernel dereferences a user address,
-// so they are the only places that turn one into a kernel dereference.
+// These doors, with `copy_out_swap`'s word-sized compare-and-swap through
+// the outward one, are the only places the kernel dereferences a user
+// address, so they are the only places that turn one into a kernel
+// dereference.
 // `hal.phys_to_virt` is the conversion on a tier whose kernel does not run at
 // physical addresses, and the identity otherwise; the code reads the same
 // either way, which keeps this module arch-free.
@@ -973,7 +975,8 @@ public(package) func copy_out_check(p: ProcessIndex, dst: UInt, bytes: UInt) uns
 /// paths), the boot-handle iterator's record, `clock_now`, the stats ops, and
 /// the pipe ops that return a record or a message body (spec §2.1).
 ///
-/// Nothing else in the kernel may dereference a user address for writing.
+/// Nothing else in the kernel may dereference a user address for writing
+/// but `copy_out_swap`, below.
 public(package) func copy_out(p: ProcessIndex, dst: UInt, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if let why = copy_out_check(p, dst, bytes) {
         return why
@@ -986,6 +989,28 @@ public(package) func copy_out(p: ProcessIndex, dst: UInt, src: UInt, bytes: UInt
                                 SegFlag.Write as UInt8) catch { return error }
     copy_bytes(hal.phys_to_virt(pa), src, bytes)
     None
+}
+
+/// Replace the machine word in process `p` at `dst` with `desired` when it
+/// holds `expected`, as one atomic compare-and-swap, and answer whether it
+/// did; a destination `copy_out` would refuse is refused with its reason and
+/// nothing is read or written.
+///
+/// The door outward for a word the process changes concurrently with its own
+/// atomics: a lock word, whose waiters bit `LOCK_WAIT_OP` sets while the
+/// holder's give may swap the word to 0. A plain copy could store a stale
+/// word over a give on a second core; the swap fails instead, and its caller
+/// reads the word again.
+public(package) func copy_out_swap(p: ProcessIndex, dst: UInt, expected: UInt,
+                                   desired: UInt) unsafe -> Result<Bool, FaultReason> {
+    if let why = copy_out_check(p, dst, word_bytes()) {
+        return why
+    }
+    let pa = try translate_user(p, dst, word_bytes(),
+                                SegFlag.Write as UInt8) catch { return error }
+    let word = hal.phys_to_virt(pa) as UnsafePointer<Atomic<Int>>
+    word[0].compare_exchange(Int.from(truncating: expected),
+                             Int.from(truncating: desired))
 }
 
 // -----------------------------------------------------------------------------

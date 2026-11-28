@@ -1,5 +1,5 @@
 // A `LOCK_WAIT_OP`'s early end and its holder's level (spec §7). The wait
-// word, the Clock's word, the Events, the Waiters and the lock's pairs are at
+// word, the Clock's word, the Events, the Waiters and the locks' words are at
 // the C altitude, and the threads are typed. The manifest puts `Low` at level
 // 1, `Normal` at 2 and `High` at 3; the main thread runs at 2, and the image
 // arms no tick, so every switch is one a thread makes.
@@ -30,7 +30,7 @@
 //               and then with a latched wake: `Ok` both times, readiness
 //               first, and the latch is kept for H's next park
 //
-// L then gives the lock back: the waiters flag H's waits left set makes one
+// L then gives the lock back: the waiters bit H's waits left set makes one
 // wake that answers nobody, `Ok`. No line says how long a wait took, only
 // that its deadline passed.
 
@@ -63,10 +63,10 @@ static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
 /// H's wait word. Neither L nor the main thread registers one.
 unsafe static var WORD_H: UInt64 = 0
 
-/// The lock's pair: the holder's ID, then the waiters flag. The second is a
-/// lock nobody takes.
-unsafe static var PAIR: [UInt; 2] = [0; 2]
-unsafe static var FREE_PAIR: [UInt; 2] = [0; 2]
+/// The lock's word: the holder's ID, with the waiters bit once H waits. The
+/// second is a lock nobody takes.
+unsafe static var LOCK_WORD: UInt = 0
+unsafe static var FREE_WORD: UInt = 0
 
 /// Set by H once its deadline's line is printed; `L spins` reads it.
 static H_DONE: Atomic<Int> = Atomic(0)
@@ -103,12 +103,12 @@ func record_bytes() -> UInt {
     (RECORD_WORDS as UInt) * (sizeof<UInt>() as UInt)
 }
 
-func pair() unsafe -> UInt {
-    ((&var PAIR) as UnsafePointer<UInt>) as UInt
+func lock_word() unsafe -> UInt {
+    ((&var LOCK_WORD) as UnsafePointer<UInt>) as UInt
 }
 
-func free_pair() unsafe -> UInt {
-    ((&var FREE_PAIR) as UnsafePointer<UInt>) as UInt
+func free_word() unsafe -> UInt {
+    ((&var FREE_WORD) as UnsafePointer<UInt>) as UInt
 }
 
 func word_h() unsafe -> UInt {
@@ -158,7 +158,7 @@ func l_entry(arg: UInt) sync -> UInt {
 /// L: take the lock, tell the main thread, then act on each signal until
 /// `STOP`, and give the lock back.
 func l_run() unsafe sync -> UInt {
-    if sos_lock_take(pair()) != STATUS_OK {
+    if sos_lock_take(lock_word()) != STATUS_OK {
         print("SOS deadlinelock: L's take was refused")
     }
     let _ = sos_event_signal(EVENT_MAIN, GO)
@@ -181,7 +181,7 @@ func l_run() unsafe sync -> UInt {
         let _ = sos_event_signal(EVENT_MAIN, GO)
     }
     print("SOS deadlinelock: L gives the lock: {}",
-          named(sos_lock_give(pair())))
+          named(sos_lock_give(lock_word())))
     0
 }
 
@@ -198,7 +198,7 @@ func h_wait() unsafe {
 /// Take the lock with `word` in H's wait word, and answer the status.
 func h_take(word: UInt64) unsafe -> UInt {
     WORD_H = word
-    let status = sos_lock_take(pair())
+    let status = sos_lock_take(lock_word())
     WORD_H = 0
     status
 }
@@ -233,13 +233,13 @@ func h_run() unsafe sync -> UInt {
 
     h_wait()
     WORD_H = 1
-    let passed = sos_lock_wait(free_pair())
+    let passed = sos_lock_wait(free_word())
     WORD_H = 0
     print("SOS deadlinelock: H's wait for a free lock, passed word: {}",
           named(passed))
     let _ = sos_thread_wake(H_ID)
     WORD_H = NEVER
-    let latched = sos_lock_wait(free_pair())
+    let latched = sos_lock_wait(free_word())
     WORD_H = 0
     print("SOS deadlinelock: H's wait for a free lock, latched wake: {}",
           named(latched))

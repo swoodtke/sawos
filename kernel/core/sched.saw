@@ -551,14 +551,15 @@ func ready_sibling(t: ThreadIndex, p: Int) -> Bool {
 // The inheritance lock (spec §7)
 // =============================================================================
 //
-// A lock is a pair of machine words in a process's memory: its holder's
-// thread ID, or 0, and a waiters flag the kernel writes. The process takes
-// and gives back a free lock with compare-and-swaps and no trap; the kernel
+// A lock is one machine word in a process's memory: 0 while free, else its
+// holder's thread ID, with the waiters bit (`LOCK_WAITERS_BIT`, the word's
+// top bit) set by the kernel once a thread waits. The process takes and gives
+// back a lock nobody waits for with compare-and-swaps and no trap; the kernel
 // sees a lock only when a thread finds it held (`LOCK_WAIT_OP`) and when a
-// holder gives it back with the flag set (`LOCK_WAKE_OP`).
+// holder gives it back with the bit set (`LOCK_WAKE_OP`).
 //
 // The kernel keeps no record per lock. A thread parked on one names the lock
-// (`ThreadSlot.lock_at`) and the holder its owner word resolved to
+// (`ThreadSlot.lock_at`) and the holder its word resolved to
 // (`ThreadSlot.lock_holder`), and a thread's level is the highest of its base
 // level and the levels of the threads parked naming it as their holder. A
 // wait raises the holder to the waiter's level, and the holder of whatever
@@ -601,11 +602,11 @@ func lock_unpark(w: ThreadIndex, result: SyscallResult) unsafe {
 /// parked on the lock at user address `addr`, in slot order, and bring each
 /// holder one of them named back to what its remaining waiters owe it.
 ///
-/// Every waiter is answered, not only those naming the caller: the caller
-/// writes the waiters flag to zero after this, so a thread left parked would
-/// never be answered. One parked behind a thread that took the lock between
-/// the caller's give and its trap finds it held again and waits again,
-/// raising that holder anew.
+/// Every waiter is answered, not only those naming the caller: the caller's
+/// give swapped the word to 0, waiters bit and all, so a thread left parked
+/// would never be answered. One parked behind a thread that took the lock
+/// between the caller's give and its trap finds it held again and waits
+/// again, raising that holder anew.
 public(package) func lock_wake(p: Int, addr: UInt) {
     var w: Int = 0
     while w < threads().capacity() {
@@ -1807,7 +1808,7 @@ public func kernel_yield() {
 }
 
 /// The kernel's answer to `sosrt`'s thread ID hook, which the output lock's
-/// owner word holds: one identity, as `kernel_lock_owner` answers.
+/// word holds: one identity, as `kernel_lock_owner` answers.
 @export("sos_rt_thread_id")
 public func kernel_thread_id() -> Int {
     1

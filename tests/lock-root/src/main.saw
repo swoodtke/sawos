@@ -19,14 +19,13 @@
 // Given `lock-raw`'s regions and the pool, root runs `foreign wake`. It maps a
 // piece of the pool into itself and takes a lock there through the C floor,
 // and its thread W, at `High`, waits for it and parks. The child, given the
-// same piece, wakes the lock's words at its own address for them, which on a
+// same piece, wakes the lock's word at its own address for them, which on a
 // profile that places both at one address is the address W waits on. The
-// wake answers threads of the waker's process only, so W stays parked until
-// root gives the lock back: the child's line and root's, then W's. The
-// child's wake writes the waiters flag the two share to zero, so root gives
-// the lock back by hand and wakes it. R, a thread of root's at `Low`, is
-// ready across the give, which brings root back to its own level, above R:
-// root's line after W's, then R's.
+// wake answers threads of the waker's process only and writes nothing, so W
+// stays parked until root gives the lock back, and root's give finds the
+// waiters bit W's wait set: the child's line and root's, then W's. R, a
+// thread of root's at `Low`, is ready across the give, which brings root back
+// to its own level, above R: root's line after W's, then R's.
 //
 // Then `torn`: `lock-raw`, mapped with `Normal` at 7, holds a lock and sends
 // root a stack top; root makes W in it on that stack and starts it, and W
@@ -59,7 +58,7 @@
 
 import sos.{Process, Memory, Pool, Thread, Event, BootSet, Priority,
             SosStatus, SystemRight, MapAccess, QuotaKind, sos_lock_take,
-            sos_lock_give, sos_lock_wait, sos_lock_wake, sos_thread_id}
+            sos_lock_give, sos_lock_wait, sos_thread_id}
 import sosmain
 
 /// A status no arm of this case can produce honestly.
@@ -128,7 +127,7 @@ static RAW_WIDE: UInt = 8
 static RAW_FOREIGN: UInt = 9
 static RAW_UNALIGNED: UInt = 10
 static RAW_READONLY: UInt = 11
-static RAW_STRADDLE: UInt = 12
+static RAW_LAST_WORD: UInt = 12
 static RAW_WAKE_UNALIGNED: UInt = 13
 static RAW_FOREIGN_WAKE: UInt = 14
 static RAW_RAW_THREAD: UInt = 15
@@ -137,6 +136,9 @@ static RAW_LAST_SLOT: UInt = 17
 static RAW_DEAD_EXITED: UInt = 18
 static RAW_ID_AND_EXIT: UInt = 19
 static RAW_ID_AND_PARK: UInt = 20
+static RAW_OWN_BIT: UInt = 21
+static RAW_BIT_ALONE: UInt = 22
+static RAW_WAKE_READONLY: UInt = 23
 
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
                                | SystemRight.Transfer)
@@ -223,11 +225,14 @@ func raw_rounds(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
     try raw(&img, &ram, "last slot", RAW_LAST_SLOT, false)
     try raw(&img, &ram, "past slab", RAW_PAST_SLAB, false)
     try raw(&img, &ram, "wide", RAW_WIDE, false)
+    try raw(&img, &ram, "own bit", RAW_OWN_BIT, false)
+    try raw(&img, &ram, "bit alone", RAW_BIT_ALONE, false)
     try raw(&img, &ram, "foreign", RAW_FOREIGN, false)
     try raw(&img, &ram, "unaligned", RAW_UNALIGNED, false)
     try raw(&img, &ram, "readonly", RAW_READONLY, false)
-    try raw(&img, &ram, "straddle", RAW_STRADDLE, false)
+    try raw(&img, &ram, "last word", RAW_LAST_WORD, false)
     try raw(&img, &ram, "wake unaligned", RAW_WAKE_UNALIGNED, false)
+    try raw(&img, &ram, "wake readonly", RAW_WAKE_READONLY, false)
     try raw(&img, &ram, "raw thread", RAW_RAW_THREAD, true)
     return
 }
@@ -337,16 +342,12 @@ func foreign_wake(img: &Memory, ram: &Memory,
     try tell(&child, TAG_ADDR, try theirs.base())
     try start(&child)
     try ended(move child, "foreign wake")
-    // The child's wake wrote the waiters flag both share to zero, so root
-    // gives the lock back by hand: the owner word to zero, then the wake.
     print("SOS lock: foreign wake: root gives the lock back")
     let r = try sosmain.context().process().thread_create(run: foreign_r,
                                                          arg: 0,
                                                          stack_top: top_r())
     try r.start(band: Priority.Low)
-    let words = at as UnsafePointer<UInt>
-    words[0] = 0
-    try taken(sos_lock_wake(at))
+    try taken(sos_lock_give(at))
     print("SOS lock: foreign wake: root after the give")
     let _ = try w.join()
     let _ = try r.join()
@@ -393,7 +394,7 @@ func torn(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
     return
 }
 
-/// A `lock-raw` child waits with `wid` as its lock's owner word.
+/// A `lock-raw` child waits with `wid` as its lock's word.
 func dead_owner(img: &Memory, ram: &Memory, wid: UInt,
                 round: String) -> Result<Void, SosStatus> {
     let child = try sosmain.context().system().process_create(image: &img,
@@ -456,10 +457,10 @@ func foreign_exited(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
     return
 }
 
-/// Wait with `owner` as a pair's owner word, and print the answer.
+/// Wait with `owner` as a lock's word, and print the answer.
 func root_waits(round: String, owner: UInt) unsafe {
-    var pair: [UInt; 2] = [owner, 0]
-    let at = ((&var pair) as UnsafePointer<UInt>) as UInt
+    var word: UInt = owner
+    let at = ((&var word) as UnsafePointer<UInt>) as UInt
     let status = sos_lock_wait(at)
     print("SOS lock: {}: root's wait answered {}", round, status)
 }

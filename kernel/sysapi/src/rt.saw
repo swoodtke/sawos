@@ -33,7 +33,7 @@ import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
 import sos.thread.{Thread}
 import sos.exec.{own_block, thread_word, set_thread_word, end_thread_tasks}
 import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
-               HandleKind, SystemRight}
+               HandleKind, SystemRight, LOCK_WAITERS_BIT}
 
 // A thread's block and its entry are `sos.exec`'s, which keeps the executor
 // word and the wait word in it; a start-up reaches them here.
@@ -228,23 +228,24 @@ func own_thread_handle() unsafe -> UInt {
     block[0].thread
 }
 
-/// The output lock's ID hook: the calling thread's ID, which the lock's owner
-/// word holds while the thread holds it.
+/// The output lock's ID hook: the calling thread's ID, which the lock's word
+/// holds while the thread holds it.
 @export("sos_rt_thread_id")
 func rt_thread_id() unsafe -> Int {
     Int.from(truncating: own_thread_id())
 }
 
-/// The output lock's wait hook: park until the holder gives the lock at
-/// `lock` back, raising it meanwhile (`LOCK_WAIT_OP`). Answers `Ok` to swap
-/// again, or a refusal when the holder is gone.
+/// The output lock's wait hook: set the waiters bit in the word at `lock`
+/// and park until the holder gives the lock back, raising it meanwhile
+/// (`LOCK_WAIT_OP`). Answers `Ok` to swap again, or a refusal when the holder
+/// is gone.
 @export("sos_rt_lock_wait")
 func rt_lock_wait(lock: UInt) -> UInt {
     sos_lock_wait(lock)
 }
 
-/// The output lock's wake hook: answer the threads parked on the lock at
-/// `lock` (`LOCK_WAKE_OP`).
+/// The output lock's wake hook: answer the threads parked on the lock whose
+/// word is at `lock` (`LOCK_WAKE_OP`).
 @export("sos_rt_lock_wake")
 func rt_lock_wake(lock: UInt) -> UInt {
     sos_lock_wake(lock)
@@ -407,7 +408,12 @@ import sos.floor.{sos_pipe_inlet_post, sos_pipe_inlet_call, sos_handle_release}
 import sosabi.{PIPE_BODY_BYTES, PIPE_MSG_HANDLES, PipeSendRecord,
                PipeMsgRecord, PipeMsgMeta, PipeInletHandle,
                pipe_send_record_bytes}
-import sosrt.{LINE_CHUNK, rt_output_lock, rt_output_unlock}
+import sosrt.{LINE_CHUNK, OUTPUT_WAITERS_BIT, rt_output_lock, rt_output_unlock}
+
+// The output lock is written below `sosabi`, so it states the waiters bit
+// itself; the two must be the one bit the kernel sets.
+static_assert(OUTPUT_WAITERS_BIT == LOCK_WAITERS_BIT,
+              "the output lock's waiters bit must be LOCK_WAITERS_BIT")
 
 static_assert(LINE_CHUNK == PIPE_BODY_BYTES - 1,
               "a line's piece is a pipe body less the op byte")

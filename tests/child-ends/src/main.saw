@@ -16,9 +16,9 @@
 //                   that is not one
 //   PANIC           the panic op on `PANIC_BYTES` bytes, past the kernel's
 //                   bound, the byte at `i` being `'a' + i % 26`
-//   LOCK            waits on a lock pair of its own whose owner word is the
-//                   launcher's thread: the kernel's lock-owner line, then the
-//                   `BadArg` fault
+//   LOCK            waits on a lock word of its own that holds the
+//                   launcher's thread's ID: the kernel's lock-owner line, then
+//                   the `BadArg` fault
 //   CLAIM HELD      claims the console while the launcher holds it, and exits
 //                   with `EXIT_SAW_CLAIMED` when the claim answers `Claimed`
 //   RELEASE UNHELD  releases a console it does not hold: the `BadState` fault
@@ -113,8 +113,8 @@ unsafe static var TEXT: [UInt8; PANIC_BYTES] = [0; PANIC_BYTES]
 /// profile that protects memory refuses to run data at all.
 unsafe static var ZEROS: [UInt; 4] = [0; 4]
 
-/// `LOCK`'s pair: the owner word, then the waiters flag.
-unsafe static var PAIR: [UInt; 2] = [0; 2]
+/// `LOCK`'s word.
+unsafe static var WORD: UInt = 0
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -300,10 +300,10 @@ func panic_long() unsafe {
               PANIC_BYTES as UInt)
 }
 
-/// Wait on `PAIR` with `owner`, another process's thread, as its owner.
+/// Wait on `WORD` with `owner`, another process's thread, as its holder.
 func lock_foreign(owner: UInt) unsafe {
-    PAIR[0] = owner
-    let _ = sos_lock_wait(((&var PAIR) as UnsafePointer<UInt>) as UInt)
+    WORD = owner
+    let _ = sos_lock_wait(((&var WORD) as UnsafePointer<UInt>) as UInt)
 }
 
 /// Read this process's own death record, through the System handle's word,

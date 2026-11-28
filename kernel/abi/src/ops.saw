@@ -178,14 +178,14 @@ public static PANIC_OP: UInt = 0xFFFC
 /// looked up as every op is, and no kind's table reaches it.
 public static THREAD_ID_OP: UInt = 0xFFFB
 
-/// LOCK WAIT: wait for the in-process lock whose pair of machine words is at
-/// the address in the first argument, which the caller found held (spec §7):
-/// the holder's thread ID, or 0, then the waiters flag the kernel writes. The
-/// caller parks and the holder is raised to its level until it gives the lock
-/// back.
+/// LOCK WAIT: wait for the in-process lock whose machine word is at the
+/// address in the first argument, which the caller found held (spec §7): 0
+/// while free, else the holder's thread ID, with `LOCK_WAITERS_BIT` set once a
+/// thread has waited. The kernel sets the bit, parks the caller and raises
+/// the holder to its level until it gives the lock back.
 ///
 /// LOCK WAKE: the caller gave the lock at that address back and found the
-/// waiters flag set; every thread of its process parked on it is answered.
+/// waiters bit set; every thread of its process parked on it is answered.
 ///
 /// Both are made with `NO_HANDLE`, as `THREAD_ID_OP` is, and take no handle
 /// and no right: they act only on the calling thread and a lock of its own
@@ -193,6 +193,13 @@ public static THREAD_ID_OP: UInt = 0xFFFB
 /// handle of its own must still be able to wait and to give back.
 public static LOCK_WAIT_OP: UInt = 0xFFFA
 public static LOCK_WAKE_OP: UInt = 0xFFF9
+
+/// The lock word's waiters bit (spec §7): the word's top bit, which the kernel
+/// sets when a thread waits for the lock. A holder whose give finds it set
+/// makes `LOCK_WAKE_OP`; one that finds it clear makes no trap. No thread ID
+/// reaches it: each board's split leaves the word's top bit free, which the
+/// kernel asserts at compile time.
+public static LOCK_WAITERS_BIT: UInt = UInt.max ^ (UInt.max >> 1)
 
 /// WAIT WORD: register the calling thread's wait word (spec §7), the
 /// eight-aligned doubleword at the address in the first argument, which the

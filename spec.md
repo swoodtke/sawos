@@ -3821,8 +3821,8 @@ word it is looked up as every op is, and no kind's table reaches it.
 |---|---|---|
 | `PANIC_OP` | `0xFFFC` | ends the caller as a panic (§8) |
 | `THREAD_ID_OP` | `0xFFFB` | answers the calling thread's ID (§7) |
-| `LOCK_WAIT_OP` | `0xFFFA` | waits for an in-process lock found held (§7) |
-| `LOCK_WAKE_OP` | `0xFFF9` | answers the threads parked on a lock given back (§7) |
+| `LOCK_WAIT_OP` | `0xFFFA` | sets the waiters bit in the word of an in-process lock found held, and waits for it (§7) |
+| `LOCK_WAKE_OP` | `0xFFF9` | answers the threads parked on a lock whose word was given back with its waiters bit set (§7) |
 | `WAIT_WORD_OP` | `0xFFF8` | registers, or with 0 unregisters, the calling thread's wait word, with a Monotonic Clock handle carrying `ClockRight.Read` or with none (§7) |
 | `THREAD_WAKE_OP` | `0xFFF7` | wakes a thread of the caller's process by its ID (§7) |
 | `PARK_OP` | `0xFFF6` | parks the caller on nothing, until its deadline or a wake (§7) |
@@ -4522,62 +4522,102 @@ arm their own.
 - **Every thread has an ID.** A thread ID names a thread and grants
   nothing: its slot's index plus one in the low `THREAD_ID_INDEX_BITS` bits
   and the slot's generation in the `THREAD_ID_GENERATION_BITS` above them,
-  each board's HAL choosing the split within its owner word (12 and 20 on
-  every board today, so 4,095 threads). An ID is opaque: only the kernel
+  each board's HAL choosing the split below a lock word's top bit, which is
+  the lock's waiters bit (below): 12 and 19 on the 32-bit boards, and 12 and
+  20 on arm64, so 4,095 threads everywhere. An ID is opaque: only the kernel
   decodes it, and it is never stored outside the machine or sent anywhere,
   so it needs no portable layout. The generation moves on when the slot is
   freed, so a freed thread's ID does not name the next thread in its slot
-  until the slot has been reused 2^20 times. `THREAD_ID_OP`, made with
-  `NO_HANDLE` as `PANIC_OP` is, answers the caller's own ID; it needs no
-  right and cannot fail. Each board's kernel asserts at compile time that
-  the two fields fit its word and that the thread slab's floor fits the
+  until the slot has been reused 2^19 times on a 32-bit board (2^20 on
+  arm64): the waiters bit costs the 32-bit boards one generation bit, and
+  halves how often a slot may be reused before its ID repeats.
+  `THREAD_ID_OP`, made with `NO_HANDLE` as `PANIC_OP` is, answers the
+  caller's own ID; it needs no right and cannot fail. Each board's kernel
+  asserts at compile time that the two fields fit below its word's top bit,
+  so no ID has the waiters bit set, and that the thread slab's floor fits the
   index field; the slab never grows past the index field, by an image's
   areas or a donation, and the image builder refuses an image whose thread
   total would, naming the bound.
-- **Inheritance inside a process: the lock.** A lock is two machine words
-  in a process's memory: the holder's thread ID, or 0 while it is free, and
-  a waiters flag the kernel writes. Taking and giving back a free lock are
-  compare-and-swaps the process makes, with no syscall. A thread that finds
-  the lock held waits with `LOCK_WAIT_OP(addr)`: the kernel decodes the
-  owner ID, parks the caller and raises the holder to the caller's level,
-  and the holder of whatever lock that holder is parked on, and so on along
-  the chain, until it gives the lock back. A thread's level is the highest
-  of the level its band gave it at its start and the levels of the threads
-  parked naming it as their holder; a raised thread that is ready moves to
-  its new level's list, and one raised while parked elsewhere is woken onto
-  it. A holder that finds the flag set gives back with `LOCK_WAKE_OP(addr)`,
-  which answers every thread of the caller's process parked on the lock with
-  `Ok`, in slot order, clears the flag, and brings each holder they named
-  back to the highest of its base level and its remaining waiters'. The
-  woken go onto their levels' lists, so the highest runs first and takes the
-  lock with its swap; the others find it held and wait again. A give that
-  lowers the giver below a ready thread gives the processor up at its
-  return. Both ops are made with `NO_HANDLE` and need no right: they act
-  only on the calling thread and a lock of its own process, and a thread
-  that holds no Thread handle of its own must still be able to wait and to
-  give back. A holder is always a thread of the waiter's own process, and a
-  raise is to a waiter's own level, so a thread is never raised above a
-  level its own process's map gives. The kernel keeps no record per lock:
-  each waiter names its holder. The read of the owner and the park are one
-  trap, so a give cannot be lost between them.
-- **The lock's answers.** `LOCK_WAIT_OP` first refuses a pair the kernel
-  cannot write: an address that is not word-aligned is the `BadAlign` fault,
-  and a pair outside one writable row is the copy-out door's fault.
-  `LOCK_WAKE_OP` checks only the waiters word it writes, with the same two
-  faults, after answering the threads parked on the pair, of which there are
-  none on a pair the door refuses. Then
-  `LOCK_WAIT_OP` reads the owner word: 0 answers `Ok` at once, and the
-  caller swaps again; the caller's own ID is the `BadState` fault, since the
-  lock is not recursive. An ID whose generation is its slot's names that
-  slot's thread: one that has run and not exited is the holder if it is the
-  caller's process's; one that has exited answers `Revoked` if it is the
-  caller's process's or its process has died, since an exited holder
-  answers `Revoked` whether or not its slot is still held; another live
-  process's thread, live or exited, is the waiter's fault (below); and
-  anything else (a free slot, a thread never started, an invalid thread)
-  holds nothing, the `BadArg` fault. An ID whose generation is behind its slot's,
-  by less than half the generation's range, names a thread that exited and
-  whose slot was freed: `Revoked`. Any other ID (a slot field of zero, one
+- **Inheritance inside a process: the lock.** Every lock in a process is one
+  machine word in the process's memory: 0 while it is free, else the
+  holder's thread ID, with the waiters bit, `LOCK_WAITERS_BIT`, the word's
+  top bit, set once a thread has waited for it. Every lock works this way:
+  `sos.Lock`, the runtime's output lock, and the runtime's lock seams
+  (§10.1). The kernel keeps no record per lock: each parked waiter names the
+  word's address and the holder it found there.
+  - **Acquire** is a compare-and-swap of 0 to the caller's own ID, with no
+    trap. One that fails makes `LOCK_WAIT_OP(addr)` and swaps again once it
+    answers `Ok`.
+  - **Release** is a compare-and-swap of the caller's own ID to 0, with no
+    trap, when the waiters bit is clear. When the kernel has set it, the
+    holder swaps its ID with the bit to 0 and then makes `LOCK_WAKE_OP(addr)`.
+    Only the kernel sets the bit, and only in a word naming the holder, so a
+    first swap that fails finds either the holder's ID with the bit or a lock
+    the caller does not hold.
+  - **The wait** reads the word through the copy-in door in the same trap
+    as the park. A word naming a live thread of the caller's process sets
+    the waiters bit in the word with a compare-and-swap on the process's
+    memory, retried while the word names the same holder, parks the caller
+    and raises the holder to the caller's level, and the holder of whatever
+    lock that holder is parked on, and so on along the chain, until it gives
+    the lock back. A word that names another holder or none by then was
+    given back meanwhile, and the wait answers `Ok`. A thread's level is the
+    highest of the level its band gave it at its start and the levels of the
+    threads parked naming it as their holder; a raised thread that is ready
+    moves to its new level's list, and one raised while parked elsewhere is
+    woken onto it.
+  - **The wake** answers every thread of the caller's process parked on the
+    word with `Ok`, in slot order, and brings each holder they named back to
+    the highest of its base level and its remaining waiters'. It writes
+    nothing: the give swapped the word to 0, bit and all. The woken go onto
+    their levels' lists, so the highest runs first and takes the lock with
+    its swap; the others find it held, set the bit again and wait again. A
+    give that lowers the giver below a ready thread gives the processor up at
+    its return.
+  - **A lock is handed on where it is given back.** The waiters park on the
+    lock's own word, so a lock given back while its holder holds others is
+    handed on at once, and a lock order with no cycle never closes the
+    kernel's chain, however the locks nest. A wait whose walk would pass
+    `LOCK_CHAIN_MAX` holders is still the `LockChain` fault, cycle or not
+    (below).
+  - **Every holder can be raised.** Every thread has an ID, a thread with no
+    block too (it asks the kernel with `THREAD_ID_OP`), so the holder of any
+    lock is named in its word, and a waiter above it raises it.
+  - **No give is lost.** The bit is set before the park and in the word the
+    give swaps, so a give before the wait's swap makes that swap fail and is
+    answered `Ok`, and one after it finds the bit set and traps to wake. On
+    one core the wait's read, its swap and its park are one trap with
+    interrupts masked. On two cores the wake's trap is served under the
+    kernel's one lock, so it comes either before the wait's trap, which then
+    finds the word 0 or its swap failing, or after the park, which it
+    answers: unlike a lock whose waiters flag sits in a second word, no give
+    can fall between the waiter's read of the holder and its park.
+
+  Both ops are made with `NO_HANDLE` and need no right: they act only on the
+  calling thread and a lock of its own process, and a thread that holds no
+  Thread handle of its own must still be able to wait and to give back. A
+  holder is always a thread of the waiter's own process, and a raise is to a
+  waiter's own level, so a thread is never raised above a level its own
+  process's map gives.
+- **The lock's answers.** Both ops first refuse a word the kernel cannot
+  write: an address that is not word-aligned is the `BadAlign` fault, and a
+  word outside one writable row is the copy-out door's fault, so no wait
+  parks on a word the door refuses at the wait. A row can be unmapped while
+  a thread is parked on a word in it; the holder's give then faults, at its
+  own swap or at the wake's check, and the process ends, so no waiter is
+  left parked for good. Then `LOCK_WAIT_OP` reads the word: 0 answers `Ok`
+  at once, and the caller swaps again; the caller's own ID, the waiters bit
+  aside, is the `BadState` fault, since the lock is not recursive. Otherwise the word without its waiters bit is decoded as an ID.
+  An ID whose generation is its slot's names that slot's thread: one that
+  has run and not exited is the holder if it is the caller's process's; one
+  that has exited answers `Revoked` if it is the caller's process's or its
+  process has died, since an exited holder answers `Revoked` whether or not
+  its slot is still held; another live process's thread, live or exited, is
+  the waiter's fault (below); and anything else (a free slot, a thread never
+  started, an invalid thread) holds nothing, the `BadArg` fault. An ID whose
+  generation is behind its slot's, by less than half the generation's range,
+  names a thread that exited and whose slot was freed: `Revoked`. Any other
+  ID (a slot field of zero, as a word holding the waiters bit alone has, one
   naming a slot the slab does not have, a generation ahead of its slot's or
   wider than the field) names no thread there ever was: the `BadArg` fault.
   A chain of holders, each parked on a lock the next holds, that comes back
@@ -4586,28 +4626,66 @@ arm their own.
   cycle or passes the bound`). The bound is on each wait's walk forward
   from its own holder, not on a chain's length: a chain grows past it when
   a thread others wait on parks behind another chain. Every other wait
-  parks. A holder that exits with `ThreadOp.Exit` answers every thread
-  parked naming it with `Revoked`; the kernel cannot see a lock nobody
-  waits on, so the exit itself is no fault. While the caller's section is
-  held, a wait that would park is the `SectionHeld` fault: no sibling, the
-  holder included, could run to give the lock back.
-- **Locks are process-local.** The kernel does not check whether a pair's
-  memory is mapped by another process. A wait that finds a thread of
-  another live process as the owner is the `BadArg` fault of the waiter
+  sets the bit and parks. A holder that exits with `ThreadOp.Exit` answers
+  every thread parked naming it with `Revoked`, and every later wait for a
+  lock it still holds answers `Revoked` too; the kernel cannot see a lock
+  nobody waits on, so the exit itself is no fault. While the caller's
+  section is held, a wait that would park is the `SectionHeld` fault: no
+  sibling, the holder included, could run to give the lock back.
+
+  **A stale holder.** A word left holding the ID of a holder whose slot has
+  been freed since answers by how far the slot's generation has moved on,
+  once per free: 2^19 frees wrap a generation on a 32-bit board, 2^20 on
+  arm64.
+  - **1 to 2^18 − 1 behind** (2^19 − 1 on arm64): `Revoked`, as for an
+    exited holder. The waiter does not park, and the slot's thread is not
+    touched.
+  - **2^18 to 2^19 − 1 behind** (2^19 to 2^20 − 1 on arm64): the
+    generation reads as ahead of its slot's, the `BadArg` fault, which ends
+    the waiter's process. The slot's thread is not touched, unless it is a
+    thread of that process, which ends with it.
+  - **exactly 2^19** (2^20 on arm64): the ID names the slot as it is now,
+    and is answered by the rules above for whatever is there. When that is
+    X, a live thread of the waiter's process, the waiter sets the bit in the
+    word, parks naming X and raises X, though X does not hold the lock. The waiter is answered only by a
+    give of that word or by X's exit. X's own take of that lock then finds
+    its ID with the bit, the `BadState` fault, and X's give of it, which
+    would otherwise panic, swaps the word to 0 and wakes the waiter.
+- **Locks are process-local.** The kernel does not check whether a lock
+  word's memory is mapped by another process. A wait that finds a thread of
+  another live process as the holder is the `BadArg` fault of the waiter
   alone, after the line `SOS: lock wait: the owner is a thread of another
   process waiter=W holder=H`; the holder's process runs on. So a lock
   shared across processes is caught loudly, though only once a wait meets
-  such an owner. A dead process's threads name no process: one that exited
+  such a holder. A dead process's threads name no process: one that exited
   answers `Revoked` and an invalid one is the `BadArg` fault, with no line.
   A wake answers only the waker's own process's threads.
-- **The lock's `sos` side.** `sos.Lock` takes and gives back a pair of its
-  own with the calling thread's ID, which the runtime reads once at the
-  thread's start and keeps in its block (every thread a `main` program or
-  `thread_create(run:)` makes); a thread with no block asks the kernel at
+- **The runtime's lock seams.** Saw's runtime lock seams
+  (`__saw_rt_lock_acquire` and `__saw_rt_lock_release`, which std's
+  channels take) are this lock on the word std gives each lock, with the
+  calling thread's ID, from its block or, on a thread with no block, from
+  `THREAD_ID_OP`. They keep these rules:
+  - **No re-take.** An acquire that finds the caller's own ID in the word,
+    the waiters bit aside, panics, naming the lock by its address, before it
+    traps: the lock is not recursive, and no thread waits on itself.
+  - **`Revoked` panics.** A wait that answers `Revoked`, the holder having
+    exited holding the lock, panics, naming the lock, as the output lock's
+    wait does.
+  - **A plain wait.** The seam's wait runs with the thread's wait word at 0,
+    so the park is plain: it answers only `Ok` or `Revoked`, never `Woken`
+    or `TimedOut`, and a wake made meanwhile stays latched for the thread's
+    next wakeable park. The seam writes the word to 0 for its wait and puts
+    back what was there after.
+  - **No give of a lock not held.** A release that finds neither the
+    caller's ID nor its ID with the bit panics, naming the lock.
+- **The lock's `sos` side.** `sos.Lock` is one word of its own, taken and
+  given back with the calling thread's ID, which the runtime reads once at
+  the thread's start and keeps in its block (every thread a `main` program
+  or `thread_create(run:)` makes); a thread with no block asks the kernel at
   each take. The floor exports `sos_lock_take` and `sos_lock_give` over any
-  pair's address, and `sos_thread_id`, `sos_lock_wait` and `sos_lock_wake`.
-  `Revoked` comes back from `take` as the error, and a give of a lock the
-  caller does not hold panics.
+  lock word's address, `sos_thread_id`, `sos_lock_wait` and `sos_lock_wake`,
+  and `sos` exports `LOCK_WAITERS_BIT`. `Revoked` comes back from `take` as
+  the error, and a give of a lock the caller does not hold panics.
 - **The runtime's locks.** Each window of the runtime's arena and of its
   pool heaps keeps its spin lock, which excludes, and runs inside the
   process's section once the word is registered, which defers the holder's
@@ -4618,42 +4696,14 @@ arm their own.
   call; a program that makes threads another way calls
   `Process.section_register()` itself before it makes them, and until it
   does its windows run unguarded. The output lock is this section's lock:
-  its owner word is the holder's thread ID, for every thread, a thread with
+  one word holding the holder's thread ID, for every thread, a thread with
   no block included; the recursion depth is the runtime's and only the
-  holder touches it; every waiter parks with `LOCK_WAIT_OP`; and the last
-  give of a lock whose waiters flag is set answers them with
-  `LOCK_WAKE_OP`. A wait that answers `Revoked`, the holder having exited
-  holding the lock, panics, naming the output lock. The panic sink takes the
-  lock and never gives it back.
-- **The one-word lock.** Saw's runtime lock seams (`__saw_rt_lock_acquire`
-  and `_release`, which std's channels take) lock one word, zero while free,
-  and inherit through this section's lock:
-  - **The word.** While the lock is held it holds the holder's runtime record
-    (§10.1), or on a thread with no block its odd lock-owner identity.
-  - **Acquire** swaps the word from 0 to the caller's own and raises the
-    thread's lock depth, kept in its record. When the depth goes from 0 to 1
-    the thread takes its record's own inheritance pair with its thread ID. No
-    other thread takes that pair, so this never waits.
-  - **Contention.** An acquire that finds the word held reads the holder. A
-    record is waited on with `LOCK_WAIT_OP` on that record's pair, made
-    while the thread's wait word is 0, so the park is plain and a latched
-    wake never surfaces there as `Woken`. The kernel raises the holder to
-    the waiter's level and answers once the holder has given back every
-    runtime lock it holds, and the waiter swaps again. A holder with no
-    block has no record and no pair, and is spun on: the waiter yields and
-    swaps again, and a waiter with no block of its own holds no Thread
-    handle to yield through (the section word's cost, above), so it spins.
-  - **Release** swaps the caller's own back to 0 and drops the depth. At 0 it
-    gives the pair back, with `LOCK_WAKE_OP` when the waiters flag is set.
-  - **What it leaves stated.** Records are never freed, so a stale holder read
-    is still a record. One given to another thread since makes the waiter wait
-    for that thread instead, which is spurious and ends. The lock is not
-    recursive: before it swaps, an acquire compares the word with the caller's
-    own identity, and a match panics, naming the lock, whether the thread has a
-    block or not, so no thread waits on itself. A wait that answers `Revoked`,
-    the holder having exited holding a runtime lock, panics, naming the lock, as
-    the output lock's wait does; a thread that ends holding one keeps its record
-    for good.
+  holder touches it, a thread finding its own ID in the word, the bit aside,
+  counting a take; every waiter parks with `LOCK_WAIT_OP`; and the last
+  give of a lock whose waiters bit is set swaps the word to 0 and answers
+  them with `LOCK_WAKE_OP`. A wait that answers `Revoked`, the holder having
+  exited holding the lock, panics, naming the output lock. The panic sink
+  takes the lock and never gives it back.
 - **Deadlines and wakes: the wait word.** A thread may register one doubleword
   in its own memory with `WAIT_WORD_OP(addr, clock)`, made with `NO_HANDLE` as
   the lock's ops are, and so are `PARK_OP` and `THREAD_WAKE_OP` (below). The
@@ -4703,7 +4753,7 @@ arm their own.
   Each op's section says what its early end leaves: `Wait` (§2.2), `Call`,
   `Resolve` and `ReplyWait` (§2.1), `Join` (§8). A `LOCK_WAIT_OP` that ends
   early is taken off its holder, and the holder is brought back to the
-  highest of its base level and its remaining waiters'; the waiters flag
+  highest of its base level and its remaining waiters'; the waiters bit
   stays set, so the holder's give makes one `LOCK_WAKE_OP` that answers
   nobody, which is harmless.
 - **The wait word's answers.** `WAIT_WORD_OP(addr, clock)` registers the
@@ -5473,8 +5523,8 @@ nothing to the console but what a stop of the machine writes.
 ### 10.1 The task executor
 
 Partly built (§11): the entries' declarations, the seams, the close, the
-drive in the typed wrappers and `send`'s fallback are built, and the one-word
-lock is specified here and not built yet.
+drive in the typed wrappers and `send`'s fallback are built, and the lock
+seams, whose rules §7 gives ("The runtime's lock seams"), are not built yet.
 
 Saw's tasks run on a cooperative executor in std, which reaches the machine
 through a set of runtime seams (sawlang's `runtime/ABI.md` at the pinned
@@ -5518,18 +5568,17 @@ and the wakeable-forever parks (§2.6, §7).
   block; a thread that runs tasks enters one with sos.rt.enter_thread_block
   before it spawns`. The panic is the runtime's own, not program code.
 
-**The runtime record.** Each thread with a block that parks or locks through
-the runtime has one record, holding its thread ID, `parked` and `seen`
-(below), its lock pair and its lock depth (§7's one-word lock). It keeps no
-kernel object. Records live on a process-wide list that only grows: a thread
-takes a free one, or makes one with the runtime's allocator, the first time
-it needs one, keeps its address in its block, and gives it back at its close
-(§8). A record is never freed, so a stale pointer another thread holds always
-lands in a valid record. A thread that takes a record, fresh or given back by
-another, takes it with `seen` set to none, so its first poll answers at once:
-a wake made before it held the record, while it held none or the record had
-another owner, is not lost, at the cost of one early answer, which a poll is
-allowed.
+**The runtime record.** Each thread with a block that parks through the
+runtime has one record, holding its thread ID, `parked` and `seen` (below).
+It keeps no kernel object. Records live on a process-wide list that only
+grows: a thread takes a free one, or makes one with the runtime's allocator,
+the first time it needs one, keeps its address in its block, and gives it
+back at its close (§8). A record is never freed, so a stale pointer another
+thread holds always lands in a valid record. A thread that takes a record,
+fresh or given back by another, takes it with `seen` set to none, so its
+first poll answers at once: a wake made before it held the record, while it
+held none or the record had another owner, is not lost, at the cost of one
+early answer, which a poll is allowed.
 
 **The process-wide state** is these words, each an atomic:
 
@@ -5618,7 +5667,8 @@ since the wrappers drive (below).
   - **The latch catches the race.** A wake that lands as a thread returns
     from its park is latched (§7), so that thread's next wakeable park
     returns early, which a poll is allowed to do.
-- **`lock_acquire` / `lock_release`:** §7's one-word lock.
+- **`lock_acquire` / `lock_release`:** §7's lock, over the word std gives
+  each lock, by the rules §7's "The runtime's lock seams" gives.
 
 **The drive in the typed wrappers.** Each wrapper that parks for a program
 drives the thread's tasks around its op: `Waiter.wait`,
@@ -5820,11 +5870,12 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **The task executor's lock** (§10.1): the one-word lock (§7). `sos.exec`'s
-  seams, the background entries' declarations, the close at a thread's end
-  (§8), the drive in the typed wrappers and `send`'s fallback are built, so a
-  program spawns and runs tasks and a wait runs them, but a channel fails at
-  link, naming `__saw_rt_lock_acquire`.
+- **The task executor's lock** (§10.1): the runtime's lock seams over §7's
+  lock, by §7's rules for them. `sos.exec`'s seams, the background entries'
+  declarations, the close at a thread's end (§8), the drive in the typed
+  wrappers and `send`'s fallback are built, so a program spawns and runs
+  tasks and a wait runs them, but a channel fails at link, naming
+  `__saw_rt_lock_acquire`.
 - **The thread gate** (§10.1). A `Channel.receive` made in thread context,
   outside any task, and a `TaskGroup(threads:)` reach std's thread gate, the
   `__saw_rt_pthread_*` mutex and condition-variable seams, and a

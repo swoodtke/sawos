@@ -47,12 +47,12 @@
 //   RELOCK    the main thread takes A twice: the `BadState` fault
 //   GIVE UNHELD   the main thread gives back a lock it does not hold: a panic
 //   UNCONTENDED   W (`Low`) waits for A while the main thread holds it, and
-//             the main thread's give answers it, which sets the waiters flag
-//             and clears it; the give leaves the main thread at its own
-//             level, above W, so its line comes first. Then 100 takes and
-//             gives make no syscall
-//   STALE     A (`Low`) takes K and writes its owner word back to 0, as a
-//             give does before it traps. U (`High`) takes B and parks; X
+//             the main thread's give answers it: W's wait set the waiters
+//             bit, and the give swaps it away with the word. The give leaves
+//             the main thread at its own level, above W, so its line comes
+//             first. Then 100 takes and gives make no syscall
+//   STALE     A (`Low`) takes K and writes its word back to 0, as a give
+//             does before it traps. U (`High`) takes B and parks; X
 //             (`Rt0`) takes K and waits for B, raising U to 4; V (`Rt1`)
 //             waits for K, raising X and, through X, U to 5. A's wake
 //             answers V, whose holder is X, not A, and V does not wait
@@ -770,7 +770,7 @@ func stale_a(arg: UInt) sync -> UInt {
     0
 }
 
-/// A takes K and puts its owner word back to 0 without a trap, then starts U,
+/// A takes K and puts its word back to 0 without a trap, then starts U,
 /// X and V in turn, each running until it parks, and wakes K's waiters.
 func stale_a_body() unsafe sync {
     take(&LOCK_K, "stale")

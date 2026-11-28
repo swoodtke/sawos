@@ -419,7 +419,7 @@ public func sos_thread_yield(handle: UInt) -> UInt {
 /// The calling thread's own ID (spec §7): a number naming the thread, which
 /// grants nothing. It is made with no handle, needs no right and cannot fail.
 /// The ID of a thread that has exited and whose slot was freed names no later
-/// thread. A lock's owner word is its holder's ID.
+/// thread. A lock's word holds its holder's ID.
 @export("sos_thread_id")
 public func sos_thread_id() unsafe -> UInt {
     var id: UInt = 0
@@ -428,15 +428,17 @@ public func sos_thread_id() unsafe -> UInt {
     id
 }
 
-/// Wait for the in-process lock whose two words are at `lock`, which the
-/// caller found held (spec §7): the holder's thread ID, or 0, then the waiters
-/// flag the kernel writes. It is made with no handle and needs no right: it
-/// acts only on the calling thread and a lock of its own process.
-/// `sos_lock_take` is the whole take, swap included.
+/// Wait for the in-process lock whose word is at `lock`, which the caller
+/// found held (spec §7): 0 while free, else the holder's thread ID, with
+/// `LOCK_WAITERS_BIT` set by the kernel once a thread waits. It is made with
+/// no handle and needs no right: it acts only on the calling thread and a
+/// lock of its own process. `sos_lock_take` is the whole take, swap included.
 ///
-/// A holder that is a thread of this process is raised to the caller's level
-/// while the caller parks, and the answer is `SosStatus.Ok` once it gives the
-/// lock back, after which the caller swaps again. A lock already free answers
+/// The kernel sets the waiters bit in the word before the caller parks, so
+/// the holder's give finds it and wakes. A holder that is a thread of this
+/// process is raised to the caller's level while the caller parks, and the
+/// answer is `SosStatus.Ok` once it gives the lock back, after which the
+/// caller swaps again. A lock already free answers
 /// `Ok` at once. A holder that has exited answers `SosStatus.Revoked`, and so
 /// does a wait parked on one when it exits. A wait that would park reads the
 /// caller's wait word (`sos_wait_word`): on a wakeable word it answers
@@ -446,9 +448,9 @@ public func sos_thread_id() unsafe -> UInt {
 /// Clock terminates the caller (`AccessDenied`).
 ///
 /// Terminating the caller, decided in this order: a `lock` that is not
-/// word-aligned, a pair the kernel cannot write, an owner word that is the
-/// caller's own ID (`BadState`: the lock is not recursive), an owner word that
-/// names no thread there ever was, a thread never started or another
+/// word-aligned, a word the kernel cannot write, a word holding the caller's
+/// own ID (`BadState`: the lock is not recursive), a word whose ID names no
+/// thread there ever was, a thread never started or another
 /// process's thread (`BadArg`; for another process's thread the kernel first
 /// writes a line naming both processes), and a chain of holders, each parked
 /// on a lock the next holds, that comes back to the caller or passes four
@@ -459,12 +461,13 @@ public func sos_lock_wait(lock: UInt) -> UInt {
     sos_syscall1(NO_HANDLE, LOCK_WAIT_OP, lock)
 }
 
-/// Answer every thread of this process parked on the lock at `lock`, which
-/// the caller gave back and found its waiters flag set (spec §7), clear the
-/// flag, and bring each holder they named back to the level its remaining
-/// waiters owe it. Made with no handle, as `sos_lock_wait` is; a `lock` that
-/// is not word-aligned, or a pair the kernel cannot write, terminates the
-/// caller. `sos_lock_give` is the whole give.
+/// Answer every thread of this process parked on the lock whose word is at
+/// `lock`, which the caller gave back, swapping the word to 0, and found its
+/// waiters bit set (spec §7), and bring each holder they named back to the
+/// level its remaining waiters owe it. The word is not written. Made with no
+/// handle, as `sos_lock_wait` is; a `lock` that is not word-aligned, or a word
+/// the kernel cannot write, terminates the caller. `sos_lock_give` is the
+/// whole give.
 @export("sos_lock_wake")
 public func sos_lock_wake(lock: UInt) -> UInt {
     sos_syscall1(NO_HANDLE, LOCK_WAKE_OP, lock)

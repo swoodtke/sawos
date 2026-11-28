@@ -1,0 +1,340 @@
+// The one-word lock (spec §7), played by a root's own threads. Root's
+// manifest puts its main thread at `Normal`, level 2, with `Low` at 1 and
+// `High` at 3. This image's kernel arms no tick, so every switch is one a
+// thread makes: a start or a wake of a thread above the running one, a give
+// that lowers the giver below a ready thread, a park, a yield or an exit. The
+// main thread starts each round's first thread below itself and joins it, so
+// the round runs while the main thread is parked. At one level a yield
+// returns once every thread that was ready at it has run until it parked,
+// yielded or exited.
+//
+//   NESTED       T (`Low`) takes A and then B, and yields; W (`Low`), started
+//                after it, runs until it parks waiting for B. T gives B back
+//                while it holds A, and yields again: W was answered at the
+//                give, so it takes B and exits before T goes on, and T sees
+//                that W got B while T still held A
+//   ACYCLIC      T (`Low`) takes M1 and M2 and starts W (`High`), which runs
+//                at once, takes M3 and waits for M2, raising T. T gives M2
+//                back holding M1, which answers W and lowers T below it: W
+//                takes M2 and gives both back. T then takes M3. The order
+//                M1 before M2, M1 before M3 and M3 before M2 has no cycle,
+//                so no wait faults and every thread finishes
+//   NO BLOCK     L, made at an entry of its own and so with no block, takes
+//                the lock through the kernel's ID at `Low` and starts W
+//                (`High`), which waits for it and raises L to 3, then M
+//                (`Normal`), which therefore does not take the processor from
+//                L. L's give lowers it below both: L releases, W, M, L after
+//   HOLDER EXITS L (`Low`) takes the lock and starts W (`High`), which waits
+//                for it; L exits holding it, and W's take answers `Revoked`
+//   WAITERS BIT  the main thread's ID has no waiters bit. It takes the lock,
+//                which leaves its word its ID alone; W (`High`) waits for it,
+//                and the word then holds the main thread's ID with the bit.
+//                The main thread's give swaps it to 0 and answers W, which
+//                takes the lock and gives it back. Then 100 takes and gives
+//                with nobody waiting make no syscall
+
+import sos.{Lock, Priority, SosStatus, Thread, LOCK_WAITERS_BIT, sos_thread_id}
+import sosmain
+
+extern "C" {
+    func __saw_rt_thread_yield()
+}
+
+static LOCK_A: Lock
+static LOCK_B: Lock
+static LOCK_M1: Lock
+static LOCK_M2: Lock
+static LOCK_M3: Lock
+static LOCK_N: Lock
+static LOCK_X: Lock
+static LOCK_Y: Lock
+
+/// `NESTED`'s W has taken B.
+static W_GOT_B: Atomic<Int> = Atomic(0)
+
+/// Three threads' stacks, besides the main thread's. A thread that prints
+/// wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+static STACKS: Int = 3
+unsafe static var STACK: [UInt; STACK_WORDS * STACKS] = [0; STACK_WORDS * STACKS]
+
+/// The Threads a round's first thread starts, by address.
+unsafe static var STARTS_W: UInt = 0
+unsafe static var STARTS_M: UInt = 0
+
+/// The takes and gives `WAITERS BIT` counts.
+static ROUNDS: Int = 100
+
+/// The top of stack `i`.
+func top(i: Int) unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + ((i + 1) * STACK_WORDS) as UInt * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    try nested()
+    try acyclic()
+    try no_block()
+    try holder_exits()
+    try waiters_bit()
+    print("SOS lockword: done")
+    return
+}
+
+/// A thread of this process that runs `run(arg)` on stack `i`.
+func spawn(run: FuncPointer<(UInt) sync -> UInt>,
+           i: Int) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: 0,
+                                              stack_top: top(i))
+}
+
+func join(t: &Thread) -> Result<Void, SosStatus> {
+    let _ = try t.join()
+    return
+}
+
+func take(lock: &Lock, who: String) sync {
+    try lock.take() catch {
+        panic("SOS lockword: {}: the take was refused: {}", who, error)
+    }
+}
+
+/// The address of `thread`, for another thread to start it.
+func address_of(thread: &var Thread) unsafe -> UInt {
+    ((&var thread) as UnsafePointer<Thread>) as UInt
+}
+
+/// Start the Thread at `at`, at `band`.
+func start_at(at: UInt, band: Priority, who: String) unsafe sync {
+    let t = at as UnsafePointer<Thread>
+    try t[0].start(band: band) catch {
+        panic("SOS lockword: {}: the start was refused: {}", who, error)
+    }
+}
+
+/// `WAITERS BIT`'s lock's word, as the kernel and the takes see it.
+func word_y() unsafe -> UInt {
+    let at = ((&LOCK_Y) as UnsafePointer<Lock>) as UInt
+    (at as UnsafePointer<UInt>)[0]
+}
+
+// -----------------------------------------------------------------------------
+// NESTED
+// -----------------------------------------------------------------------------
+
+func nested() -> Result<Void, SosStatus> {
+    let t = try spawn(nested_t, 0)
+    let w = try spawn(nested_w, 1)
+    try t.start(band: Priority.Low)
+    try w.start(band: Priority.Low)
+    try join(&t)
+    try join(&w)
+}
+
+func nested_t(arg: UInt) sync -> UInt {
+    nested_t_body()
+    0
+}
+
+func nested_t_body() unsafe sync {
+    take(&LOCK_A, "nested")
+    take(&LOCK_B, "nested")
+    __saw_rt_thread_yield()
+    print("SOS lockword: nested: T gives B back, holding A")
+    LOCK_B.give()
+    __saw_rt_thread_yield()
+    print("SOS lockword: nested: after B's give, W got B: {}",
+          W_GOT_B.load() == 1)
+    LOCK_A.give()
+}
+
+func nested_w(arg: UInt) sync -> UInt {
+    print("SOS lockword: nested: W waits for B")
+    take(&LOCK_B, "nested")
+    W_GOT_B.store(1)
+    print("SOS lockword: nested: W took B")
+    LOCK_B.give()
+    0
+}
+
+// -----------------------------------------------------------------------------
+// ACYCLIC
+// -----------------------------------------------------------------------------
+
+func acyclic() unsafe -> Result<Void, SosStatus> {
+    var w = try spawn(acyclic_w, 1)
+    STARTS_W = address_of(&var w)
+    let t = try spawn(acyclic_t, 0)
+    try t.start(band: Priority.Low)
+    try join(&t)
+    try join(&w)
+    print("SOS lockword: acyclic: every thread finished")
+    return
+}
+
+func acyclic_t(arg: UInt) sync -> UInt {
+    acyclic_t_body()
+    0
+}
+
+func acyclic_t_body() unsafe sync {
+    take(&LOCK_M1, "acyclic")
+    take(&LOCK_M2, "acyclic")
+    start_at(STARTS_W, Priority.High, "acyclic")
+    print("SOS lockword: acyclic: T gives M2 back, holding M1")
+    LOCK_M2.give()
+    print("SOS lockword: acyclic: T takes M3")
+    take(&LOCK_M3, "acyclic")
+    print("SOS lockword: acyclic: T took M3")
+    LOCK_M3.give()
+    LOCK_M1.give()
+}
+
+func acyclic_w(arg: UInt) sync -> UInt {
+    take(&LOCK_M3, "acyclic")
+    print("SOS lockword: acyclic: W holds M3 and waits for M2")
+    take(&LOCK_M2, "acyclic")
+    print("SOS lockword: acyclic: W took M2")
+    LOCK_M2.give()
+    LOCK_M3.give()
+    0
+}
+
+// -----------------------------------------------------------------------------
+// NO BLOCK
+// -----------------------------------------------------------------------------
+
+func no_block() unsafe -> Result<Void, SosStatus> {
+    var w = try spawn(no_block_w, 1)
+    var m = try spawn(no_block_m, 2)
+    STARTS_W = address_of(&var w)
+    STARTS_M = address_of(&var m)
+    let entry: FuncPointer<(UInt) sync -> Never> = no_block_l
+    let l = try sosmain.context().process().thread_create(entry: entry.address(),
+                                                         stack_top: top(0),
+                                                         arg: 0)
+    try l.start(band: Priority.Low)
+    try join(&l)
+    try join(&w)
+    try join(&m)
+}
+
+/// L: a thread with no block, so every take asks the kernel for its ID. It
+/// cannot return, so it exits through a handle of its own.
+func no_block_l(arg: UInt) sync -> Never {
+    no_block_l_body()
+    let me = try sosmain.context().process().thread_self() catch {
+        panic("SOS lockword: no block: L's own handle was refused: {}", error)
+    }
+    let _ = (move me).exit(code: 0)
+    while { }
+}
+
+func no_block_l_body() unsafe sync {
+    take(&LOCK_N, "no block")
+    start_at(STARTS_W, Priority.High, "no block")
+    start_at(STARTS_M, Priority.Normal, "no block")
+    print("SOS lockword: no block: L releases")
+    LOCK_N.give()
+    print("SOS lockword: no block: L after")
+}
+
+func no_block_w(arg: UInt) sync -> UInt {
+    take(&LOCK_N, "no block")
+    print("SOS lockword: no block: W took the lock")
+    LOCK_N.give()
+    0
+}
+
+func no_block_m(arg: UInt) sync -> UInt {
+    print("SOS lockword: no block: M")
+    0
+}
+
+// -----------------------------------------------------------------------------
+// HOLDER EXITS
+// -----------------------------------------------------------------------------
+
+func holder_exits() unsafe -> Result<Void, SosStatus> {
+    var w = try spawn(exits_w, 1)
+    STARTS_W = address_of(&var w)
+    let l = try spawn(exits_l, 0)
+    try l.start(band: Priority.Low)
+    try join(&l)
+    try join(&w)
+}
+
+func exits_l(arg: UInt) sync -> UInt {
+    exits_l_body()
+    0
+}
+
+func exits_l_body() unsafe sync {
+    take(&LOCK_X, "holder exits")
+    start_at(STARTS_W, Priority.High, "holder exits")
+    print("SOS lockword: holder exits: L exits holding the lock")
+}
+
+func exits_w(arg: UInt) sync -> UInt {
+    print("SOS lockword: holder exits: W waits for the lock L holds")
+    let answer = match LOCK_X.take() {
+        case Ok(_) -> "Ok",
+        case Err(e) -> {
+            match e {
+                case Revoked -> "Revoked",
+                case _ -> "another status",
+            }
+        },
+    }
+    print("SOS lockword: holder exits: W's take answered {}", answer)
+    0
+}
+
+// -----------------------------------------------------------------------------
+// WAITERS BIT
+// -----------------------------------------------------------------------------
+
+func waiters_bit() unsafe -> Result<Void, SosStatus> {
+    let me = sos_thread_id()
+    print("SOS lockword: waiters bit: the main thread's ID has the bit: {}",
+          (me & LOCK_WAITERS_BIT) != 0)
+    take(&LOCK_Y, "waiters bit")
+    print("SOS lockword: waiters bit: held, the word is the holder's ID: {}",
+          word_y() == me)
+    let w = try spawn(bit_w, 0)
+    try w.start(band: Priority.High)
+    let word = word_y()
+    print("SOS lockword: waiters bit: waited for, the holder's ID: {}",
+          (word & ~LOCK_WAITERS_BIT) == me)
+    print("SOS lockword: waiters bit: waited for, with the bit: {}",
+          (word & LOCK_WAITERS_BIT) != 0)
+    LOCK_Y.give()
+    print("SOS lockword: waiters bit: given back, the word is {}",
+          word_y())
+    try join(&w)
+    let before = try sosmain.context().process().stats()
+    var i: Int = 0
+    while i < ROUNDS {
+        take(&LOCK_Y, "waiters bit")
+        LOCK_Y.give()
+        i = i + 1
+    }
+    let after = try sosmain.context().process().stats()
+    // The second reading's own trap is counted in it.
+    print("SOS lockword: waiters bit: {} takes and gives made {} syscalls",
+          ROUNDS, after.syscalls - before.syscalls - 1)
+    return
+}
+
+func bit_w(arg: UInt) sync -> UInt {
+    bit_w_body()
+    0
+}
+
+func bit_w_body() unsafe sync {
+    print("SOS lockword: waiters bit: W's ID has the bit: {}",
+          (sos_thread_id() & LOCK_WAITERS_BIT) != 0)
+    take(&LOCK_Y, "waiters bit")
+    print("SOS lockword: waiters bit: W took the lock")
+    LOCK_Y.give()
+}

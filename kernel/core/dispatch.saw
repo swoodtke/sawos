@@ -142,6 +142,7 @@ import sosabi.{
     THREAD_ID_OP,
     LOCK_WAIT_OP,
     LOCK_WAKE_OP,
+    LOCK_WAITERS_BIT,
     WAIT_WORD_OP,
     THREAD_WAKE_OP,
     PARK_OP,
@@ -348,6 +349,7 @@ import kcore.process.{
     copy_in_check,
     copy_out,
     copy_out_check,
+    copy_out_swap,
     domain_changed,
     executable_at,
     in_image_row,
@@ -2355,65 +2357,74 @@ func caller_thread_id() unsafe -> UInt {
     thread_id(CURRENT_THREAD)
 }
 
-/// `LOCK_WAIT_OP`'s first answer (spec §7): a pair the copy-out door refuses
-/// is that door's fault, which is `BadAlign` for an `addr` that is not
-/// word-aligned before anything about its row. The pair is the kernel's to
-/// write, so it is held to the door the kernel writes through, before the
-/// owner word is read.
-func lock_pair_check(p: Int, addr: UInt) unsafe {
-    if let why = copy_out_check(ProcessIndex(p), addr, word_bytes() * 2) {
+/// The lock word's first check (spec §7), for both of its ops: a word the
+/// copy-out door refuses is that door's fault, which is `BadAlign` for an
+/// `addr` that is not word-aligned before anything about its row. The kernel
+/// writes the word's waiters bit, so the word is held to the door the kernel
+/// writes through, before it is read.
+func lock_word_check(p: Int, addr: UInt) unsafe {
+    if let why = copy_out_check(ProcessIndex(p), addr, word_bytes()) {
         fault_process(p, why)
     }
 }
 
-/// `LOCK_WAIT_OP(addr)`: wait for the lock at `addr`, which the caller found
-/// held, raising its holder (spec §7). Made with no handle: it acts only on
-/// the calling thread and a lock of its own process.
+/// The lock word at `addr` in process `p`, read through the copy-in door.
+func lock_word(p: Int, addr: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    if let why = copy_in(ProcessIndex(p), ((&var word) as UnsafePointer<UInt>) as UInt, addr,
+                         word_bytes()) {
+        fault_process(p, why)
+    }
+    word
+}
+
+/// `LOCK_WAIT_OP(addr)`: wait for the lock whose word is at `addr`, which the
+/// caller found held, raising its holder (spec §7). Made with no handle: it
+/// acts only on the calling thread and a lock of its own process.
 ///
-/// After `lock_pair_check`, the owner word is read and the answers are, in
-/// order:
+/// After `lock_word_check`, the word is read and the answers are, in order:
 ///
 ///   - 0: the lock was given back between the caller's swap and its trap.
 ///     `Ok` without parking, and the caller swaps again.
-///   - the caller's own ID: the `BadState` fault, since the kernel's lock is
-///     not recursive.
-///   - otherwise the word is decoded as an ID (`thread_named`): the
-///     holder, or `Revoked` without parking when the holder has exited, or
-///     the `BadArg` fault.
+///   - the caller's own ID, the waiters bit aside: the `BadState` fault, since
+///     the kernel's lock is not recursive.
+///   - otherwise the word without its waiters bit is decoded as an ID
+///     (`thread_named`): the holder, or `Revoked` without parking when the
+///     holder has exited, or the `BadArg` fault.
 ///   - a holder whose chain (each holder parked on a lock the next holds)
 ///     comes back to the caller, or would pass `LOCK_CHAIN_MAX` holders: the
 ///     `LockChain` fault.
 ///   - the caller's wait word (`park_plan`): on a wakeable word, `Woken` for
 ///     a latched wake or `TimedOut` for a deadline passed, without parking
-///     and with the flag left as it was.
+///     and with the word as it was.
 ///
-/// Otherwise the caller parks: the waiters flag is written nonzero, the lock
-/// and the holder are recorded in its slot, and the chain is raised to its
-/// level. A parked waiter is answered by a wake with `Ok` or by its holder's
-/// exit with `Revoked`, and a wakeable one by its deadline or another
-/// thread's wake (`end_park`), which lowers the holder again. A park while
-/// the caller's section is held is `ktrap`'s `SectionHeld`, as every park is.
-/// A caller with no thread, a harness kernel's, has nothing to wait with: the
-/// `BadState` fault.
+/// Otherwise the waiters bit is set in the word with a compare-and-swap
+/// (`copy_out_swap`) that expects the word as read, retried while the word
+/// still names the same holder; a word that names another, or none, was
+/// given back meanwhile, and the caller is answered `Ok` to swap again. Then
+/// the caller parks: the lock and the holder are recorded in its slot, and
+/// the chain is raised to its level. A parked waiter is answered by a wake
+/// with `Ok` or by its holder's exit with `Revoked`, and a wakeable one by
+/// its deadline or another thread's wake (`end_park`), which lowers the
+/// holder again. A park while the caller's section is held is `ktrap`'s
+/// `SectionHeld`, as every park is. A caller with no thread, a harness
+/// kernel's, has nothing to wait with: the `BadState` fault.
 ///
-/// The read of the owner and the park are one trap with interrupts masked,
-/// so a give cannot slip between them: one that swapped the owner to 0 before
-/// this trap is the first answer, and one whose read of the flag comes after
-/// this park sees it set and traps to wake.
+/// The bit is set before the park and in the word the holder's give swaps,
+/// so no give is lost: a give before the swap here makes the swap fail and
+/// is answered `Ok`, and one after it finds the bit set and traps to wake,
+/// which the kernel serves only once this trap has parked the caller.
 func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
     let me = CURRENT_THREAD
     if me == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
-    lock_pair_check(p, addr)
-    var owner: UInt = 0
-    if let why = copy_in(ProcessIndex(p), ((&var owner) as UnsafePointer<UInt>) as UInt, addr,
-                         word_bytes()) {
-        fault_process(p, why)
-    }
-    if owner == 0 {
+    lock_word_check(p, addr)
+    var word = lock_word(p, addr)
+    if word == 0 {
         return op_ok()
     }
+    let owner = word & ~LOCK_WAITERS_BIT
     if owner == thread_id(me) {
         fault_process(p, FaultReason.BadState)
     }
@@ -2424,11 +2435,20 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
     lock_chain_check(p, holder)
     let park = try park_plan(p, me, false) catch { return op_status(error) }
 
-    let one: UInt = 1
-    if let why = copy_out(ProcessIndex(p), addr + word_bytes(),
-                          ((&one) as UnsafePointer<UInt>) as UInt,
-                          word_bytes()) {
-        fault_process(p, why)
+    while {
+        let set = try copy_out_swap(ProcessIndex(p), addr, word,
+                                    word | LOCK_WAITERS_BIT) catch {
+            fault_process(p, error)
+        }
+        if set {
+            break
+        }
+        // Only a second core's thread can change the word between this
+        // trap's read and its swap, so on one core the swap never fails.
+        word = lock_word(p, addr)
+        if (word & ~LOCK_WAITERS_BIT) != owner {
+            return op_ok()
+        }
     }
     let level = borrow var thread = threads().at(me) {
         thread.lock_at = addr
@@ -2445,7 +2465,8 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
 /// The thread ID `id` names, for an op by process `p` that acts on a thread of
 /// its own (spec §7): the thread, or `NO_THREAD` when it has exited, which the
 /// op answers `Revoked`. Any other ID faults `p`. `LOCK_WAIT_OP` decodes its
-/// owner word here, with `line` set, and `THREAD_WAKE_OP` its target, without:
+/// word's holder here, with `line` set, and `THREAD_WAKE_OP` its target,
+/// without:
 ///
 ///   - a slot field of zero, or naming a slot the thread slab does not have,
 ///     or a generation wider than the board's field: no thread there ever
@@ -2568,16 +2589,17 @@ func lock_chain_check(p: Int, holder: Int) unsafe {
     }
 }
 
-/// `LOCK_WAKE_OP(addr)`: the caller gave the lock at `addr` back and found
-/// its waiters flag set (spec §7). Made with no handle, as the wait is.
+/// `LOCK_WAKE_OP(addr)`: the caller gave the lock whose word is at `addr`
+/// back and found its waiters bit set (spec §7). Made with no handle, as the
+/// wait is.
 ///
-/// Every thread of the caller's process parked on `addr` is answered `Ok` and
-/// readied, each at its own level, so the highest runs first and takes the
-/// lock with its swap; the others find it held and wait again. The flag is
-/// then written to zero through the copy-out door, which checks the flag's
-/// word alone: one the door refuses (an `addr` not word-aligned, `BadAlign`,
-/// or a flag outside a writable row) is its fault. No thread can be parked on
-/// a pair whose flag the door refuses, so the wakes before it found none.
+/// The word is held to `lock_word_check` first: a word the door refuses (an
+/// `addr` not word-aligned, `BadAlign`, or a word outside a writable row) is
+/// its fault, and no thread can be parked on such a word. Then every thread of
+/// the caller's process parked on `addr` is answered `Ok` and readied, each
+/// at its own level, so the highest runs first and takes the lock with its
+/// swap; the others find it held and wait again, setting the bit anew. The
+/// word itself is not written: the give swapped it to 0, bit and all.
 ///
 /// The wake brings each holder a waiter named back to what its remaining
 /// waiters owe it. Every thread that raised the caller through this lock was
@@ -2590,13 +2612,8 @@ func lock_wake_op(p: Int, addr: UInt) unsafe -> SyscallResult {
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
+    lock_word_check(p, addr)
     lock_wake(p, addr)
-    let zero: UInt = 0
-    if let why = copy_out(ProcessIndex(p), addr + word_bytes(),
-                          ((&zero) as UnsafePointer<UInt>) as UInt,
-                          word_bytes()) {
-        fault_process(p, why)
-    }
     if ready_above(threads().at(CURRENT_THREAD).level) {
         NEED_RESCHED = true
     }
