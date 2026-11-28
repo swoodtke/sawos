@@ -1,0 +1,147 @@
+// A `uartproto` client that echoes what is typed at the console's UART,
+// written with `main`. It never returns.
+//
+// It writes a prompt, then reads a byte at a time and writes each back as it
+// arrives. On a carriage return or a line feed it writes
+//
+//   line: TEXT
+//   stats: received=R read=N lost=L frame=F parity=P breaks=B end=E first_us=A last_us=Z
+//
+// where `TEXT` is the bytes since the last line (a line feed straight after a
+// carriage return ends no line), `R` the bytes the driver took off the wire,
+// `N` the bytes this client has read, `E` the byte that ended the line (13 or
+// 10) and the rest the driver's counters.
+// `A` and `Z` are the Monotonic clock, in microseconds, at the line's first
+// and last byte as the client read them: the client's reading rate, which is
+// not the wire's.
+// A line longer than `LINE_MAX` keeps its first `LINE_MAX` bytes. A `Lost` or
+// `Garbled` mark in the input is written where it falls, with its counters
+// and `at`, the bytes this client had read, and the reading goes on after it.
+
+import sos.{Clock, SosStatus}
+import uartproto.{Uart, UartError}
+import uartpipe.{PipeTransport, uart}
+import sosmain
+
+/// The tag its declaration gives its `uart` record (`process.toml`).
+static TAG_UART: UInt = 2
+
+static EXIT_FAILED: Int = 1
+
+static NANOS_PER_MICRO: UInt64 = 1000
+
+static CR: UInt8 = 13
+static LF: UInt8 = 10
+
+/// The bytes of a line the client keeps.
+static LINE_MAX: Int = 255
+
+/// The bytes since the last line, and how many of them there were.
+struct Line {
+    bytes: [UInt8; LINE_MAX],
+    kept: Int,
+    seen: Int,
+    first_ns: UInt64,
+    last_ns: UInt64,
+}
+
+extension Line {
+    static func empty() -> Line {
+        Line(bytes: [0; LINE_MAX], kept: 0, seen: 0, first_ns: 0, last_ns: 0)
+    }
+
+    func add(&var self, b: UInt8, at_ns: UInt64) {
+        if self.seen == 0 {
+            self.first_ns = at_ns
+        }
+        self.last_ns = at_ns
+        if self.kept < LINE_MAX {
+            self.bytes[self.kept] = b
+            self.kept = self.kept + 1
+        }
+        self.seen = self.seen + 1
+    }
+
+    func clear(&var self) {
+        self.kept = 0
+        self.seen = 0
+    }
+}
+
+/// Writes `line` and the driver's counters; `read` is the bytes this client
+/// has read so far.
+func report(u: &var Uart<PipeTransport>, line: &Line, read: Int, end: UInt8) -> Result<Void, UartError> {
+    try u.write("\r\nline: ")
+    var i = 0
+    while i < line.kept {
+        try u.write_byte(line.bytes[i])
+        i = i + 1
+    }
+    if line.seen > line.kept {
+        try u.write(" ...")
+    }
+    try u.write("\r\n")
+    let s = try u.stats()
+    print("stats: received={} read={} lost={} frame={} parity={} breaks={} end={} first_us={} last_us={}\r",
+          s.received, read, s.lost, s.frame_errors, s.parity_errors, s.breaks, end,
+          line.first_ns / NANOS_PER_MICRO, line.last_ns / NANOS_PER_MICRO)
+    try u.write("> ")
+    return
+}
+
+func run(u: &var Uart<PipeTransport>, clock: &Clock) -> Result<Void, UartError> {
+    try u.write("SOS line-echo: type a line and press Enter\r\n> ")
+    var line = Line.empty()
+    var read = 0
+    var after_cr = false
+    while true {
+        match u.read() {
+            case Ok(b) -> {
+                read = read + 1
+                let skip = after_cr && b == LF
+                after_cr = b == CR
+                if not skip {
+                    if b == CR || b == LF {
+                        try report(&var u, &line, read, b)
+                        line.clear()
+                    } else {
+                        try u.write_byte(b)
+                        line.add(b, try clock.now() catch { 0 })
+                    }
+                }
+            },
+            case Err(Lost(c)) -> {
+                print("\r\nmark: lost_at_least={} frame={} parity={} breaks={} at={} (Lost)\r",
+                      c.lost, c.frame, c.parity, c.breaks, read)
+            },
+            case Err(Garbled(c)) -> {
+                print("\r\nmark: lost_at_least={} frame={} parity={} breaks={} at={} (Garbled)\r",
+                      c.lost, c.frame, c.parity, c.breaks, read)
+            },
+            case Err(e) -> { return e },
+        }
+    }
+    return
+}
+
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_UART) else {
+        print("SOS line-echo: no record {}", TAG_UART)
+        return EXIT_FAILED
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS line-echo: record {} is no inlet", TAG_UART)
+        return EXIT_FAILED
+    }
+    var u = uart(move inlet)
+    let clock = try sosmain.context().system().clock_get() catch {
+        print("SOS line-echo: no clock: {}", error)
+        return EXIT_FAILED
+    }
+    try run(&var u, &clock) catch {
+        print("SOS line-echo: stopped: {}", error)
+        return EXIT_FAILED
+    }
+    0
+}

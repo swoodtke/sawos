@@ -27496,6 +27496,86 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_clean_exit": True,
         },
         {
+            # Stage B1, for a board (`--emit-flash`, at `--console rom` and
+            # at `--console b921600`): the UART driver as the console and a
+            # client that echoes what is typed, and on a line prints it with
+            # the driver's counters (`tests/uart-line-echo`). It never ends.
+            "name": "uart_line_echo",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "uart_line_echo_s3.toml"},
+            "board_only": "it needs a person typing at the board's "
+                          "terminal and never ends",
+            "expect_out": ["{banner}",
+                           "SOS line-echo: type a line and press Enter"],
+            "expect_clean_exit": False,
+        },
+        {
+            # Stage B2, for a board (`--emit-flash`, with the stall count on,
+            # at each `--console` key and a fast clock and flash key): a
+            # printer at `Normal` posts 512 full messages from one prebuilt
+            # message beside a counting thread at `Background`
+            # (`tests/console-share` with `config/burst.saw`), through the
+            # kernel-print console server here and through the UART driver in
+            # the next case. The clock and the count around an idle round
+            # and the burst, and the refusals, are printed for a reader.
+            "name": "console_share_profile",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_share_s3.toml"},
+            "console_stall": True,
+            "board_only": "its numbers are the part's: the emulator runs "
+                          "on host time",
+            "expect_out": ["{banner}",
+                           "SOS share: idle us=",
+                           "SOS share: burst posted_us=",
+                           "SOS share: refused writes="],
+            "expect_clean_exit": True,
+        },
+        {
+            "name": "console_share_profile_uart",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_share_uart_s3.toml"},
+            "console_stall": True,
+            "board_only": "its numbers are the part's: the emulator runs "
+                          "on host time",
+            "expect_out": ["{banner}",
+                           "SOS share: idle us=",
+                           "SOS share: burst posted_us=",
+                           "SOS share: refused writes="],
+            "expect_clean_exit": True,
+        },
+        {
+            # The stage timer, for a board (`--emit-flash`, at the ROM's
+            # clock and flash keys and at `--clock pll240 --flash qio80`):
+            # `tests/console-share` with `config/stages.saw` times the
+            # stages of 16 lines, without and beside the counting thread,
+            # through the UART driver here and the kernel-print console
+            # server in the next case.
+            "name": "console_share_stages",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_stages_uart_s3.toml"},
+            "console_stall": True,
+            "board_only": "its numbers are the part's: the emulator runs "
+                          "on host time",
+            "expect_out": ["{banner}",
+                           "SOS stage: pass 1 total us now=",
+                           "SOS stage: pass 2 total us now=",
+                           "SOS stage: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            "name": "console_share_stages_console",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_stages_s3.toml"},
+            "console_stall": True,
+            "board_only": "its numbers are the part's: the emulator runs "
+                          "on host time",
+            "expect_out": ["{banner}",
+                           "SOS stage: pass 1 total us now=",
+                           "SOS stage: pass 2 total us now=",
+                           "SOS stage: done"],
+            "expect_clean_exit": True,
+        },
+        {
             # The stock root on a plan of the case's own (`root_plan`), over
             # rows the case names (`devices`): the GPIO block, then timer
             # group 1, rows 2 and 3 after the child's blob and destination.

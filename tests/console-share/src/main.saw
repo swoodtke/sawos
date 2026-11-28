@@ -1,0 +1,249 @@
+// What printing costs the rest of a process: one client of an image's
+// console with two threads, a printer and a worker, and the Monotonic clock
+// read around what the printer does. `shareconfig.MODE` says which of two
+// programs it is.
+//
+// The printer is the main thread, at `Normal`. The worker is a thread at
+// `Background` that adds one to `PASSES` for as long as it is scheduled, so
+// its count rises exactly when nothing above it is ready.
+//
+// MODE_BURST measures the console's share. The printer writes `WRITES`
+// writes of the largest message the protocol carries, posted from one
+// prebuilt message so that a write costs the post and nothing else, and
+// measures two stretches, each as microseconds and the worker's passes:
+//
+//   idle   `IDLE_MS` of sleep, with nothing printed: the worker's rate when
+//          the process is not printing;
+//   burst  the writes, up to the last post's return (`posted`) and up to the
+//          `Sync` that follows (`sent`), which the console answers once every
+//          byte before it has gone out.
+//
+//   SOS share: idle us=U passes=P
+//   SOS share: burst posted_us=U posted_passes=P sent_us=U sent_passes=P
+//   SOS share: refused writes=W sync=S
+//
+// `W` counts the writes the transport refused and `S` is 0 when the `Sync`
+// was answered `Ok`. The share of the processor printing takes is one minus
+// the ratio of the worker's rate in the burst to its rate when idle.
+//
+// MODE_STAGES says where the time of one line goes. `TIMED` times, each with
+// the clock read before and after, seven stages of one line:
+//
+//   now    two reads of the clock back to back: what a reading costs;
+//   body   building the `Write` message from a 100-byte `String`;
+//   tell   posting it;
+//   sync   the `Sync` after it: the console's work, the wire's time included;
+//   stats  a `Stats` call: a round trip that touches no wire;
+//   print  one `print` with two arguments, a tell;
+//   psync  the `Sync` after it.
+//
+// It does that twice, first with the worker not started and then beside it,
+// and prints each pass: the first four lines' stages, then the totals.
+//
+//   SOS stage: pass P line N us now=. body=. tell=. sync=. stats=. print=. psync=.
+//   SOS stage: pass P total us now=. body=. tell=. sync=. stats=. print=. psync=. refused=R
+//
+// Nothing here asserts a number: the values are the part's and the console's.
+
+import sos.{Clock, Priority, SosStatus}
+import uartproto.{Uart, UartBody, UartOp, BODY_BYTES, MAX_PAYLOAD, UartTransport}
+import uartpipe.{PipeTransport, uart}
+import shareconfig
+import sosmain
+
+/// The tag its declaration gives its `uart` record (`process.toml`).
+static TAG_UART: UInt = 2
+
+static MODE_STAGES: Int = 1
+static MODE_BURST: Int = 2
+
+static IDLE_MS: UInt64 = 200
+static NANOS_PER_MICRO: UInt64 = 1000
+
+/// The most lines `MODE_STAGES` can time.
+static MAX_TIMED: Int = 16
+static SHOWN: Int = 4
+
+/// The worker's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+/// The worker's loop passes. Only the worker writes it.
+static PASSES: Atomic<Int> = Atomic(0)
+
+static_assert(MAX_PAYLOAD + 1 == BODY_BYTES, "a full message fills the body")
+
+/// Ninety-nine bytes and a line feed.
+func line_text() -> String {
+    "SOS fill: abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyza\n"
+}
+
+func top() unsafe -> UInt {
+    ((&var STACK) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func worker(arg: UInt) sync -> UInt {
+    while true {
+        let _ = PASSES.fetch_add(1)
+    }
+    0
+}
+
+func start_worker() unsafe -> Result<Void, SosStatus> {
+    let run: FuncPointer<(UInt) sync -> UInt> = worker
+    let thread = try sosmain.context().process().thread_create(
+        run: run, arg: 0, stack_top: top())
+    try thread.start(band: Priority.Background)
+    return
+}
+
+/// One stage's times over the timed lines, in nanoseconds.
+struct Stage {
+    ns: [UInt64; MAX_TIMED],
+}
+
+extension Stage {
+    static func empty() -> Stage {
+        Stage(ns: [0; MAX_TIMED])
+    }
+
+    func total(&self) -> UInt64 {
+        var t: UInt64 = 0
+        var i = 0
+        while i < shareconfig.TIMED {
+            t = t + self.ns[i]
+            i = i + 1
+        }
+        t
+    }
+}
+
+/// `MODE_STAGES`: one pass over `TIMED` lines. Returns the writes and calls
+/// the transport refused.
+func stage_pass(u: &var Uart<PipeTransport>, clock: &Clock, pass: Int) -> Result<Int, SosStatus> {
+    var now = Stage.empty()
+    var body_t = Stage.empty()
+    var tell = Stage.empty()
+    var sync = Stage.empty()
+    var stats = Stage.empty()
+    var printed = Stage.empty()
+    var psync = Stage.empty()
+    var refused = 0
+    var i = 0
+    while i < shareconfig.TIMED {
+        var body = UartBody.empty()
+        let t0 = try clock.now()
+        let t1 = try clock.now()
+        let n = body.text(UartOp.Write, line_text())
+        let t2 = try clock.now()
+        try u.transport.tell(&body.bytes, n) catch { refused = refused + 1 }
+        let t3 = try clock.now()
+        try u.sync() catch { refused = refused + 1 }
+        let t4 = try clock.now()
+        match u.stats() {
+            case Ok(_) -> {},
+            case Err(_) -> { refused = refused + 1 },
+        }
+        let t5 = try clock.now()
+        print("SOS stage: print {} of pass {}", i, pass)
+        let t6 = try clock.now()
+        try u.sync() catch { refused = refused + 1 }
+        let t7 = try clock.now()
+        now.ns[i] = t1 - t0
+        body_t.ns[i] = t2 - t1
+        tell.ns[i] = t3 - t2
+        sync.ns[i] = t4 - t3
+        stats.ns[i] = t5 - t4
+        printed.ns[i] = t6 - t5
+        psync.ns[i] = t7 - t6
+        i = i + 1
+    }
+    i = 0
+    while i < SHOWN && i < shareconfig.TIMED {
+        print("SOS stage: pass {} line {} us now={} body={} tell={} sync={} stats={} print={} psync={}",
+              pass, i, now.ns[i] / NANOS_PER_MICRO,
+              body_t.ns[i] / NANOS_PER_MICRO, tell.ns[i] / NANOS_PER_MICRO,
+              sync.ns[i] / NANOS_PER_MICRO, stats.ns[i] / NANOS_PER_MICRO,
+              printed.ns[i] / NANOS_PER_MICRO, psync.ns[i] / NANOS_PER_MICRO)
+        i = i + 1
+    }
+    print("SOS stage: pass {} total us now={} body={} tell={} sync={} stats={} print={} psync={} refused={}",
+          pass, now.total() / NANOS_PER_MICRO,
+          body_t.total() / NANOS_PER_MICRO, tell.total() / NANOS_PER_MICRO,
+          sync.total() / NANOS_PER_MICRO, stats.total() / NANOS_PER_MICRO,
+          printed.total() / NANOS_PER_MICRO, psync.total() / NANOS_PER_MICRO,
+          refused)
+    return refused
+}
+
+/// `MODE_BURST`.
+func burst(u: &var Uart<PipeTransport>, clock: &Clock) -> Result<Void, SosStatus> {
+    var body = UartBody.empty()
+    body.bytes[0] = UartOp.Write as UInt8
+    var k = 0
+    while k < MAX_PAYLOAD {
+        body.bytes[1 + k] = 0x61 + ((k % 26) as UInt8)
+        k = k + 1
+    }
+    body.bytes[MAX_PAYLOAD] = 10
+    let n = BODY_BYTES as UInt
+    try start_worker()
+
+    let idle_start = try clock.now()
+    let idle_passes = PASSES.load()
+    sleep(Duration.ms(IDLE_MS))
+    let idle_end = try clock.now()
+    let idle_done = PASSES.load()
+
+    var refused = 0
+    let burst_start = try clock.now()
+    let burst_passes = PASSES.load()
+    var i = 0
+    while i < shareconfig.WRITES {
+        try u.transport.tell(&body.bytes, n) catch { refused = refused + 1 }
+        i = i + 1
+    }
+    let posted = try clock.now()
+    let posted_passes = PASSES.load()
+    var synced = 0
+    try u.sync() catch { synced = 1 }
+    let sent = try clock.now()
+    let sent_passes = PASSES.load()
+
+    print("SOS share: idle us={} passes={}",
+          (idle_end - idle_start) / NANOS_PER_MICRO, idle_done - idle_passes)
+    print("SOS share: burst posted_us={} posted_passes={} sent_us={} sent_passes={}",
+          (posted - burst_start) / NANOS_PER_MICRO,
+          posted_passes - burst_passes,
+          (sent - burst_start) / NANOS_PER_MICRO,
+          sent_passes - burst_passes)
+    print("SOS share: refused writes={} sync={}", refused, synced)
+    return
+}
+
+func measure() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_UART) else {
+        return SosStatus.BadImage
+    }
+    guard let inlet = record.take_inlet() else {
+        return SosStatus.BadImage
+    }
+    var u = uart(move inlet)
+    let clock = try sosmain.context().system().clock_get()
+    if shareconfig.MODE == MODE_STAGES {
+        let _ = try stage_pass(&var u, &clock, 1)
+        try start_worker()
+        let _ = try stage_pass(&var u, &clock, 2)
+        print("SOS stage: done")
+        return
+    }
+    try burst(&var u, &clock)
+    return
+}
+
+func main() -> Result<Void, SosStatus> {
+    try measure()
+    return
+}
