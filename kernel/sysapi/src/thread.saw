@@ -9,8 +9,9 @@ import sosabi.{SosStatus, ThreadOp, ThreadHandle, Priority, NO_HANDLE,
                MINT_OP}
 
 import sos.floor.{call_value, checked, sos_handle_release, sos_thread_exit,
-                  sos_thread_start_band, sos_thread_yield, ALL_RIGHTS,
-                  handle_rights}
+                  sos_thread_join, sos_thread_start_band, sos_thread_yield,
+                  ALL_RIGHTS, handle_rights}
+import sos.exec.{arm_drive, disarm_drive, ended_early}
 
 /// A handle to a Thread, a kernel-scheduled execution context in a process.
 ///
@@ -82,8 +83,13 @@ extension Thread {
     /// does a join parked on it when the process dies. Joining yourself
     /// terminates the process: the wait could never end, and the caller could
     /// have checked.
+    ///
+    /// A thread that has background tasks runs them while it waits: the join
+    /// is made in bounded turns, each a `Join` that consumes nothing when it
+    /// ends early, and the tasks run between turns (§10.1). A task that the
+    /// joined thread waits on is served by the joiner's own turns.
     public func join(&self) -> Result<UInt, SosStatus> {
-        call_value(self.handle, ThreadOp.Join as UInt, 0, 0, 0)
+        join_driving(self.handle)
     }
 
     /// End the calling thread with `code`, which whoever joins it receives.
@@ -132,4 +138,28 @@ extension Thread {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
         return Thread(handle: ThreadHandle(raw))
     }
+}
+
+/// `Join` on `handle`, driving the calling thread's tasks around it: with a
+/// task live each `Join` is bounded by the wait word, and a `TimedOut` or
+/// `Woken` answer is the same `Join` made again after the tasks' next turn.
+func join_driving(handle: ThreadHandle) -> Result<UInt, SosStatus> {
+    while true {
+        let armed = arm_drive()
+        let answer = join_once(handle)
+        disarm_drive(armed)
+        if armed && ended_early(answer.0) {
+            continue
+        }
+        try checked(answer.0)
+        return answer.1
+    }
+    panic("sos: a driven join left its loop")
+}
+
+/// One `Join`: the status word and the exit value.
+func join_once(handle: ThreadHandle) unsafe -> (UInt, UInt) {
+    var code: UInt = 0
+    let raw = sos_thread_join(handle, (&var code) as UnsafePointer<UInt>)
+    (raw, code)
 }

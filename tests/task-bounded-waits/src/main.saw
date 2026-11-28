@@ -1,0 +1,367 @@
+// The typed wrappers that park drive the thread's tasks around their wait
+// (spec §10.1). Each round has `main` wait on something only a task of its
+// own thread can bring about, so the wait ends only if the wrapper runs the
+// task:
+//
+//   waiter       `Waiter.wait` on an Event a task signals after a sleep
+//   join         `Thread.join` of T, which waits on an Event the same task
+//                signals
+//   send         `PipeInlet.send` to a server that is a task of `main`
+//   resolve      `PipeReply.resolve` of a claim whose server is a task
+//   reply_wait   `PipeRequest.reply_wait` by `main`, whose wait leg ends on
+//                an Event a task signals, answering a client thread C
+//   woken        `Waiter.wait` ended early by a reactor wake from thread W,
+//                which signals the Event after it
+//   nested       a wrapper made inside a task's turn, whose task `main` waits
+//                on, a bounded wait that ends on a deadline, and a plain wait
+//                after every task has ended
+//
+// The send and resolve rounds make their server sleep first, so the wait is
+// bounded by a deadline and ends early at least once before the reply is
+// there.
+//
+//   SOS taskbounded: waiter: woken by the task, key 1
+//   SOS taskbounded: join: T exited with 7
+//   SOS taskbounded: send: reply of 2 bytes
+//   SOS taskbounded: resolve: reply of 2 bytes
+//   SOS taskbounded: reply_wait: the next wake is the Event, key 2
+//   SOS taskbounded: reply_wait: C got a reply of 2 bytes
+//   SOS taskbounded: woken: the wait ended after a wake, key 1
+//   SOS taskbounded: nested: main woke on key 6, the inner wait saw key 5
+//   SOS taskbounded: nested: main waits with no task
+//   SOS taskbounded: nested: P signals
+//   SOS taskbounded: nested: a plain wait after the tasks, key 7
+//
+// Every order is fixed by waiting on what the other side does. A wrapper that
+// does not drive, or that writes its wait word as 0, parks `main` with nothing
+// that can end the wait, and the kernel reports the deadlock.
+
+import sos.{SosStatus, PipeInlet, PipeOutlet, Waiter, Event, Priority,
+            PIPE_BODY_BYTES}
+import std.task.{yield_now}
+import sosmain
+
+static KEY_EVENT: UInt = 1
+static KEY_REQUEST: UInt = 1
+static KEY_LATE: UInt = 2
+static KEY_INNER: UInt = 5
+static KEY_OUTER: UInt = 6
+static KEY_PLAIN: UInt = 7
+
+extern "C" {
+    func __saw_rt_reactor_create(r_out: UnsafePointer<Int>) -> Int
+    func __saw_rt_reactor_wake(r: Int)
+}
+
+/// Wake the process's reactor.
+func wake_reactor() unsafe {
+    var r = 0
+    let _ = __saw_rt_reactor_create((&var r) as UnsafePointer<Int>)
+    __saw_rt_reactor_wake(r)
+}
+
+/// What T exits with.
+static T_CODE: UInt = 7
+
+/// The stacks of the threads this case makes. A thread that prints wants 4 KiB
+/// at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_T: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_C: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_t() unsafe -> UInt {
+    ((&var STACK_T) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_c() unsafe -> UInt {
+    ((&var STACK_C) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+/// A task: sleep, then signal.
+func signal_later(event: Event) -> Int {
+    sleep(Duration.ms(5))
+    let _ = event.signal(1)
+    0
+}
+
+/// A task that sleeps until it is cancelled, so the thread's drive answers a
+/// deadline.
+func idle() -> Int {
+    while not cancelled() {
+        sleep(Duration.ms(1_000_000))
+    }
+    0
+}
+
+/// A task: wait on `waiter`, which a wrapper made in a task's turn does, and
+/// then signal `done`. Answers the key it woke on.
+func inner_wait(waiter: Waiter, done: Event) -> Int {
+    let wake = try waiter.wait() catch {
+        return -1
+    }
+    let (key, _) = (move wake).open()
+    let _ = done.signal(1)
+    Int.from(truncating: key)
+}
+
+/// A task: sleep, then serve one request as `serve_one` does, so that a wait
+/// for the answer has a deadline to end at before the answer is there.
+func serve_late(outlet: PipeOutlet) -> Int {
+    sleep(Duration.ms(5))
+    serve_one(move outlet)
+}
+
+/// A task: serve one request of `outlet`, polling for it, and answer it with
+/// two bytes. Answers 1 when it did, and -1 when it was cancelled first.
+func serve_one(outlet: PipeOutlet) -> Int {
+    while not cancelled() {
+        let (msg, request) = try outlet.take() catch {
+            yield_now()
+            continue
+        }
+        let _ = move msg
+        var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+        out[0] = 0x4F
+        out[1] = 0x4B
+        let _ = (move request).reply(body: &out, len: 2)
+        return 1
+    }
+    -1
+}
+
+/// T: wait on the Waiter `main` made, which `main`'s task makes ready.
+func t_run(arg: UInt) unsafe sync -> UInt {
+    let waiter = arg as UnsafePointer<Waiter>
+    let _ = waiter[0].wait()
+    T_CODE
+}
+
+/// W: wake the reactor, which ends `main`'s wait early, and then signal the
+/// Event it waits for.
+func w_run(arg: UInt) unsafe sync -> UInt {
+    let event = arg as UnsafePointer<Event>
+    wake_reactor()
+    let _ = event[0].signal(1)
+    0
+}
+
+/// P: signal the Event `main` waits for.
+func p_run(arg: UInt) unsafe sync -> UInt {
+    let event = arg as UnsafePointer<Event>
+    print("SOS taskbounded: nested: P signals")
+    let _ = event[0].signal(1)
+    0
+}
+
+/// C: send to the inlet `main` made, and exit with the reply's length.
+func c_run(arg: UInt) unsafe sync -> UInt {
+    let inlet = arg as UnsafePointer<PipeInlet>
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 0x51
+    body[1] = 0x52
+    let reply = try inlet[0].send(body: &body, len: 2) catch {
+        return 99
+    }
+    reply.len
+}
+
+func main() -> Result<Void, SosStatus> {
+    try waiter_round()
+    try join_round()
+    try send_round()
+    try resolve_round()
+    try reply_wait_round()
+    try woken_round()
+    try nested_round()
+    return
+}
+
+/// `Waiter.wait`, on an Event a task signals.
+func waiter_round() -> Result<Void, SosStatus> {
+    let event = try sosmain.context().process().event_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+    let sibling = try event.mint()
+    let task = Task.spawn(signal_later(move sibling))
+    let wake = try waiter.wait() catch {
+        panic("SOS taskbounded: waiter: refused: {}", error)
+    }
+    let (key, _) = (move wake).open()
+    print("SOS taskbounded: waiter: woken by the task, key {}", key)
+    task.join()
+    return
+}
+
+/// `Thread.join`, of a thread that waits on an Event a task signals.
+func join_round() -> Result<Void, SosStatus> {
+    let event = try sosmain.context().process().event_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+    let thread = try sosmain.context().process().thread_create(
+        run: t_run, arg: waiter_at(&waiter), stack_top: top_t())
+    try thread.start()
+    let sibling = try event.mint()
+    let task = Task.spawn(signal_later(move sibling))
+    let code = try thread.join() catch {
+        panic("SOS taskbounded: join: refused: {}", error)
+    }
+    print("SOS taskbounded: join: T exited with {}", code)
+    task.join()
+    return
+}
+
+func waiter_at(waiter: &Waiter) unsafe -> UInt {
+    (&waiter) as UnsafePointer<Waiter> as UInt
+}
+
+func inlet_at(inlet: &PipeInlet) unsafe -> UInt {
+    (&inlet) as UnsafePointer<PipeInlet> as UInt
+}
+
+/// `PipeInlet.send`, to a server that is a task of this thread.
+func send_round() -> Result<Void, SosStatus> {
+    let (inlet, outlet) = try sosmain.context().process().pipe_create()
+    let task = Task.spawn(serve_late(move outlet))
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 0x51
+    let reply = try inlet.send(body: &body, len: 1) catch {
+        panic("SOS taskbounded: send: refused: {}", error)
+    }
+    print("SOS taskbounded: send: reply of {} bytes", reply.len)
+    task.join()
+    return
+}
+
+/// `PipeReply.resolve`, of a claim a task's reply settles.
+func resolve_round() -> Result<Void, SosStatus> {
+    let (inlet, outlet) = try sosmain.context().process().pipe_create()
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 0x51
+    let claim = try inlet.post(body: &body, len: 1)
+    let task = Task.spawn(serve_late(move outlet))
+    let reply = try (move claim).resolve() catch {
+        panic("SOS taskbounded: resolve: refused: {}", error)
+    }
+    print("SOS taskbounded: resolve: reply of {} bytes", reply.len)
+    task.join()
+    return
+}
+
+/// `PipeRequest.reply_wait`: `main` serves C's request, and its wait leg ends
+/// on an Event a task signals.
+func reply_wait_round() -> Result<Void, SosStatus> {
+    let (inlet, outlet) = try sosmain.context().process().pipe_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(outlet: &outlet, key: KEY_REQUEST)
+    let client = try sosmain.context().process().thread_create(
+        run: c_run, arg: inlet_at(&inlet), stack_top: top_c())
+    try client.start()
+    // No task is live yet, so this wait is plain: C runs while `main` is
+    // parked, and its call stages the request.
+    let first = try waiter.wait()
+    let (key, _) = (move first).open()
+    if key != KEY_REQUEST {
+        panic("SOS taskbounded: reply_wait: the first wake was key {}", key)
+    }
+    let (msg, request) = try outlet.take()
+    let _ = move msg
+    let event = try sosmain.context().process().event_create()
+    try waiter.add(event: &event, key: KEY_LATE)
+    let sibling = try event.mint()
+    let task = Task.spawn(signal_later(move sibling))
+    var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    out[0] = 0x4F
+    out[1] = 0x4B
+    let next = try (move request).reply_wait(body: &out, len: 2,
+                                             waiter: &waiter) catch {
+        panic("SOS taskbounded: reply_wait refused: {}", error)
+    }
+    let (late, _) = (move next).open()
+    print("SOS taskbounded: reply_wait: the next wake is the Event, key {}",
+          late)
+    task.join()
+    let got = try client.join()
+    print("SOS taskbounded: reply_wait: C got a reply of {} bytes", got)
+    return
+}
+
+func event_at(event: &Event) unsafe -> UInt {
+    (&event) as UnsafePointer<Event> as UInt
+}
+
+/// `Waiter.wait` ended early by a reactor wake from another thread, then made
+/// again. W runs only once `main` has parked in the wait, which a task's
+/// sleep gives a deadline, and signals the Event after its wake.
+func woken_round() -> Result<Void, SosStatus> {
+    let event = try sosmain.context().process().event_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+    let sibling = try event.mint()
+    let thread = try sosmain.context().process().thread_create(
+        run: w_run, arg: event_at(&sibling), stack_top: top_t())
+    try thread.start(band: Priority.Background)
+    let sleeper = Task.spawn(idle())
+    let wake = try waiter.wait() catch {
+        panic("SOS taskbounded: woken: refused: {}", error)
+    }
+    let (key, _) = (move wake).open()
+    print("SOS taskbounded: woken: the wait ended after a wake, key {}", key)
+    sleeper.cancel()
+    let _ = try thread.join()
+    return
+}
+
+/// A wrapper made inside a task's turn, and a plain one after the tasks.
+///
+/// Task A waits on a Waiter, which makes a nested drive that runs task B, and
+/// B signals what A waits for; A then signals what `main` waits for. After
+/// both tasks have ended `main` makes one more bounded wait, which a task
+/// sleeping ends, and then waits with no task live, on an Event thread P
+/// signals once `main` has parked: a plain wait, which a word left armed by
+/// the bounded one would end at once, its deadline past.
+func nested_round() -> Result<Void, SosStatus> {
+    let first = try sosmain.context().process().event_create()
+    let inner = try sosmain.context().process().waiter_create()
+    try inner.add(event: &first, key: KEY_INNER)
+    let second = try sosmain.context().process().event_create()
+    let outer = try sosmain.context().process().waiter_create()
+    try outer.add(event: &second, key: KEY_OUTER)
+    let first_sibling = try first.mint()
+    let second_sibling = try second.mint()
+    let a = Task.spawn(inner_wait(move inner, move second_sibling))
+    let b = Task.spawn(signal_later(move first_sibling))
+    let wake = try outer.wait() catch {
+        panic("SOS taskbounded: nested: refused: {}", error)
+    }
+    let (key, _) = (move wake).open()
+    let saw = a.join()
+    b.join()
+    print("SOS taskbounded: nested: main woke on key {}, the inner wait saw key {}",
+          key, saw)
+    let third = try sosmain.context().process().event_create()
+    let plain = try sosmain.context().process().waiter_create()
+    try plain.add(event: &third, key: KEY_PLAIN)
+    let third_sibling = try third.mint()
+    let signaller = try sosmain.context().process().thread_create(
+        run: p_run, arg: event_at(&third_sibling), stack_top: top_t())
+    let fourth = try sosmain.context().process().event_create()
+    let later = try sosmain.context().process().waiter_create()
+    try later.add(event: &fourth, key: KEY_LATE)
+    let fourth_sibling = try fourth.mint()
+    let sleeper = Task.spawn(signal_later(move fourth_sibling))
+    sleeper.detach()
+    let bounded = try later.wait() catch {
+        panic("SOS taskbounded: nested: refused: {}", error)
+    }
+    let _ = move bounded
+    try signaller.start(band: Priority.Background)
+    print("SOS taskbounded: nested: main waits with no task")
+    let last = try plain.wait()
+    let (last_key, _) = (move last).open()
+    print("SOS taskbounded: nested: a plain wait after the tasks, key {}",
+          last_key)
+    let _ = try signaller.join()
+    return
+}

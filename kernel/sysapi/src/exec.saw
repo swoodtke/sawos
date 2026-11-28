@@ -21,7 +21,8 @@
 
 import sosabi.{SosStatus, ClockType, ClockRight, SystemRight, HandleInfo,
                HandleKind, NO_HANDLE}
-import sos.floor.{SYSTEM_HANDLE, checked, background_close, sos_handle_info,
+import sos.floor.{SYSTEM_HANDLE, checked, background_close, background_drive,
+                  sos_handle_info,
                   sos_handle_release, sos_system_clock_get, sos_clock_now,
                   sos_wait_word, sos_thread_wake, sos_park, sos_thread_id}
 
@@ -346,6 +347,93 @@ func give_record_back() unsafe {
     }
     block[0].record = block[0].record & CLOCKED
     words(record)[R_CLAIMED].store(0)
+}
+
+// -----------------------------------------------------------------------------
+// The drive around a wrapper's wait
+// -----------------------------------------------------------------------------
+//
+// A typed wrapper that parks for a program runs the thread's tasks around its
+// op and bounds the op's park with the wait word (spec §10.1). It is three
+// calls: `arm_drive` before the op, `disarm_drive` after it, and `ended_early`
+// on the op's answer, which says to go round again. The wrapper makes its op
+// between the first two, and nothing else.
+
+/// `background_drive`'s answer for "every live task waits with no deadline".
+static DRIVE_FOREVER: Int64 = 0x7FFF_FFFF_FFFF_FFFF
+
+/// The wait word of a drive that answered "a task can run now": a past
+/// instant, so a ready op answers and anything else answers `TimedOut` at
+/// once.
+static PAST_NS: UInt64 = 1
+
+/// Run the calling thread's tasks for one turn, and arm the wait word of the
+/// op the thread is about to make. Answers `true` with the word armed, and
+/// `false` with the word left at 0 when no task is live, which is a plain op.
+///
+/// The turn is `background_drive`. Its answer becomes the word: `PAST_NS` for
+/// "now", `NEVER_NS` for "no deadline", and otherwise the deadline itself,
+/// which is already an absolute reading of the Monotonic clock. A finite word
+/// needs the thread's word registered with the process's Clock, which is made
+/// before it is written.
+///
+/// The thread then sets `parked` and reads the reactor's generation again, as
+/// a poll does. A wake after that finds `parked` set and ends the op's park.
+/// A generation that moved since the thread last looked is a wake that came
+/// after the turn, so the thread marks it seen and the word is `PAST_NS`
+/// instead: the op answers if it is ready and otherwise ends at once, and the
+/// wrapper's next turn runs the tasks again. The thread never drives twice
+/// before it makes its op, so a task that wakes the reactor in every turn
+/// cannot keep the op from being made.
+///
+/// A thread with no block runs no task and answers `false` without driving.
+public(package) func arm_drive() unsafe -> Bool {
+    let block = own_block()
+    if (block as UInt) == 0 {
+        return false
+    }
+    let next = background_drive()
+    if next < 0 {
+        return false
+    }
+    let rec = words(own_record(block))
+    var word = NEVER_NS
+    if next == 0 {
+        word = PAST_NS
+    } else if next != DRIVE_FOREVER {
+        word = UInt64.from(truncating: next)
+    }
+    rec[R_PARKED].store(1)
+    let gen = REACTOR.load()
+    if gen != rec[R_SEEN].load() {
+        rec[R_PARKED].store(0)
+        rec[R_SEEN].store(gen)
+        word = PAST_NS
+    }
+    if word != NEVER_NS {
+        clock_the_word(block)
+    }
+    block[0].wait = word
+    true
+}
+
+/// Put the thread's word back to 0 and clear `parked`, after the op of an
+/// `arm_drive` that answered `true`. Call it with the answer: `false` does
+/// nothing.
+public(package) func disarm_drive(armed: Bool) unsafe {
+    if not armed {
+        return
+    }
+    let block = own_block()
+    block[0].wait = 0
+    words(block[0].record & ~CLOCKED)[R_PARKED].store(0)
+}
+
+/// Whether an op's raw status word ended its armed park early: its deadline
+/// came first (`TimedOut`) or another thread woke it (`Woken`). Nothing the op
+/// waits for was consumed, and the wrapper goes back to `arm_drive`.
+public(package) func ended_early(raw: UInt) -> Bool {
+    raw == (SosStatus.TimedOut as UInt) || raw == (SosStatus.Woken as UInt)
 }
 
 // -----------------------------------------------------------------------------

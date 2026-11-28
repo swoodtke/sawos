@@ -61,7 +61,7 @@
 //! below, keep the disarm, because `consumes` is a receiver-position effect and
 //! they take their value as a by-value parameter.
 
-import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
+import sosabi.{SosStatus, CALL_NOT_STAGED, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
                NO_HANDLE, PIPE_BODY_BYTES, PIPE_MSG_HANDLES,
                BootHandleKind, InletLevel, OutletLevel, ReplyLevel,
@@ -84,6 +84,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok,
                   sos_pipe_reply_resolve,
                   sos_pipe_request_reply, sos_pipe_request_reply_wait,
                   sos_waiter_wait, handle_rights}
+import sos.exec.{arm_drive, disarm_drive, ended_early, count_send_fallback}
 import sos.waiter.{AttachMode, Waiter, mode_flag}
 import sos.memory.{Memory}
 import sos.pool.{Pool}
@@ -694,6 +695,15 @@ extension Waiter {
     /// and the copy is not: a parked waiter cannot predict which arm fires, so
     /// the buffer holds the biggest answer its attachments could give, while
     /// the kernel writes only what the delivery needs.
+    ///
+    /// A thread that has background tasks runs them while it waits: the wait
+    /// is made in bounded turns, and between turns the tasks run, so a task
+    /// that signals what this thread waits for is served by this very wait.
+    /// The wait itself is unchanged: it returns the first delivery, whichever
+    /// turn it comes in. The tasks run on this thread's stack, inside the call,
+    /// so a `sos.Lock` or `Section` held across it is held while they run,
+    /// and a task that takes the lock this thread holds faults the process
+    /// (§10.1).
     public func wait(&self) -> Result<WaitResult, SosStatus> {
         wait_into_frame(self.handle)
     }
@@ -701,16 +711,31 @@ extension Waiter {
 
 /// The `unsafe` half of `wait`, confined to one small named helper. The
 /// buffer's address never leaves it.
+///
+/// It drives the thread's tasks around the wait (spec §10.1): with a task
+/// live, each `Wait` is bounded by the wait word `arm_drive` writes, and a
+/// `TimedOut` or `Woken` answer, which consumed nothing, is the same `Wait`
+/// made again after the next turn of the tasks. With none live it is the one
+/// plain `Wait`.
 func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatus> {
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
                          meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
                          sender: 0,
                          body: [0; PIPE_BODY_BYTES])
-    try checked(sos_waiter_wait(handle,
-                                (&var buf.header) as UnsafePointer<UInt>,
-                                wait_record_bytes() as UInt))
-    return decode_wait(&buf)
+    while true {
+        let armed = arm_drive()
+        let raw = sos_waiter_wait(handle,
+                                  (&var buf.header) as UnsafePointer<UInt>,
+                                  wait_record_bytes() as UInt)
+        disarm_drive(armed)
+        if armed && ended_early(raw) {
+            continue
+        }
+        try checked(raw)
+        return decode_wait(&buf)
+    }
+    panic("sos: a driven wait left its loop")
 }
 
 /// A handle to a PipeInlet, the client end of a connection, where requests flow
@@ -888,6 +913,15 @@ extension PipeInlet {
     /// whose handles found no room in this process's table. The reply and its
     /// handles are lost, because a parked call cannot ask again; make table
     /// room before calling a server that answers with handles.
+    ///
+    /// A thread that has background tasks runs them while the call waits, for
+    /// room or for the reply, and the call is bounded to serve them: it is made
+    /// as a `Post` and a `Resolve` in one trap, which holds one `Handle` row
+    /// for the claim until the reply comes. A table with no row for it costs
+    /// only the bound: the call is made again unbounded, the thread's tasks
+    /// wait with it, and `sos_exec_send_fallbacks` counts the fallback. The
+    /// message goes out once and the caller sees no status it would not see
+    /// with no tasks (§10.1).
     public func send(&self, body: &[UInt8; PIPE_BODY_BYTES],
                      len: UInt) -> Result<PipeMsg, SosStatus> {
         var none = PipeHandles.none()
@@ -1074,20 +1108,59 @@ func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
                               sender: 0,
                               bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
-    let raw = sos_pipe_inlet_call(handle,
-                                  (&var args) as UnsafePointer<UInt>,
-                                  pipe_send_record_bytes() as UInt,
-                                  (&var reply) as UnsafePointer<UInt>,
-                                  (&var value) as UnsafePointer<UInt>)
-    // The carrier is emptied before the answer is read, unlike `post`'s: a
-    // `Call` parks rather than refusing the send, so every answer consumes the
-    // entries. A staged message carries them to the server, a `PeerClosed`
-    // from a server end that was gone before or during the park has the kernel
-    // release them, and a `NoResource` or `QuotaExceeded` at the reply's
-    // delivery comes after they were staged.
-    handles.handed_over()
-    try checked(raw)
-    return msg_of(&reply.meta, &reply.handles, reply.sender, &reply.bytes)
+    var unbounded = false
+    while true {
+        // A thread with tasks makes the call wakeable, with the wait word
+        // armed. After a full table, the one call that follows is plain.
+        let armed = if unbounded { false } else { arm_drive() }
+        value = 0
+        let raw = sos_pipe_inlet_call(handle,
+                                      (&var args) as UnsafePointer<UInt>,
+                                      pipe_send_record_bytes() as UInt,
+                                      (&var reply) as UnsafePointer<UInt>,
+                                      (&var value) as UnsafePointer<UInt>)
+        disarm_drive(armed)
+        if armed && ended_early(raw) {
+            if value == NO_HANDLE {
+                // The room park ended with nothing staged: the carried
+                // handles are still the caller's, and the same call is made
+                // again after the tasks' next turn.
+                continue
+            }
+            // The message was staged and the claim is the caller's, which
+            // `value` names: resolve it. The carrier is emptied, since the
+            // handles went out with the message.
+            handles.handed_over()
+            return resolve_claim(value)
+        }
+        if armed && is_claim_refusal(raw) && value == CALL_NOT_STAGED {
+            // No row for the claim, and nothing staged, so the carried
+            // handles are still the caller's. The same call, with the word at
+            // 0, mints no claim, and goes out once. A refusal at the reply's
+            // delivery leaves 0 in the value register: that call was staged
+            // and answered, and is not made again.
+            count_send_fallback()
+            unbounded = true
+            continue
+        }
+        // The carrier is emptied before the answer is read, unlike `post`'s: a
+        // `Call` parks rather than refusing the send, so every answer consumes
+        // the entries. A staged message carries them to the server, a
+        // `PeerClosed` from a server end that was gone before or during the
+        // park has the kernel release them, and a `NoResource` or
+        // `QuotaExceeded` at the reply's delivery comes after they were
+        // staged.
+        handles.handed_over()
+        try checked(raw)
+        return msg_of(&reply.meta, &reply.handles, reply.sender, &reply.bytes)
+    }
+    panic("sos: a driven send left its loop")
+}
+
+/// Whether a `Call`'s status is the table's refusal of its claim's row.
+func is_claim_refusal(raw: UInt) -> Bool {
+    raw == (SosStatus.QuotaExceeded as UInt) ||
+        raw == (SosStatus.NoResource as UInt)
 }
 
 /// A handle to a PipeOutlet, the server end of a connection, where requests
@@ -1302,6 +1375,14 @@ extension PipeReply {
     /// Take the reply, parking until it is there, and spend the claim. Requires
     /// `PipeReplyRight.Resolve`.
     ///
+    /// A thread that has background tasks runs them while it waits, in bounded
+    /// turns on the same claim, which is spent only by the turn that delivers
+    /// (§10.1). While a turn is parked on the claim, attaching, giving or
+    /// carrying it from another thread is the `BadState` fault. Between turns
+    /// nothing holds it, so a Waiter the claim was attached to may take the
+    /// reply as a delivery, and the next turn then answers `PeerClosed`: do
+    /// not attach a claim that a thread with tasks resolves.
+    ///
     /// `Ok(msg)`: the reply is here and its bytes and handles are yours.
     /// `msg.len` may be zero, which is a reply that carries no data rather than
     /// an absence.
@@ -1366,18 +1447,36 @@ extension PipeReply {
 /// handle word is swept by a synthesized drop that does nothing, and this
 /// helper takes the word like every other one in the file.
 func resolve_into_frame(handle: PipeReplyHandle) unsafe -> Result<PipeMsg, SosStatus> {
+    resolve_claim(handle)
+}
+
+/// `Resolve` on the claim `word` names, driving the thread's tasks around it
+/// (spec §10.1). With a task live each `Resolve` is bounded by the wait word,
+/// and it borrows the claim: a `TimedOut` or `Woken` answer leaves the claim
+/// the caller's under the same word, and the same `Resolve` is made again
+/// after the tasks' next turn. Only the answer that ends the exchange spends
+/// the claim. With none live it is the one plain `Resolve`.
+func resolve_claim(word: UInt) unsafe -> Result<PipeMsg, SosStatus> {
     var rec = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                               kinds: [0; PIPE_MSG_HANDLES]),
                             handles: [NO_HANDLE; PIPE_MSG_HANDLES],
                             sender: 0,
                             bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
-    let raw = sos_pipe_reply_resolve(handle,
-                                     (&var rec) as UnsafePointer<UInt>,
-                                     pipe_msg_record_bytes() as UInt,
-                                     (&var value) as UnsafePointer<UInt>)
-    try checked(raw)
-    return msg_of(&rec.meta, &rec.handles, rec.sender, &rec.bytes)
+    while true {
+        let armed = arm_drive()
+        let raw = sos_pipe_reply_resolve(word,
+                                         (&var rec) as UnsafePointer<UInt>,
+                                         pipe_msg_record_bytes() as UInt,
+                                         (&var value) as UnsafePointer<UInt>)
+        disarm_drive(armed)
+        if armed && ended_early(raw) {
+            continue
+        }
+        try checked(raw)
+        return msg_of(&rec.meta, &rec.handles, rec.sender, &rec.bytes)
+    }
+    panic("sos: a driven resolve left its loop")
 }
 
 /// A handle to a PipeRequest, the server's obligation to send one reply (spec
@@ -1494,6 +1593,11 @@ extension PipeRequest {
     /// Both legs of the error consume: `Err(Reply(_))` did not deliver the
     /// reply and `Err(Wait(_))` did, and neither leaves an obligation anyone
     /// still holds.
+    ///
+    /// A thread that has background tasks runs them during the wait leg, which
+    /// is made again as a driving `Waiter.wait` after each bounded turn: the
+    /// reply was delivered by the first turn and is never made twice, and the
+    /// answer is the first delivery, whichever turn it comes in (§10.1).
     ///
     /// The loop it is written for:
     ///
@@ -1643,12 +1747,23 @@ func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
                          sender: 0,
                          body: [0; PIPE_BODY_BYTES])
     var leg: UInt = 0
+    let armed = arm_drive()
     let raw = sos_pipe_request_reply_wait(handle,
                                           (&var args) as UnsafePointer<UInt>,
                                           pipe_reply_wait_record_bytes() as UInt,
                                           (&var buf.header) as UnsafePointer<UInt>,
                                           (&var leg) as UnsafePointer<UInt>)
+    disarm_drive(armed)
     handles.handed_over()
+    if armed && ended_early(raw) && leg == (ReplyWaitLeg.Wait as UInt) {
+        // The reply landed and the wait leg's park ended early, consuming
+        // nothing. The reply is not made twice: the wait is, as a driving
+        // `Waiter.wait`, and a failure of it is the wait leg's.
+        let delivered = try wait_into_frame(waiter) catch {
+            return ReplyWaitError.Wait(status: error)
+        }
+        return move delivered
+    }
     try checked(raw) catch { return leg_error(error, leg) }
     return decode_wait(&buf)
 }

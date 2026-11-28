@@ -1,0 +1,151 @@
+// The server of `bounded-room-child` (spec §2.1, §10.1): a bounded `send`
+// into a ring that is full. Root fills a connection's ring with tells, gives
+// the child an inlet, starts it, and takes the child's three sends:
+//
+//   A   the child's table has room: its call waits for room, root frees a
+//       slot, and the call stages and is answered
+//   B   the child's table is full: its call waits for room, root frees a slot,
+//       the resume finds no row for the claim and refuses, and the child
+//       makes the call again unbounded, which stages and is answered
+//   C   the child's table is one row short for the reply: root answers with
+//       two handles, the delivery is refused, and the refusal is the child's
+//       answer, with the message taken once
+//
+// Each request root takes is printed, and every request is taken exactly once:
+// the case reads the transcript for a second line of any of them. Root and
+// the child take turns by yielding, and an image with no tick returns from a
+// yield once every thread that was runnable has run until it blocked or
+// ended, so every step is ordered by construction.
+
+import sos.{SosStatus, Process, Memory, BootSet, PipeHandles, PipeInlet,
+            PipeOutlet, SystemRight, PIPE_BODY_BYTES}
+import sosmain
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// What root gives the child.
+static TAG_BOOT: UInt = 31
+static TAG_INLET: UInt = 42
+
+static KEY_DEATH: UInt = 2
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS roomroot: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS roomroot: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// Post empty tells until the ring is full, dropping each claim.
+func fill(inlet: &PipeInlet) {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    while true {
+        let claim = try inlet.post(body: &body, len: 0) catch {
+            return
+        }
+        let _ = move claim
+    }
+}
+
+/// Take one staged message and let it go: a tell's exchange settles, and the
+/// room it frees resumes a call parked for it.
+func free_one(outlet: &PipeOutlet) {
+    let (msg, request) = try outlet.take() catch {
+        panic("SOS roomroot: nothing to take: {}", error)
+    }
+    let _ = move msg
+    let _ = move request
+}
+
+/// Take every staged message: a tell is let go, and a request, which has a
+/// body, is printed and answered with its own first byte. `with_handles`
+/// answers it with two Events.
+func serve(outlet: &PipeOutlet, with_handles: Bool) -> Result<Void, SosStatus> {
+    while true {
+        let (msg, request) = try outlet.take() catch {
+            return
+        }
+        if msg.len == 0 {
+            let _ = move request
+            continue
+        }
+        print("SOS roomroot: took {}", msg.bytes[0])
+        var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+        out[0] = msg.bytes[0]
+        if with_handles {
+            var carried = PipeHandles.none()
+            let first = try sosmain.context().process().event_create()
+            let second = try sosmain.context().process().event_create()
+            carried.put(at: 0, event: move first)
+            carried.put(at: 1, event: move second)
+            try (move request).reply_with(body: &out, len: 1, handles: &var carried)
+        } else {
+            try (move request).reply(body: &out, len: 1)
+        }
+    }
+    panic("SOS roomroot: the serve loop ended")
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    let context = sosmain.context()
+    let child = try context.system().process_create(image: &img, memory: &ram)
+    let (inlet, outlet) = try context.process().pipe_create()
+    let for_child = try inlet.mint()
+    try child.give(inlet: move for_child, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try context.system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try context.process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let me = try context.process().thread_self()
+
+    // A: the ring is full, and the child's call waits for room.
+    fill(&inlet)
+    try child.start(boot_tag: TAG_BOOT)
+    try me.yield_now()
+    free_one(&outlet)
+    try me.yield_now()
+    try serve(&outlet, false)
+
+    // B: the ring is full again, and the child has filled its table.
+    fill(&inlet)
+    try me.yield_now()
+    free_one(&outlet)
+    try me.yield_now()
+    try serve(&outlet, false)
+
+    // C: the ring has room, and the reply's two handles meet one free row.
+    try me.yield_now()
+    try serve(&outlet, true)
+    try me.yield_now()
+
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    if key != KEY_DEATH {
+        panic("SOS roomroot: wake on key {}", key)
+    }
+    match what {
+        case Process(status) -> {
+            print("SOS roomroot: the child ended status={}", status)
+        },
+        case _ -> { panic("SOS roomroot: the death was no Process") },
+    }
+    return
+}

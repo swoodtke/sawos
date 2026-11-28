@@ -1,0 +1,87 @@
+// The server of `bounded-send-child` (spec §10.1). Root makes a connection,
+// gives the child its inlet and a System that can read the clock, starts it,
+// and serves the connection: each request it takes is printed with its first
+// byte, and is answered with the same byte.
+//
+//   SOS boundedroot: took 0
+//   SOS boundedroot: took 1
+//   SOS boundedroot: took 2
+//   SOS boundedroot: the child ended status=65536
+//
+// A send that went out twice would show as a second `took`. Each of the
+// child's sends returns only after root has answered, so the order is the
+// child's. Root has no task, so every wait it makes is plain.
+
+import sos.{SosStatus, Process, Memory, BootSet, SystemRight, PIPE_BODY_BYTES}
+import sosmain
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// What root gives the child.
+static TAG_BOOT: UInt = 31
+static TAG_INLET: UInt = 42
+
+static KEY_REQUEST: UInt = 1
+static KEY_DEATH: UInt = 2
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS boundedroot: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS boundedroot: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    let context = sosmain.context()
+    let child = try context.system().process_create(image: &img, memory: &ram)
+    let (inlet, outlet) = try context.process().pipe_create()
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try context.system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try context.process().waiter_create()
+    try waiter.add(outlet: &outlet, key: KEY_REQUEST)
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    while true {
+        let wake = try waiter.wait()
+        let (key, what) = (move wake).open()
+        if key == KEY_DEATH {
+            match what {
+                case Process(status) -> {
+                    print("SOS boundedroot: the child ended status={}", status)
+                },
+                case _ -> { panic("SOS boundedroot: the death was no Process") },
+            }
+            return
+        }
+        // The connection's far end went with the child, which leaves the
+        // outlet readable for good: stop watching it, and the death is next.
+        let (msg, request) = try outlet.take() catch {
+            let _ = waiter.remove(key: KEY_REQUEST)
+            continue
+        }
+        print("SOS boundedroot: took {}", msg.bytes[0])
+        var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+        out[0] = msg.bytes[0]
+        try (move request).reply(body: &out, len: 1)
+    }
+    panic("SOS boundedroot: the serve loop ended")
+}

@@ -1,0 +1,91 @@
+// A client at its Handle quota with a task live (spec §10.1), for
+// `bounded-send-root`. The task sleeps for the whole case, so every `send`
+// finds a live task and takes the bounded form, which holds one `Handle` row
+// for its claim.
+//
+//   0. A warm-up `send(0)`, which gets the process's Clock and settles the
+//      thread's wait word, with the table not yet full: it is bounded, and no
+//      fallback is counted.
+//   1. The child mints siblings of its inlet until a mint is refused. Its
+//      table then has no row for a claim.
+//   2. `send(1)`: the bounded form is refused for the claim's row, and the
+//      same call is made again unbounded. It is answered, and one fallback is
+//      counted.
+//   3. The child releases one sibling.
+//   4. `send(2)`: the row is there, so the bounded form serves it, and the
+//      count is still one.
+//
+//   SOS boundedchild: reply 0, fallbacks=0
+//   SOS boundedchild: the table is full
+//   SOS boundedchild: reply 1, fallbacks=1
+//   SOS boundedchild: reply 2, fallbacks=1
+//
+// Root answers each request with its first byte and prints each it takes, so
+// a send that goes out twice shows there.
+
+import sos.{SosStatus, PipeInlet, PIPE_BODY_BYTES}
+import sosmain
+
+static TAG_INLET: UInt = 42
+
+extern "C" {
+    func sos_exec_send_fallbacks() -> Int
+}
+
+/// A task that sleeps until it is cancelled, which the thread's close does.
+func idle() -> Int {
+    while not cancelled() {
+        sleep(Duration.ms(1_000_000))
+    }
+    0
+}
+
+/// One request whose first byte is `n`, and what the reply's first byte says.
+func send_one(inlet: &PipeInlet, n: UInt8) -> Result<UInt8, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = n
+    let reply = try inlet.send(body: &body, len: 1)
+    reply.bytes[0]
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    guard var record = set.take(TAG_INLET) else {
+        panic("SOS boundedchild: no record under tag {}", TAG_INLET)
+    }
+    guard let inlet = record.take_inlet() else {
+        panic("SOS boundedchild: the record under tag {} is no inlet", TAG_INLET)
+    }
+    let task = Task.spawn(idle())
+    let ended = session(&inlet)
+    task.cancel()
+    return ended
+}
+
+/// The steps above, with the task live.
+func session(inlet: &PipeInlet) -> Result<Void, SosStatus> {
+    let warm = try send_one(&inlet, 0)
+    print("SOS boundedchild: reply {}, fallbacks={}", warm,
+          sos_exec_send_fallbacks())
+
+    var siblings: Vector<PipeInlet> = Vector()
+    while true {
+        let sibling = try inlet.mint() catch {
+            break
+        }
+        try siblings.push(move sibling) catch {
+            panic("SOS boundedchild: no memory for the sibling: {}", error)
+        }
+    }
+    print("SOS boundedchild: the table is full")
+
+    let first = try send_one(&inlet, 1)
+    print("SOS boundedchild: reply {}, fallbacks={}", first,
+          sos_exec_send_fallbacks())
+
+    let _ = siblings.pop()
+    let second = try send_one(&inlet, 2)
+    print("SOS boundedchild: reply {}, fallbacks={}", second,
+          sos_exec_send_fallbacks())
+    return
+}

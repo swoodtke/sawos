@@ -404,7 +404,8 @@ would, and leaves the exchange as follows.
 - **`Call`'s room park.** Nothing was staged. The message is still in the
   caller's memory and was never posted, its carried handles are still the
   caller's, the call's parked state is cleared, and the value register is
-  `NO_HANDLE`.
+  `NO_HANDLE`. No claim handle word is `NO_HANDLE`, so an early end reads the
+  same way whichever park it came from.
 - **`Call`'s reply park.** A wakeable `Call` is a `Post` and a wakeable
   `Resolve` made in one trap, because a park that can end early has to give
   the claim back:
@@ -413,7 +414,11 @@ would, and leaves the exchange as follows.
     waits. The table is checked before anything is staged, where the stage
     happens: at the op, or at the room park's resume.
   - A table with no row for the claim answers `QuotaExceeded` at the caller's
-    `Handle` quota, or `NoResource` with the table full, as `Post` does.
+    `Handle` quota, or `NoResource` with the table full, as `Post` does, with
+    `CALL_NOT_STAGED` (1) in the value register. The same two statuses at the
+    reply's delivery, where the message was staged and the reply's handles
+    found no room, leave 0 there, so a caller tells the halves by the value
+    and not by the status.
     Nothing is staged and the carried handles stay the caller's: a transient
     refusal takes nothing, on `Post`'s terms. A thread resumed from the room
     park is answered the same way. A plain `Call` on the same table goes
@@ -5467,9 +5472,9 @@ nothing to the console but what a stop of the machine writes.
 
 ### 10.1 The task executor
 
-Partly built (§11): the entries' declarations, the seams and the close are
-built, and the drive in the typed wrappers, `send`'s fallback and the one-word
-lock are specified here and not built yet.
+Partly built (§11): the entries' declarations, the seams, the close, the
+drive in the typed wrappers and `send`'s fallback are built, and the one-word
+lock is specified here and not built yet.
 
 Saw's tasks run on a cooperative executor in std, which reaches the machine
 through a set of runtime seams (sawlang's `runtime/ABI.md` at the pinned
@@ -5618,9 +5623,8 @@ since the wrappers drive (below).
 **The drive in the typed wrappers.** Each wrapper that parks for a program
 drives the thread's tasks around its op: `Waiter.wait`,
 `PipeRequest.reply_wait` (and `_with`), `PipeInlet.send` (and `_with`),
-`PipeReply.resolve` and `Thread.join`. Each ends at the floor's syscall
-stubs, which are not seams, so the window fence already counts every wrapper
-as running tasks. A wrapper bounds its wait in its one trap:
+`PipeReply.resolve` and `Thread.join`. A wrapper bounds its wait in its one
+trap:
 
 1. It calls `background_drive()`. On `-1`, no task is live: it makes the op
    with the word at 0, a plain park, and stops.
@@ -5629,24 +5633,43 @@ as running tasks. A wrapper bounds its wait in its one trap:
    once, and the event the program waits for is still served once per turn;
    `NEVER_NS` for `INT64_MAX`; and the answer itself for a deadline, which is
    already an absolute instant on the Monotonic clock.
-3. It sets `parked` and checks the generation, as the poll does; if it moved,
-   it clears `parked` and drives again. Then it makes the op, the one trap,
+3. It sets `parked` and checks the generation, as the poll does. If it moved
+   since the thread last looked, it marks it seen and the word is `1` instead
+   of step 2's: the op answers if it is ready and otherwise ends at once, and
+   the next turn runs the tasks again, so a task that wakes the reactor in
+   every turn cannot keep the op from being made. Then it makes the op, the one trap,
    and writes 0 to the word and clears `parked`.
 4. On `TimedOut` or `Woken` it goes back to step 1.
 5. Anything else is the op's answer, and the wrapper's.
+
+A thread with no block runs no task, so its wrappers make no drive and the
+word stays 0. A finite word, the past instant `1` included, needs the thread's
+word registered with the process's Clock, which the wrapper sees to before it
+writes one (above). The Clock itself is got with `ClockGet` the first time the
+runtime needs the time, which is at the first task that sleeps or the first
+finite word, whichever comes first, and costs one `Handle` row (below). A
+process whose table is full before that moment panics there, naming the
+refusal, and a process that has held it is unaffected by a full table. The
+wrapper writes the word only after the turn's drive, so no task runs between
+the word and the op.
 
 | wrapper | after `TimedOut` or `Woken`, re-issued as |
 |---|---|
 | `Waiter.wait` | the same `Wait` |
 | `PipeRequest.reply_wait(_with)` | a driving `Waiter.wait`, since the reply was delivered (§2.1) |
-| `PipeInlet.send(_with)` | after the room park, which staged nothing, the same `Call`; after the reply park, a driving `Resolve` of the claim it handed back (§2.1) |
+| `PipeInlet.send(_with)` | after the room park, which staged nothing and answered `NO_HANDLE` in the value register, the same `Call`, its carried handles still the caller's; after the reply park, which answers the claim's handle word there, a driving `Resolve` of that claim (§2.1) |
 | `PipeReply.resolve` | the same `Resolve`; the typed `consumes` wrapper spends the claim only at the end that answers it |
 | `Thread.join` | the same `Join` |
 
 **`send` on a full table.** A wakeable `Call` that finds no row for its claim
 answers `QuotaExceeded` or `NoResource`, with nothing staged and the carried
-handles still the caller's (§2.1). `send` then makes the same `Call` again
-with the word at 0: a plain `Call`, which mints no claim and goes through.
+handles still the caller's (§2.1), and `CALL_NOT_STAGED` in the value
+register, at the op and at a room park's resume alike. That value is how
+`send` tells the refusal from the same two statuses at the reply's delivery,
+where the message was staged and answered and the value register is 0: only
+the first is made again, and the second is the status `send` returns. For
+the first, `send` makes the same `Call` again with the word at 0: a plain
+`Call`, which mints no claim and goes through.
 That one call is unbounded, and the thread's tasks wait with it; the next
 `send` tries the wakeable form again. Nothing was staged, so the message goes
 out exactly once, and the caller sees no status it would not have seen
@@ -5673,6 +5696,14 @@ of nesting holds a turn's frames on the thread's stack.
   holds waits on its own thread, the `BadState` fault, and a task that parks
   inside the section faults the process (`SectionHeld`), as any park there
   does (§7).
+- **A held std `Mutex` or `SpinLock` window across a driving wrapper.** A
+  lock's `borrows(sync)` window may run a call that drives, so the thread runs
+  its tasks inside it, and a task of the same thread that takes the same lock
+  re-enters a lock its thread already holds: std's owner check panics at
+  `lock()`. The compiler's window fence (`coro.window-drives`) refuses a
+  static root's exclusive window around a call that drives, and sees a
+  wrapper's route to `__saw_background_drive` there; it does not cover a
+  `Mutex` or `SpinLock` window, so this one is a run-time panic.
 - **A task that never parks** keeps every drive answering `0`. The wrapper
   still makes its op once per turn, so the event it waits for is served, but
   the thread never parks, and holds the processor as any thread that never
@@ -5789,12 +5820,11 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **The task executor's waits and locks** (§10.1): the drive in the typed
-  wrappers, `send`'s fallback and the one-word lock (§7). `sos.exec`'s seams,
-  the background entries' declarations and the close at a thread's end (§8)
-  are built, so a program spawns and runs tasks, but a typed wrapper's park
-  is plain and runs no task while it waits, and a channel fails at link,
-  naming `__saw_rt_lock_acquire`.
+- **The task executor's lock** (§10.1): the one-word lock (§7). `sos.exec`'s
+  seams, the background entries' declarations, the close at a thread's end
+  (§8), the drive in the typed wrappers and `send`'s fallback are built, so a
+  program spawns and runs tasks and a wait runs them, but a channel fails at
+  link, naming `__saw_rt_lock_acquire`.
 - **The thread gate** (§10.1). A `Channel.receive` made in thread context,
   outside any task, and a `TaskGroup(threads:)` reach std's thread gate, the
   `__saw_rt_pthread_*` mutex and condition-variable seams, and a

@@ -4883,17 +4883,21 @@ a pass's instructions, so many ticks that land in a burst land in one.
    at 4 x 8 x 512 = 16384.
 
 The verdict passes only if every atomic counter holds 16384, all 16 cold
-swaps answered the loaded word, the cold word is 16, and the plain counter
-lost counts: one that lost nothing means no tick reached a window, so the
-run raced nothing and fails for it. Before the race the verdict is held to
-a tally with each of those four faults and to a clean one, and says so.
+swaps answered the loaded word, the cold word is 16, and the run raced: a
+compare-and-swap retried or the plain counter lost counts. A run with
+neither means no tick reached a window, so it raced nothing and fails for
+it. Which windows the ticks land in follows the code's layout, so on the
+instruction-counted clock the plain counter alone may lose nothing.
+Before the race the verdict is held to a tally with each of those four
+faults and to a clean one, and says so.
 
 On the emulator the case runs on the instruction-counted clock (`icount`),
-where the ticks land at the same instructions on every run, so the plain
-counter's losses do not depend on the host; the counts are exact on any
-clock. `psram_stress_no_tick` boots the same image with no tick: each
-thread's burst runs alone, the control loses nothing, and the run fails
-with `no tick between a load and its store`. EXTMEM's counters read 0
+where the ticks land at the same instructions on every run of one build, so
+the retries and the plain counter's losses do not depend on the host; the
+counts are exact on any clock. `psram_stress_no_tick` boots the same image
+with no tick: each thread's burst runs alone, nothing retries, the control
+loses nothing, and the run fails with `no tick between a load and its
+store`. EXTMEM's counters read 0
 here.
 
 On the part, at `pll80` and at `pll240`

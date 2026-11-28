@@ -43,13 +43,16 @@
 //
 // The verdict (`verdict`) passes only if every atomic counter holds
 // `WORKERS` times the increments each thread made, every cold swap answered
-// the loaded word, the cold word counts them, and the plain counter lost
-// counts. A plain counter that lost nothing means no tick reached the window
-// between a load and its store, so the run raced nothing: it says so and
-// fails. Before the run the verdict is held to a tally with each fault in
-// turn, and to a clean one (`check_verdict`). The counts are exact on every
-// run; how many retries and losses there are, and the cache's counts, are
-// the part's record (the cache's read 0 on the emulator).
+// the loaded word, the cold word counts them, and the run raced: a
+// compare-and-swap retried or the plain counter lost counts. Either means a
+// tick reached the window between a load and its store. A run with neither
+// raced nothing: it says so and fails. Which windows the ticks land in
+// follows the code's layout, so the plain counter alone may lose nothing on
+// a run whose atomics retried. Before the run the verdict is held to a tally
+// with each fault in turn, and to a clean one (`check_verdict`). The counts
+// are exact on every run; how many retries and losses there are, and the
+// cache's counts, are the part's record (the cache's read 0 on the
+// emulator).
 
 import sos.{System, Process, Pool, IoMemory, Thread, AllocateFrom, MapAccess,
             SosStatus}
@@ -164,6 +167,8 @@ struct Tally {
     cold_word: UInt
     // How many increments the plain counter lost.
     lost: UInt
+    // How many compare-and-swaps the workers retried, every counter's.
+    retries: UInt
 }
 
 extension Tally: NoCopy {}
@@ -183,7 +188,7 @@ func verdict(t: &Tally) -> String {
     if t.cold_word != COLD_ROUNDS {
         return "the cold word is wrong"
     }
-    if t.lost == 0 {
+    if t.lost == 0 && t.retries == 0 {
         return "no tick between a load and its store"
     }
     ""
@@ -199,7 +204,7 @@ func tally_with(last: UInt) -> Tally {
         i += 1
     }
     Tally(counts: move counts, cold_swapped: COLD_ROUNDS,
-          cold_word: COLD_ROUNDS, lost: 1)
+          cold_word: COLD_ROUNDS, lost: 1, retries: 1)
 }
 
 /// Does the verdict refuse `t` for `why`?
@@ -219,6 +224,7 @@ func faults_refused() -> UInt {
     refused += refuses(move word, "the cold word is wrong")
     var raced = tally_with(WANT)
     raced.lost = 0
+    raced.retries = 0
     refused += refuses(move raced, "no tick between a load and its store")
     refused
 }
@@ -525,7 +531,8 @@ func run(system: &System, proc: &Process) unsafe -> Result<Bool, SosStatus> {
         return false
     }
     let tally = Tally(counts: move counts, cold_swapped: cold_swapped,
-                      cold_word: cold_word, lost: lost)
+                      cold_word: cold_word, lost: lost,
+                      retries: psram_retries + sram_retries)
     let why = verdict(&tally)
     if not why.is_empty() {
         print("SOS stress: {}: fail", why)

@@ -287,6 +287,11 @@ TASK_TWO_THREADS_PKG = os.path.join(TESTS_DIR, "task-two-threads")
 TASK_CROSS_THREAD_WAKE_PKG = os.path.join(TESTS_DIR, "task-cross-thread-wake")
 SLEEP_NS_DIRECT_PKG = os.path.join(TESTS_DIR, "sleep-ns-direct")
 REACTOR_FIRST_POLL_PKG = os.path.join(TESTS_DIR, "reactor-first-poll")
+TASK_BOUNDED_WAITS_PKG = os.path.join(TESTS_DIR, "task-bounded-waits")
+BOUNDED_SEND_ROOT_PKG = os.path.join(TESTS_DIR, "bounded-send-root")
+BOUNDED_SEND_CHILD_PKG = os.path.join(TESTS_DIR, "bounded-send-child")
+BOUNDED_ROOM_ROOT_PKG = os.path.join(TESTS_DIR, "bounded-room-root")
+BOUNDED_ROOM_CHILD_PKG = os.path.join(TESTS_DIR, "bounded-room-child")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -4752,6 +4757,86 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The typed wrappers that park drive the thread's tasks: `main`'s
+        # `Waiter.wait`, `Thread.join`, `PipeInlet.send`, `PipeReply.resolve`
+        # and `PipeRequest.reply_wait` each end only because a task of its own
+        # thread runs inside them. `tests/task-bounded-waits` says how.
+        "name": "task_bounded_waits",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TASK_BOUNDED_WAITS_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS taskbounded: waiter: woken by the task, key 1\n",
+            "SOS taskbounded: join: T exited with 7\n",
+            "SOS taskbounded: send: reply of 2 bytes\n",
+            "SOS taskbounded: resolve: reply of 2 bytes\n",
+            "SOS taskbounded: reply_wait: the next wake is the Event, "
+            "key 2\n",
+            "SOS taskbounded: reply_wait: C got a reply of 2 bytes\n",
+            "SOS taskbounded: woken: the wait ended after a wake, key 1\n",
+            "SOS taskbounded: nested: main woke on key 6, the inner wait saw "
+            "key 5\n",
+            "SOS taskbounded: nested: main waits with no task\n",
+            "SOS taskbounded: nested: P signals\n",
+            "SOS taskbounded: nested: a plain wait after the tasks, key 7\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A bounded `send` from a client at its Handle quota falls back to a
+        # plain `Call`, counted once, and the next one, with a row free, is
+        # bounded again. `tests/bounded-send-child` says how.
+        "name": "bounded_send_table_full",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOUNDED_SEND_ROOT_PKG,
+        "children": [BOUNDED_SEND_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS boundedroot: took 0",
+            "SOS boundedchild: reply 0, fallbacks=0",
+            "SOS boundedchild: the table is full",
+            "SOS boundedroot: took 1",
+            "SOS boundedchild: reply 1, fallbacks=1",
+            "SOS boundedroot: took 2",
+            "SOS boundedchild: reply 2, fallbacks=1",
+            "SOS boundedroot: the child ended status=65536\n"],
+        # Each request is taken once: no `took` line repeats.
+        "expect_regex": [
+            r"(?s)\A(?!.*SOS boundedroot: took 1\n.*SOS boundedroot: took 1\n)",
+            r"(?s)\A(?!.*SOS boundedroot: took 2\n.*SOS boundedroot: took 2\n)"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A bounded `send` into a full ring: its early end at the room park
+        # and the same `Call` made again, the fallback when the resume finds
+        # no row for the claim, and a reply refused at its delivery, which is
+        # the answer and is not made again. `tests/bounded-room-root` says how
+        # each is made.
+        "name": "bounded_send_room",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOUNDED_ROOM_ROOT_PKG,
+        "children": [BOUNDED_ROOM_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS roomroot: took 65",
+            "SOS roomchild: A reply 65, fallbacks=0",
+            "SOS roomchild: the table is full",
+            "SOS roomroot: took 66",
+            "SOS roomchild: B reply 66, fallbacks=1",
+            "SOS roomroot: took 67",
+            "SOS roomchild: C refused: ",
+            "SOS roomroot: the child ended status=65536\n"],
+        # Each request is taken once: no `took` line repeats, and the
+        # refusal of C's reply leaves the fallback count at one.
+        "expect_regex": [
+            r"(?s)\A(?!.*SOS roomroot: took 65\n.*SOS roomroot: took 65\n)",
+            r"(?s)\A(?!.*SOS roomroot: took 66\n.*SOS roomroot: took 66\n)",
+            r"(?s)\A(?!.*SOS roomroot: took 67\n.*SOS roomroot: took 67\n)",
+            r"SOS roomchild: C refused: [^\n]*, fallbacks=1\n"],
+        "expect_clean_exit": True,
+    },
+    {
         # A park's record lasts only as long as the park: a wakeable wait a
         # delivery answered leaves nothing that makes the plain call after it
         # wakeable, so a wake made while the call is parked latches, the call
@@ -4971,13 +5056,13 @@ TEST_CASES = [
             "SOS: boot regions={two}",
             "SOS quotachild: at its quota: QuotaExceeded",
             "SOS quotaroot: the ring is full and the child's call parked",
-            "SOS quotachild: room: QuotaExceeded value=0",
-            "SOS quotachild: op: QuotaExceeded value=0",
+            "SOS quotachild: room: QuotaExceeded value=1",
+            "SOS quotachild: op: QuotaExceeded value=1",
             "SOS quotachild: the carried sibling is still ours: Ok",
             "SOS quotachild: plain: Ok len=2",
             "SOS quotaroot: took the child's message 1 time(s)",
             "SOS quotaroot: its table full: NoResource",
-            "SOS quotaroot: a wakeable call: NoResource value=0",
+            "SOS quotaroot: a wakeable call: NoResource value=1",
             "SOS quotaroot: the carried handle is still root's: Ok",
             "SOS quotaroot: then a take: WouldBlock",
         ],
@@ -25788,7 +25873,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "task_spawn_join", "task_sleep_floor",
                      "task_close_at_thread_end", "task_two_threads",
                      "task_cross_thread_wake", "sleep_ns_direct",
-                     "reactor_first_poll",
+                     "reactor_first_poll", "task_bounded_waits",
+                     "bounded_send_table_full", "bounded_send_room",
                      *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES],
                      "death_record", "console_claim", "pipe_taken"]
     by_name = {c["name"]: c for c in TEST_CASES}
