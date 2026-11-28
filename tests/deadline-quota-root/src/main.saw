@@ -1,0 +1,275 @@
+// A wakeable `Call` with no row for its claim (spec §2.1, §2.9), from the
+// server's side, at the C altitude. Root fills a connection's ring with tells,
+// gives the inlet to `deadline-quota-child` and starts it; the child goes to
+// its Handle quota and makes its calls, and root is their server:
+//
+//   the child's wakeable call parks for room, and the room root makes by
+//   letting a tell go resumes it into a table with no row for its claim:
+//   `QuotaExceeded`, nothing staged
+//   its wakeable call again, now with room: `QuotaExceeded` at the op,
+//   nothing staged
+//   its plain call of the same message: staged, and answered
+//
+// Root takes every message, answers the child's and lets the tells go, and
+// prints how many of the child's it took: one, since a refused call staged
+// nothing. The image arms no tick, so each yield returns once the child has
+// parked or exited.
+//
+// Then root, whose Handle row has no limit, fills its own table and makes a
+// wakeable call on a second connection, carrying the last handle it minted:
+// the table is full, so the call answers `NoResource`, stages nothing, and
+// leaves the carried handle in root's table.
+
+import sos.{System, SosStatus, SystemRight, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_system_process_create,
+            sos_process_boot_handle_next, sos_process_give,
+            sos_process_start, sos_process_pipe_create, sos_handle_mint,
+            sos_handle_release, sos_handle_info, sos_wait_word,
+            sos_pipe_inlet_post, sos_pipe_inlet_call, sos_pipe_outlet_take,
+            sos_pipe_request_reply}
+
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+/// The word that names nothing.
+static NONE: UInt = 0
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The most siblings the fill of root's table mints.
+static MAX_MINTS: Int = 4096
+
+/// `HandleInfo.Kind`: a selector whose answer needs the word to name a
+/// handle, and nothing more.
+static HANDLE_KIND: UInt = 1
+
+/// Root's wait word.
+unsafe static var WORD: UInt64 = 0
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// What root gives the child.
+static TAG_BOOT: UInt = 31
+static TAG_INLET: UInt = 42
+
+/// `BootTagForm.Present`: start the child on the record under a tag.
+static TAG_PRESENT: UInt = 1
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a take record on every profile.
+static REC_WORDS: Int = 128
+
+/// The most tells the fill posts before it gives up.
+static MAX_FILL: Int = 64
+
+/// Where a take record's message, and so its length byte, starts.
+static MSG_OFFSET: Int = 8
+
+unsafe static var REC: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+/// What root answers the child with.
+unsafe static var ANSWER: [UInt8; 8] = [0x52, 0x31, 0, 0, 0, 0, 0, 0]
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The answer's address, taken in a function of its own, so that the loop
+/// that sends it holds no borrow of the static across its iterations.
+func answer_at() unsafe -> UInt {
+    ((&var ANSWER) as UnsafePointer<UInt8>) as UInt
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func send_bytes() -> UInt {
+    (SEND_WORDS as UInt) * word_bytes()
+}
+
+/// The image and memory records of the boot set, as raw words.
+func image_and_ram(proc: UInt) unsafe -> (UInt, UInt) {
+    var image: UInt = NONE
+    var ram: UInt = NONE
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        if rec[0] == TAG_IMAGE {
+            image = rec[2]
+        } else if rec[0] == TAG_RAM {
+            ram = rec[2]
+        }
+    }
+    (image, ram)
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim. Answers how many were staged.
+func fill(inlet: UInt) unsafe -> Int {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        var claim: UInt = NONE
+        if sos_pipe_inlet_post(inlet, (&var msg) as UnsafePointer<UInt>,
+                               send_bytes(),
+                               (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+            return staged
+        }
+        let _ = sos_handle_release(claim)
+        staged = staged + 1
+    }
+    staged
+}
+
+/// Take every staged message: answer each of the child's, which carry a
+/// body, and let each tell go. Answers how many of the child's there were.
+func serve(outlet: UInt) unsafe -> Int {
+    var answered: Int = 0
+    while sos_pipe_outlet_take(outlet, (&var REC) as UnsafePointer<UInt>,
+                               (REC_WORDS as UInt) * word_bytes()) == STATUS_OK {
+        let len = REC[MSG_OFFSET / sizeof<UInt>()] & 0xFF
+        if len == 0 {
+            let _ = sos_handle_release(REC[0])
+        } else {
+            var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+            msg[0] = answer_at()
+            msg[1] = 2
+            let _ = sos_pipe_request_reply(REC[0], (&var msg) as UnsafePointer<UInt>,
+                                           send_bytes())
+            answered = answered + 1
+        }
+    }
+    answered
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS quotaroot: no process handle: {}", error)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        print("SOS quotaroot: no thread handle: {}", error)
+        return
+    }
+    var raw: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var raw) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS quotaroot: no raw process handle")
+        return
+    }
+    let (image, ram) = image_and_ram(raw)
+    var child: UInt = NONE
+    var ends: [UInt; 2] = [NONE; 2]
+    var boot: UInt = NONE
+    if sos_system_process_create(boot_handle, image, ram, NONE,
+                                 (&var child) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_pipe_create(raw, (&var ends) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK {
+        print("SOS quotaroot: setup refused")
+        return
+    }
+    let _ = fill(ends[0])
+    if sos_process_give(child, ends[0], TAG_INLET, ALL_RIGHTS as UInt) != STATUS_OK ||
+       sos_handle_mint(boot_handle, CHILD_SYSTEM as UInt,
+                       (&var boot) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_give(child, boot, TAG_BOOT, ALL_RIGHTS as UInt) != STATUS_OK ||
+       sos_process_start(child, TAG_PRESENT, TAG_BOOT) != STATUS_OK {
+        print("SOS quotaroot: the child did not start")
+        return
+    }
+
+    // The child runs at the yield until its wakeable call parks for room.
+    let _ = me.yield_now()
+    print("SOS quotaroot: the ring is full and the child's call parked")
+    if sos_pipe_outlet_take(ends[1], (&var REC) as UnsafePointer<UInt>,
+                            (REC_WORDS as UInt) * word_bytes()) != STATUS_OK {
+        print("SOS quotaroot: the first take was refused")
+        return
+    }
+    let _ = sos_handle_release(REC[0])
+
+    // The resume readied the child, which runs at the yield until its plain
+    // call parks for its answer.
+    let _ = me.yield_now()
+    let first = serve(ends[1])
+    // The answer readied the child, which runs at the yield until it exits.
+    let _ = me.yield_now()
+    let later = serve(ends[1])
+    print("SOS quotaroot: took the child's message {} time(s)", first + later)
+    full_table(raw)
+    let _ = proc.exit(EXIT_OK)
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.WouldBlock) {
+        return "WouldBlock"
+    }
+    if status == code(SosStatus.QuotaExceeded) {
+        return "QuotaExceeded"
+    }
+    if status == code(SosStatus.NoResource) {
+        return "NoResource"
+    }
+    "unexpected"
+}
+
+/// A wakeable call from a table with no free row, carrying a handle.
+func full_table(raw: UInt) unsafe {
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(raw, (&var ends) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK {
+        print("SOS quotaroot: no second connection")
+        return
+    }
+    var refused: UInt = STATUS_OK
+    var minted: Int = 0
+    var carried: UInt = NONE
+    while refused == STATUS_OK && minted < MAX_MINTS {
+        var sibling: UInt = NONE
+        refused = sos_handle_mint(ends[0], ALL_RIGHTS as UInt,
+                                  (&var sibling) as UnsafePointer<UInt>)
+        if refused == STATUS_OK {
+            carried = sibling
+        }
+        minted = minted + 1
+    }
+    print("SOS quotaroot: its table full: {}", named(refused))
+    let _ = sos_wait_word(((&var WORD) as UnsafePointer<UInt64>) as UInt, NONE)
+    var body: [UInt8; 8] = [0x51, 0x32, 0, 0, 0, 0, 0, 0]
+    var args: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    args[0] = ((&var body) as UnsafePointer<UInt8>) as UInt
+    args[1] = 2
+    args[2] = carried
+    var value: UInt = 0xFFFF
+    WORD = NEVER
+    let status = sos_pipe_inlet_call(ends[0], (&var args) as UnsafePointer<UInt>,
+                                     send_bytes(),
+                                     (&var REC) as UnsafePointer<UInt>,
+                                     (&var value) as UnsafePointer<UInt>)
+    WORD = 0
+    print("SOS quotaroot: a wakeable call: {} value={}", named(status), value)
+    var kind: UInt = 0
+    print("SOS quotaroot: the carried handle is still root's: {}",
+          named(sos_handle_info(carried, HANDLE_KIND,
+                                (&var kind) as UnsafePointer<UInt>)))
+    print("SOS quotaroot: then a take: {}",
+          named(sos_pipe_outlet_take(ends[1], (&var REC) as UnsafePointer<UInt>,
+                                     (REC_WORDS as UInt) * word_bytes())))
+}

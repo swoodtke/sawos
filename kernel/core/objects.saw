@@ -2408,15 +2408,18 @@ public(package) struct Exchange {
     public(package) reply_attach: Int,
     /// The attachment watching this exchange's obligation (slot + 1).
     public(package) request_attach: Int,
-    /// The thread parked in a fused `Call` on this exchange (thread slot + 1;
-    /// 0 = none).
+    /// The thread parked on this exchange's claim, in a fused `Call` or a
+    /// `Resolve` (thread slot + 1; 0 = none).
     ///
     /// This is a third way to name a claim, and the only one that is not a
-    /// handle. A fused call mints no `PipeReply` into the caller's table (zero
-    /// handle traffic and zero table rows on the fast path), so the claim it
-    /// holds is kernel-internal and tied to the parked thread. A parked caller
-    /// counts one on `reply_refs`, exactly as a handle entry or an attachment
-    /// would, so nothing can settle the ring slot out from under it.
+    /// handle. A plain fused call mints no `PipeReply` into the caller's table
+    /// (zero handle traffic and zero table rows on the fast path), so the claim
+    /// it holds is kernel-internal and tied to the parked thread. A parked
+    /// caller counts one on `reply_refs`, exactly as a handle entry or an
+    /// attachment would, so nothing can settle the ring slot out from under it.
+    /// A wakeable park counts its own one beside the handle it borrows, which
+    /// stays bound (`ThreadSlot.call_word`) and is the parked thread's while
+    /// this field is set (`parked_claim`).
     ///
     /// Two directions, two fields: this one answers "who is waiting for this
     /// exchange" (what a settling reply needs, a load rather than a scan of the

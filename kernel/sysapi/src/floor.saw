@@ -618,8 +618,9 @@ public func sos_process_start(handle: UInt, boot_tag_form: UInt,
 /// Four ways to terminate the caller, all caller-checkable: a `given` that
 /// names nothing (`BadHandle`); one without `Transfer`, or a receiver handle
 /// without `Give` (`AccessDenied`); a child that has already been started,
-/// since the boot set freezes at start (`BadState`); and a `tag` the child's
-/// set already carries (`DuplicateKey`). A full child table or boot set is
+/// since the boot set freezes at start, or a claim a wakeable `Resolve` or
+/// `Call` is parked on (`BadState`); and a `tag` the child's set already
+/// carries (`DuplicateKey`). A full child table or boot set is
 /// `SosStatus.NoResource` and a child at its handle quota is
 /// `SosStatus.QuotaExceeded`. Both are statuses, and the give did not happen:
 /// the caller's handle is untouched.
@@ -1289,8 +1290,9 @@ public func sos_pipe_inlet_post(handle: UInt, args: UnsafePointer<UInt>,
 /// end went while the caller was parked, or the caller's message was still
 /// staged when the last outlet handle went. It is `resolve`'s own convention,
 /// so the fused and composed paths report the same fact with the same word.
-/// The call itself never refuses transiently: a full ring parks it and no claim
-/// is minted, so no answer leaves the carried handles with the caller.
+/// A plain call never refuses transiently: a full ring parks it and no claim
+/// is minted, so no answer leaves the carried handles with the caller (a
+/// wakeable one, below, can).
 /// `PeerClosed` is terminal for them: the kernel releases them whether or not
 /// the message was staged (at the call, while the caller was parked for room,
 /// or after staging), and the words are stale afterwards.
@@ -1301,8 +1303,19 @@ public func sos_pipe_inlet_post(handle: UInt, args: UnsafePointer<UInt>,
 /// after the message was staged, so it is terminal for the carried handles as
 /// well: they were consumed with the message.
 ///
-/// No claim handle is minted, either way. A blocking client spends no table row
-/// on a claim, so its in-flight depth is not bounded by its handle table.
+/// With the caller's wait word at 0 or unregistered, no claim handle is
+/// minted, either way. A blocking client spends no table row on a claim, so its
+/// in-flight depth is not bounded by its handle table.
+///
+/// A wakeable word (`sos_wait_word`) bounds the call by its deadline and lets
+/// `sos_thread_wake` end it, and the call mints its claim, a `PipeReply`
+/// handle, at the stage, as a post does. With no row for it the call answers
+/// `SosStatus.QuotaExceeded` or `SosStatus.NoResource` with nothing staged
+/// and the carried handles still the caller's. `SosStatus.TimedOut` and
+/// `SosStatus.Woken` answered while the call waited for room have staged
+/// nothing either, with `NO_HANDLE` in `value_out`; answered while it waited
+/// for the reply, the message is staged and `value_out` is the claim, to
+/// resolve, wait on or release later. Every other answer spends the claim.
 @export("sos_pipe_inlet_call")
 public func sos_pipe_inlet_call(handle: UInt, args: UnsafePointer<UInt>,
                                 args_bytes: UInt, reply: UnsafePointer<UInt>,
@@ -1431,6 +1444,17 @@ public func sos_pipe_outlet_take(handle: UInt, rec: UnsafePointer<UInt>,
 /// `SosStatus.PeerClosed` means the server side abandoned it: the obligation
 /// was dropped without a reply, or the connection's server end went away before
 /// the message could ever be taken.
+///
+/// A wakeable wait word (`sos_wait_word`) bounds the park by its deadline and
+/// lets `sos_thread_wake` end it. `SosStatus.TimedOut` and `SosStatus.Woken`
+/// consume nothing: the claim is still bound under the same word, which
+/// `value_out` carries. Answered at once (a latched wake, a deadline already
+/// passed) the resolve made no park and changed nothing, so an attached claim
+/// stays attached; answered by a park that ended early, the claim was
+/// detached at the park and stays detached. While such a park holds the
+/// claim, another thread's resolve, attach, give or message carrying it
+/// terminates that thread's process (`BadState`); another thread may release
+/// it.
 @export("sos_pipe_reply_resolve")
 public func sos_pipe_reply_resolve(handle: UInt, rec: UnsafePointer<UInt>,
                                    cap: UInt,

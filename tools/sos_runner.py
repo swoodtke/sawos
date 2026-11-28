@@ -271,6 +271,13 @@ DEADLINE_PARK_PKG = os.path.join(TESTS_DIR, "deadline-park")
 THREAD_WAKE_PKG = os.path.join(TESTS_DIR, "thread-wake")
 PARK_RECORD_PKG = os.path.join(TESTS_DIR, "park-record")
 DEADLINE_TIMER_PKG = os.path.join(TESTS_DIR, "deadline-timer")
+DEADLINE_CALL_PKG = os.path.join(TESTS_DIR, "deadline-call")
+DEADLINE_CLAIMS_ROOT_PKG = os.path.join(TESTS_DIR, "deadline-claims-root")
+DEADLINE_CLAIMS_CHILD_PKG = os.path.join(TESTS_DIR, "deadline-claims-child")
+DEADLINE_CLAIM_GIVE_PKG = os.path.join(TESTS_DIR, "deadline-claim-give")
+DEADLINE_CLAIM_REWRITE_PKG = os.path.join(TESTS_DIR, "deadline-claim-rewrite")
+DEADLINE_QUOTA_ROOT_PKG = os.path.join(TESTS_DIR, "deadline-quota-root")
+DEADLINE_QUOTA_CHILD_PKG = os.path.join(TESTS_DIR, "deadline-quota-child")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -4363,6 +4370,203 @@ TEST_CASES = [
             "SOS deadlinetimer: register: Ok",
             "SOS deadlinetimer: wait: Ok key=5 fired=true",
             "SOS deadlinetimer: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The pipe parks' early ends: `Call`'s room park (`NO_HANDLE`,
+        # nothing staged, the carried handle kept) and reply park (the claim
+        # handed back), the borrowing `Resolve`, `ReplyWait`'s wait leg (the
+        # `Wait` leg, 0, after the reply landed), and a wakeable park's flag
+        # gone once its answer readied it. `tests/deadline-call` says how
+        # each is made; `body=82,49` is the server's answer, "R1".
+        "name": "deadline_call",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_CALL_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS deadlinecall: register: Ok",
+            "SOS deadlinecall: room, deadline: TimedOut value=0 at or past "
+            "it: true",
+            "SOS deadlinecall: room, woken: Woken value=0",
+            "SOS deadlinecall: room, latched: Woken value=0",
+            "SOS deadlinecall: room, passed: TimedOut value=0",
+            "SOS deadlinecall: room, the carried Event is still ours: Ok",
+            "SOS deadlinecall: room, the ring held the tells alone: true",
+            "SOS deadlinecall: room, resumed and woken: Woken claim: true "
+            "ring: true",
+            "SOS deadlinecall: room, resumed, deadline: TimedOut claim: true "
+            "past: true ring: true",
+            "SOS deadlinecall: reply, deadline: TimedOut claim: true at or "
+            "past it: true",
+            "SOS deadlinecall: reply, the claim resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: reply, woken: Woken claim: true",
+            "SOS deadlinecall: reply, the claim resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: reply, passed: TimedOut claim: true",
+            "SOS deadlinecall: reply, the claim resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: reply, answered: Ok len=2 claim spent: true",
+            "SOS deadlinecall: resolve, passed: TimedOut value is the claim: "
+            "true",
+            "SOS deadlinecall: resolve, latched: Woken value is the claim: "
+            "true",
+            "SOS deadlinecall: resolve, still attached: Ok",
+            "SOS deadlinecall: resolve, the same word resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: resolve, deadline: TimedOut at or past it: "
+            "true",
+            "SOS deadlinecall: resolve, the same word resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: resolve, woken: Woken",
+            "SOS deadlinecall: resolve, the same word resolves: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: resolve, attached: Woken, attaches again: Ok",
+            "SOS deadlinecall: resolve, the detached word resolves: Ok "
+            "len=2 body=82,49",
+            "SOS deadlinecall: resolve, released while parked: Ok len=2",
+            "SOS deadlinecall: resolve, released while parked, spent: true",
+            "SOS deadlinecall: resolve, released then woken: Woken, the "
+            "reply: PeerClosed",
+            "SOS deadlinecall: resolve, the server let go: PeerClosed "
+            "spent: true",
+            "SOS deadlinecall: replywait, deadline: TimedOut leg=0 at or "
+            "past it: true",
+            "SOS deadlinecall: replywait, deadline, the reply landed: Ok "
+            "len=2 body=82,49",
+            "SOS deadlinecall: replywait, woken: Woken leg=0",
+            "SOS deadlinecall: replywait, woken, the reply landed: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: replywait, passed: TimedOut leg=0",
+            "SOS deadlinecall: replywait, passed, the reply landed: Ok len=2 "
+            "body=82,49",
+            "SOS deadlinecall: replywait, latched: Woken leg=0",
+            "SOS deadlinecall: replywait, latched, the reply landed: Ok "
+            "len=2 body=82,49",
+            "SOS deadlinecall: stale, a bounded wait ended: true",
+            "SOS deadlinecall: stale, a plain call past that deadline: Ok "
+            "len=2",
+            "SOS deadlinecall: stale, a wakeable call: Ok",
+            "SOS deadlinecall: stale, a plain one woken meanwhile: Ok len=2",
+            "SOS deadlinecall: stale, then latched: Woken",
+            "SOS deadlinecall: H refused nothing: true",
+            "SOS deadlinecall: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A claim a wakeable park holds is the parked thread's: attaching it
+        # (under a used key, so the claim's `BadState` comes before the key's
+        # `DuplicateKey`), giving it to a Waiter, carrying it and resolving
+        # it from another thread are each `BadState` (status 131077), and an
+        # early end after another thread released it leaves a word that is
+        # `BadHandle` (131073). The `call` rounds make the first four on the
+        # claim a wakeable `Call` parks on. `tests/deadline-claims-child` says
+        # how each is made.
+        "name": "deadline_claim_refusals",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_CLAIMS_ROOT_PKG,
+        "children": [DEADLINE_CLAIMS_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS deadlineclaim: add: the parked claim, under a used key",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: add ended status=131077",
+            "SOS deadlineclaim: give: the parked claim, consuming",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: give ended status=131077",
+            "SOS deadlineclaim: carry: a post carrying the parked claim",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: carry ended status=131077",
+            "SOS deadlineclaim: resolve: the main thread resolves it",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: resolve ended status=131077",
+            "SOS deadlineclaim: released: release Ok, wake A Ok",
+            "SOS deadlineclaim: A's resolve: Woken",
+            "SOS deadlineclaim: A resolves the word again",
+            "SOS: process fault: bad handle process={one}",
+            "SOS deadlineclaims: released ended status=131073",
+            "SOS deadlineclaim: add: the parked claim, under a used key",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: call add ended status=131077",
+            "SOS deadlineclaim: give: the parked claim, consuming",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: call give ended status=131077",
+            "SOS deadlineclaim: carry: a post carrying the parked claim",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: call carry ended status=131077",
+            "SOS deadlineclaim: resolve: the main thread resolves it",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS deadlineclaims: call resolve ended status=131077",
+            "SOS deadlineclaims: done",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A claim a wakeable park holds cannot be given to another process:
+        # root's give of one, under a tag the child already carries, is the
+        # `BadState` fault, before the tag's `DuplicateKey`, and it ends root.
+        "name": "deadline_claim_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_CLAIM_GIVE_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS claimgive: giving the parked claim under a used tag",
+            "SOS: process fault: object in the wrong state process={zero}",
+        ],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A room-parked call's record, rewritten to carry a claim a wakeable
+        # park holds, arrives with that slot empty at the resume, and the
+        # claim stays the parked thread's: another thread's claim, and then
+        # the claim a wakeable call mints at that very resume, its word
+        # predicted. `tests/deadline-claim-rewrite` says how it is made.
+        "name": "deadline_claim_rewrite",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_CLAIM_REWRITE_PKG,
+        "expect_out": [
+            "{banner}",
+            "SOS claimrewrite: the call and the resolve are parked",
+            "SOS claimrewrite: the message arrived without the claim: true",
+            "SOS claimrewrite: A's resolve: Ok len=2",
+            "SOS claimrewrite: B's call: Ok",
+            "SOS claimrewrite: W's call is parked",
+            "SOS claimrewrite: W's message arrived without its claim: true",
+            "SOS claimrewrite: W's call: Woken, handed the predicted claim: "
+            "true",
+            "SOS claimrewrite: W's resolve of it: Ok len=2",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A wakeable `Call` with no row for its claim: `QuotaExceeded` at
+        # the room park's resume and at the op, nothing staged and the carried
+        # handle kept, and a plain `Call` of the same message answered, so the
+        # server takes it once; then `NoResource` from root's full table.
+        # `tests/deadline-quota-root` says how it is made.
+        "name": "deadline_call_quota",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLINE_QUOTA_ROOT_PKG,
+        "children": [DEADLINE_QUOTA_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS quotachild: at its quota: QuotaExceeded",
+            "SOS quotaroot: the ring is full and the child's call parked",
+            "SOS quotachild: room: QuotaExceeded value=0",
+            "SOS quotachild: op: QuotaExceeded value=0",
+            "SOS quotachild: the carried sibling is still ours: Ok",
+            "SOS quotachild: plain: Ok len=2",
+            "SOS quotaroot: took the child's message 1 time(s)",
+            "SOS quotaroot: its table full: NoResource",
+            "SOS quotaroot: a wakeable call: NoResource value=0",
+            "SOS quotaroot: the carried handle is still root's: Ok",
+            "SOS quotaroot: then a take: WouldBlock",
         ],
         "expect_clean_exit": True,
     },
@@ -24811,6 +25015,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "wait_word_refusals", "deadline_waiter", "deadline_join",
                      "deadline_lock", "deadline_park", "thread_wake",
                      "park_record_cleared", "deadline_timer_first",
+                     "deadline_call", "deadline_claim_refusals",
+                     "deadline_claim_give", "deadline_claim_rewrite",
+                     "deadline_call_quota",
                      *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES],
                      "death_record", "console_claim", "pipe_taken"]
     by_name = {c["name"]: c for c in TEST_CASES}

@@ -1,0 +1,101 @@
+// The refusals of a claim a wakeable park holds (spec §2.1), from root's side:
+// `deadline-claims-child` launched once per round with the round's role,
+// started, and waited out. Each round prints the child's status word:
+//
+//   SOS deadlineclaims: <round> ended status=<word>
+//
+// `Faulted` (2) << 16 with the reason: `BadHandle` 1 and `BadState` 5. The
+// child's own comment says what each round does.
+
+import sos.{Process, Memory, BootSet, SosStatus, SystemRight}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// What root gives the child.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+
+static KEY_DEATH: UInt = 6
+
+static ROLE_ADD: UInt = 1
+static ROLE_GIVE: UInt = 2
+static ROLE_CARRY: UInt = 3
+static ROLE_RESOLVE: UInt = 4
+static ROLE_RELEASED: UInt = 5
+/// Set beside a role: the claim is a wakeable `Call`'s.
+static ROLE_CALL: UInt = 16
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    try round(&img, &ram, "add", ROLE_ADD)
+    try round(&img, &ram, "give", ROLE_GIVE)
+    try round(&img, &ram, "carry", ROLE_CARRY)
+    try round(&img, &ram, "resolve", ROLE_RESOLVE)
+    try round(&img, &ram, "released", ROLE_RELEASED)
+    try round(&img, &ram, "call add", ROLE_CALL | ROLE_ADD)
+    try round(&img, &ram, "call give", ROLE_CALL | ROLE_GIVE)
+    try round(&img, &ram, "call carry", ROLE_CALL | ROLE_CARRY)
+    try round(&img, &ram, "call resolve", ROLE_CALL | ROLE_RESOLVE)
+    print("SOS deadlineclaims: done")
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS deadlineclaims: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS deadlineclaims: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// One launch of the child, told `role`, started and waited out.
+func round(img: &Memory, ram: &Memory, name: String,
+           role: UInt) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(move child, name)
+}
+
+/// Wait for `child`'s death and print its status word.
+func ended(child: Process, name: String) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS deadlineclaims: {} ended status={}", name, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

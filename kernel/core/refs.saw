@@ -77,14 +77,16 @@ import sosabi.{EventMode, FaultReason, NO_HANDLE, ObjType, OutletLevel,
                WAIT_HANDLE_SLOTS, WAIT_MSG_SLOT_0, WAIT_REQUEST_SLOT,
                PipeMsgRecord, PipeSendRecord, PipeTakeRecord, WaitBuffer,
                WaitTag,
-               pipe_msg_body_offset, pipe_request_rights, rights_allow_transfer,
+               pipe_msg_body_offset, pipe_reply_rights, pipe_request_rights,
+               rights_allow_transfer,
                pipe_msg_record_bytes, wait_meta_end_bytes, wait_prefix_bytes,
                wait_record_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
                      NO_PROCESS, NO_THREAD, PIPE_INFLIGHT, ProcessIndex,
                      ThreadIndex}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
-import kcore.result.{op_ok, op_status, op_value, write_result}
+import kcore.result.{op_ok, op_status, op_status_value, op_value,
+                     write_result}
 import kcore.threads.{CURRENT_THREAD, NEED_RESCHED, threads, ThreadState,
                       a_thread_is_running, frame_slot, free_thread_slot,
                       lock_recompute, ready_above, ready_push, unjoin_thread}
@@ -550,8 +552,8 @@ public(package) func revoke_blocked(w: Int) unsafe {
 /// deadline or `Woken` at a wake (spec §7), and ready it.
 ///
 /// The thread is taken off whatever it is parked on, as the op's own wake
-/// would, and nothing the op waited for is consumed. Four parks can be
-/// wakeable, and each leaves its own trace:
+/// would, and nothing the op waited for is consumed. Each wakeable park leaves
+/// its own trace:
 ///
 ///   - a lock wait names its holder (`lock_holder`). It is unparked as a wake
 ///     unparks it, and the holder is brought back to what its remaining
@@ -560,8 +562,18 @@ public(package) func revoke_blocked(w: Int) unsafe {
 ///     holder can be the running thread, the waker or the thread the timer
 ///     interrupted, and a lowered one below a ready thread gives the
 ///     processor up at the trap's return.
-///   - a `Wait` is on a Waiter's blocked list. It leaves the list, and no
-///     record is written: the buffer is as the thread left it.
+///   - a `Call`'s room park names its connection (`call_pipe`). Nothing was
+///     staged and the carried handles are still the caller's, so the call's
+///     state is cleared and the value register is `NO_HANDLE`.
+///   - a `Call`'s reply park or a `Resolve` names its exchange (`call_claim`)
+///     and borrows the claim's handle (`call_word`). The tie is cut and the
+///     parked thread's own reference dropped, last, and the value register
+///     carries the word: the claim is the caller's again, to resolve, wait on
+///     or drop. A claim whose handle another thread released meanwhile has no
+///     other reference, so the drop abandons the exchange.
+///   - a `Wait`, the wait leg of `ReplyWait` among them, is on a Waiter's
+///     blocked list. It leaves the list, and no record is written: the buffer
+///     is as the thread left it.
 ///   - a `Join` is on its target's joiner list. It leaves the list, and the
 ///     target is untouched.
 ///   - a bare park (`PARK_OP`) is on nothing.
@@ -570,17 +582,24 @@ public(package) func revoke_blocked(w: Int) unsafe {
 ///
 /// `unsafe` though it names nothing unsafe: `t` must be parked wakeable.
 public(package) func end_park(t: ThreadIndex, status: SosStatus) unsafe {
-    let holder = borrow var thread = threads().at(t) {
-        let holder = thread.lock_holder
+    let (holder, room, claim, word) = borrow var thread = threads().at(t) {
+        let found = (thread.lock_holder, thread.call_pipe, thread.call_claim,
+                     thread.call_word)
         thread.lock_at = 0
         thread.lock_holder = 0
-        thread.wait_buf = 0
-        holder
+        found
     }
-    if holder == 0 && not unblock_thread(t) {
-        let _ = unjoin_thread(t)
+    var value = NO_HANDLE
+    if room != 0 || claim != 0 {
+        value = word
+        clear_pending_call(t)
+    } else {
+        threads().at(t).wait_buf = 0
+        if holder == 0 && not unblock_thread(t) {
+            let _ = unjoin_thread(t)
+        }
     }
-    write_result(frame_slot(t), op_status(status))
+    write_result(frame_slot(t), op_status_value(status, value))
     threads().at(t).state = ThreadState.Runnable
     ready_push(t)
     if holder != 0 {
@@ -592,6 +611,11 @@ public(package) func end_park(t: ThreadIndex, status: SosStatus) unsafe {
            ready_above(threads().at(CURRENT_THREAD).level) {
             NEED_RESCHED = true
         }
+    }
+    // The parked thread's reference, dropped last: it can settle the exchange
+    // and cascade to a freed connection, and nothing after reads either.
+    if claim != 0 {
+        unref_waitable(WaitableKind.PipeReply, claim - 1)
     }
 }
 
@@ -1168,6 +1192,21 @@ public(package) func is_outlet_of(kind: ObjType, target: Int,
     }
 }
 
+/// Whether an entry of `kind` naming `target` is a claim a wakeable park holds
+/// (spec §2.1): a `PipeReply` handle whose exchange has a thread parked on it.
+///
+/// A plain park leaves no handle to ask about: a plain `Resolve` unbinds its
+/// claim at the park, and a plain `Call` mints none. So a bound claim on an
+/// exchange with a parked thread is always a wakeable park's borrowed one, and
+/// the claim is the parked thread's until the park ends: attaching it, giving
+/// it, carrying it in a message and a second `Resolve` of it are each refused.
+public(package) func parked_claim(kind: ObjType, target: Int) unsafe -> Bool {
+    match kind {
+        case PipeReply -> EXCHANGES[target].caller != 0,
+        case _ -> false,
+    }
+}
+
 /// Take `p`'s handle entries and hold them against exchange `x`: the first half
 /// of the rendezvous move.
 ///
@@ -1190,11 +1229,12 @@ public(package) func is_outlet_of(kind: ObjType, target: Int,
 ///
 /// It stages what is stageable and skips the rest; raising a fault is the
 /// caller's job. A word that names nothing, an entry without `Transfer`, a
-/// kind the record cannot spell, or an outlet of `pipe` is raised as a fault by
-/// `check_send` on the two paths where the caller is the running process. This
-/// function is also reached from `resume_call_room`, where the caller is
-/// blocked and there is no fault to raise, so it asks the same four questions
-/// and leaves a failing slot empty (an outlet of `pipe` stays in the sender's
+/// kind the record cannot spell, an outlet of `pipe`, or a claim a wakeable
+/// park holds (`parked_claim`) is raised as a fault by `check_send` on the
+/// paths where the caller is the running process. This function is also
+/// reached from `resume_call_room`, where the caller is blocked and there is no
+/// fault to raise, so it asks the same five questions and leaves a failing
+/// slot empty (an outlet of `pipe`, or a parked claim, stays in the sender's
 /// table). The two are not a duplicated check: one decides whether to end the
 /// caller, the other what a message carries.
 ///
@@ -1218,7 +1258,8 @@ public(package) func hold_staged(p: ProcessIndex, x: Int, args: &PipeSendRecord,
                     let may_send = rights_allow_transfer(entry.rights)
                     let spellable = msg_kind_of(entry.obj_type).is_some()
                     let own = is_outlet_of(entry.obj_type, entry.target, pipe)
-                    if may_send && spellable && not own {
+                    let parked = parked_claim(entry.obj_type, entry.target)
+                    if may_send && spellable && not own && not parked {
                         // Up before down, per handle: the kernel's own
                         // reference is taken before the entry's is dropped, so
                         // nothing can reach zero between two lines of one op.
@@ -1251,8 +1292,8 @@ public(package) func hold_staged(p: ProcessIndex, x: Int, args: &PipeSendRecord,
 /// where the caller is running have had the record through `check_send`, but
 /// `resume_call_room` re-reads a record a sibling thread may have rewritten,
 /// and there is no fault to raise for a caller that is not running. A slot that
-/// fails the questions, or that an earlier slot of the same record already
-/// released, is skipped.
+/// fails the questions, a claim a wakeable park holds among them, or that an
+/// earlier slot of the same record already released, is skipped.
 public(package) func release_carried(p: ProcessIndex, args: &PipeSendRecord) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -1264,7 +1305,8 @@ public(package) func release_carried(p: ProcessIndex, args: &PipeSendRecord) uns
                 case _ -> {
                     let may_send = rights_allow_transfer(entry.rights)
                     let spellable = msg_kind_of(entry.obj_type).is_some()
-                    if may_send && spellable {
+                    let parked = parked_claim(entry.obj_type, entry.target)
+                    if may_send && spellable && not parked {
                         // Unbind before the unref, so nothing in the cascade
                         // can find the released entry by lookup.
                         unbind_handle(p, handle_word_index(word))
@@ -1816,13 +1858,15 @@ func notify_claims(c: Int) unsafe {
 // is what a fused `Call` is. `park_resolve` gets there by taking the caller's
 // handle entry and keeping its reference (unbind without unref), so both arrive
 // at `EXCHANGES[x].caller` in the same state. One park shape, one wake shape,
-// one teardown arm.
+// one teardown arm. A wakeable park is the same shape with one more thing to
+// spend: the claim's handle it borrows, which the wake unbinds.
 
-// A thread-tied claim cannot be attached: a fused call mints no `PipeReply`
-// handle for `Waiter.Add`, and `park_resolve` detaches a parked resolver's
-// attachment on the way down. So `EXCHANGES[x].reply_attach` is zero whenever
-// `EXCHANGES[x].caller` is not, and the two arms are alternatives, not a
-// sequence.
+// A thread-tied claim cannot be attached: a plain fused call mints no
+// `PipeReply` handle for `Waiter.Add`, `park_resolve` detaches a parked
+// resolver's attachment on the way down, and a wakeable park's borrowed handle
+// is refused by `Waiter.Add` while it parks (`parked_claim`). So
+// `EXCHANGES[x].reply_attach` is zero whenever `EXCHANGES[x].caller` is not,
+// and the two arms are alternatives, not a sequence.
 //
 // The room level has the same shape. `Call` never answers `WouldBlock`, so a
 // full ring parks the caller, and the level that ends that park is the inlet's
@@ -1871,9 +1915,27 @@ public(package) func notify_claim(x: Int) unsafe {
 ///
 /// The copies that follow the check are `deliver_wait_record`'s kind of door:
 /// the same step, no user code between, and a refusal there is a kernel bug.
+///
+/// A wakeable park borrowed its claim's handle (`ThreadSlot.call_word`), and
+/// this is the end that spends it: the handle is unbound first, if the word
+/// still names this exchange (another thread may have released it), so the
+/// table has that row back before the reply's handles ask for room, as a
+/// plain `Resolve`'s table had it from the park. Its reference is dropped with
+/// the thread's, at the end.
 func wake_call_reply(t: Int, x: Int) unsafe {
-    let (p, dst) = borrow var thread = threads().at(ThreadIndex(t)) {
-        (thread.process, thread.wait_buf)
+    let (p, dst, word) = borrow var thread = threads().at(ThreadIndex(t)) {
+        (thread.process, thread.wait_buf, thread.call_word)
+    }
+    var spent = false
+    if word != NO_HANDLE {
+        let entry = lookup_handle(ProcessIndex(p), word)
+        spent = match entry.obj_type {
+            case PipeReply -> entry.target == x,
+            case _ -> false,
+        }
+        if spent {
+            unbind_handle(ProcessIndex(p), handle_word_index(word))
+        }
     }
     let answer = waitable_answer(WaitableKind.PipeReply, x)
     var result = op_status(SosStatus.PeerClosed)
@@ -1887,6 +1949,9 @@ func wake_call_reply(t: Int, x: Int) unsafe {
             doom_process(ProcessIndex(p), why)
             waitable_consume(WaitableKind.PipeReply, x)
             clear_pending_call(t)
+            if spent {
+                unref_waitable(WaitableKind.PipeReply, x)
+            }
             unref_waitable(WaitableKind.PipeReply, x)
             return
         }
@@ -1936,6 +2001,11 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     write_result(frame_slot(ThreadIndex(t)), result)
     threads().at(ThreadIndex(t)).state = ThreadState.Runnable
     ready_push(ThreadIndex(t))
+    // The borrowed handle's reference cannot be the last: the thread's own is
+    // still held, so only the second drop can settle the exchange.
+    if spent {
+        unref_waitable(WaitableKind.PipeReply, x)
+    }
     unref_waitable(WaitableKind.PipeReply, x)
 }
 
@@ -1993,12 +2063,22 @@ public(package) func notify_room(c: Int) unsafe {
 /// be faulted), and the reply buffer is asked at the wake that writes it, since
 /// the resume answers at most a status and writes no buffer.
 ///
-/// It mints nothing, which is what a fused call buys: the claim is the parked
-/// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
-/// spent.
+/// A plain call mints nothing, which is what a fused call buys: the claim is
+/// the parked thread, `Exchange.reply_refs` starts at one for it, and no handle
+/// row is spent.
+///
+/// A wakeable one, whose room park recorded its deadline and wakeability in
+/// the slot (spec §2.1, §7), mints its claim here, at the stage, as a `Post`
+/// does, and its reply park borrows it. The word is not read again: this is
+/// another thread's trap, and the reply park carries over what the room park
+/// recorded, since the thread stays parked across the stage. The table is
+/// asked before anything is staged, so a table with no row for the claim
+/// readies the thread with `QuotaExceeded` or `NoResource`, nothing staged,
+/// and the carried handles still the caller's. That counts as the thread
+/// having stopped waiting, and the freed slot goes to the next waiter.
 func resume_call_room(t: Int, c: Int) unsafe -> Bool {
-    let (p, src) = borrow var thread = threads().at(ThreadIndex(t)) {
-        (thread.process, thread.call_src)
+    let (p, src, wakeable) = borrow var thread = threads().at(ThreadIndex(t)) {
+        (thread.process, thread.call_src, thread.park_wakeable)
     }
     // The message is re-read out of its args record. `call_src` and `call_len`
     // name the record, so the handle words and the body address come back
@@ -2045,6 +2125,16 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     if x == NO_EXCHANGE {
         return false
     }
+    // `pipe_post`'s order: the ring, then the claim's row. The scan reserved
+    // nothing, so a refusal leaves the slot free for the next waiter.
+    if wakeable && not table_room(ProcessIndex(p), 1) {
+        clear_pending_call(t)
+        write_result(frame_slot(ThreadIndex(t)),
+                     op_status_value(mint_refusal(ProcessIndex(p)), NO_HANDLE))
+        threads().at(ThreadIndex(t)).state = ThreadState.Runnable
+        ready_push(ThreadIndex(t))
+        return true
+    }
     let dst = threads().at(ThreadIndex(t)).wait_buf
     // The body was checked just above, in the same step: a refusal here is a
     // kernel bug.
@@ -2055,23 +2145,39 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
                   ExitCode.ProcessFault)
         }
     }
+    var claim = NO_HANDLE
+    if wakeable {
+        claim = mint_capped(ProcessIndex(p), ObjType.PipeReply,
+                            pipe_reply_rights(), x)
+        if claim == NO_HANDLE {
+            fatal_kernel("a parked call's claim was refused after its pre-flight",
+                         x as UInt)
+        }
+    }
     EXCHANGES[x].len = len as UInt16
     // The caller is the process whose thread made the call, not whichever
     // process freed the room.
     stamp_sender(x, ProcessIndex(p))
+    // The tie comes before the handle words are held: it is what makes the
+    // claim just minted a parked one (`parked_claim`), so a rewritten record
+    // that names it, its word being the next a mint would hand out, cannot
+    // carry it away in the very message it is the claim for.
+    tie_call_reply(t, x, dst, claim)
     // The handle words are re-validated here, and have to be. The record was
     // re-read from the caller's memory just above, so a sibling thread may have
     // rewritten it since `check_send` blessed it; `hold_staged` therefore asks
-    // its four questions again. There is no fault to raise (the caller is not
+    // its five questions again. There is no fault to raise (the caller is not
     // running), so a failing slot arrives empty, and no rewritten record can
-    // stage a handle its process does not hold or may not send, or an outlet
-    // of this connection.
+    // stage a handle its process does not hold or may not send, an outlet of
+    // this connection, or a claim a wakeable park holds, this call's own
+    // among them.
     hold_staged(ProcessIndex(p), x, &args, c)
-    EXCHANGES[x].reply_refs = 1
+    // One reference for the parked thread, and one more for the claim's handle
+    // when the park borrows one.
+    EXCHANGES[x].reply_refs = if wakeable { 2 } else { 1 }
     EXCHANGES[x].request_refs = 0
     EXCHANGES[x].state = ExchangeState.Staged
     stage_push(c, x)
-    tie_call_reply(t, x, dst)
     notify_ready(WaitableKind.PipeOutlet, c)
     true
 }
@@ -2089,7 +2195,9 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 /// This covers a thread parked in `Resolve` with no arm of its own:
 /// `park_resolve` unbinds without unref, so the parked resolver's entry is
 /// already gone from the table and its reference sits on the claim column
-/// exactly where a fused caller's does.
+/// exactly where a fused caller's does. A wakeable park's borrowed handle is
+/// still in the table, and the close-all releases it as any other entry, after
+/// this has dropped the thread's own reference.
 ///
 /// It runs before the teardown drops any other reference, in two passes.
 /// Before, because the invalidation's detaches and the close-all drop endpoint

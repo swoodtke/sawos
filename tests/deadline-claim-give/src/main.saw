@@ -1,0 +1,141 @@
+// A claim a wakeable park holds cannot be given (spec §2.1, §3), at the C
+// altitude. Root posts a message on a connection of its own, and its thread
+// A parks in a wakeable `Resolve` of the claim (its wait word `UInt64.max`,
+// wakeable with no deadline). Nobody takes the message, so A stays parked.
+// The main thread, which yielded until A parked, gives the claim to a child it
+// created and never starts, under a tag the child's set already carries: the
+// `BadState` fault, which comes before the tag's `DuplicateKey`. It ends root,
+// and the machine with it.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_system_process_create,
+            sos_process_boot_handle_next, sos_process_event_create,
+            sos_process_give, sos_process_pipe_create, sos_wait_word,
+            sos_pipe_inlet_post, sos_pipe_reply_resolve}
+
+static STATUS_OK: UInt = 0
+/// The word that names nothing.
+static NONE: UInt = 0
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+/// The tag both gives name.
+static TAG: UInt = 5
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a reply record on every profile.
+static REC_WORDS: Int = 128
+
+unsafe static var CLAIM: UInt = 0
+
+/// A's wait word.
+unsafe static var WORD_A: UInt64 = 0
+
+unsafe static var REC_A: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+/// A's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func a_entry(arg: UInt) sync -> UInt {
+    a_run()
+}
+
+/// A: park in a wakeable `Resolve` of the claim, which nothing ends.
+func a_run() unsafe sync -> UInt {
+    let _ = sos_wait_word(((&var WORD_A) as UnsafePointer<UInt64>) as UInt,
+                          NONE)
+    WORD_A = NEVER
+    var value: UInt = 0
+    let _ = sos_pipe_reply_resolve(CLAIM, (&var REC_A) as UnsafePointer<UInt>,
+                                   (REC_WORDS as UInt) * word_bytes(),
+                                   (&var value) as UnsafePointer<UInt>)
+    print("SOS claimgive: A's resolve came back")
+    0
+}
+
+/// The image and memory records of the boot set, as raw words.
+func image_and_ram(proc: UInt) unsafe -> (UInt, UInt) {
+    var image: UInt = NONE
+    var ram: UInt = NONE
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        if rec[0] == TAG_IMAGE {
+            image = rec[2]
+        } else if rec[0] == TAG_RAM {
+            ram = rec[2]
+        }
+    }
+    (image, ram)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS claimgive: no process handle: {}", error)
+        return
+    }
+    var raw: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var raw) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS claimgive: no raw process handle")
+        return
+    }
+    let (image, ram) = image_and_ram(raw)
+    var child: UInt = NONE
+    var event: UInt = NONE
+    var ends: [UInt; 2] = [NONE; 2]
+    var args: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+    if sos_system_process_create(boot_handle, image, ram, NONE,
+                                 (&var child) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_event_create(raw, 0,
+                                (&var event) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_give(child, event, TAG, ALL_RIGHTS as UInt) != STATUS_OK ||
+       sos_process_pipe_create(raw, (&var ends) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK ||
+       sos_pipe_inlet_post(ends[0], (&var args) as UnsafePointer<UInt>,
+                           (SEND_WORDS as UInt) * word_bytes(),
+                           (&var CLAIM) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS claimgive: setup refused")
+        return
+    }
+    let me = try proc.thread_self() catch {
+        print("SOS claimgive: no thread handle: {}", error)
+        return
+    }
+    let stack_top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+                    (STACK_WORDS as UInt) * word_bytes()
+    let a = try proc.thread_create(run: a_entry, arg: 0,
+                                   stack_top: stack_top) catch {
+        print("SOS claimgive: no thread: {}", error)
+        return
+    }
+    try a.start() catch {
+        print("SOS claimgive: A did not start: {}", error)
+        return
+    }
+    // A runs at the yield until it parks on the claim.
+    try me.yield_now() catch {
+        print("SOS claimgive: no yield: {}", error)
+        return
+    }
+    print("SOS claimgive: giving the parked claim under a used tag")
+    let _ = sos_process_give(child, CLAIM, TAG, ALL_RIGHTS as UInt)
+    print("SOS claimgive: the give came back")
+}

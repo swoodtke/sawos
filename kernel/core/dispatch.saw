@@ -273,7 +273,7 @@ import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment, end_park,
                    hold_staged, is_outlet_of, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
-                   notify_ready, ref_object, ref_waitable, release_carried,
+                   notify_ready, parked_claim, ref_object, ref_waitable, release_carried,
                    signal_event,
                    unref_object, unref_waitable, wake_one_waiter}
 import kcore.threads.{
@@ -1759,7 +1759,8 @@ func process_start(caller: Int, child: Int,
     threads().at(slot) = ThreadSlot(state: ThreadState.Runnable, level: level,
                                base_level: level, process: child,
                                exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
-                               call_pipe: 0, call_claim: 0, call_src: 0,
+                               call_pipe: 0, call_claim: 0, call_word: 0,
+                               call_src: 0,
                                call_len: 0, latency_irq: 0, latency_from: 0,
                                lock_at: 0, lock_holder: 0, wait_word: 0,
                                wait_clock: false, wake_latched: false,
@@ -1800,6 +1801,7 @@ func process_start(caller: Int, child: Int,
 ///     handles must answer completely at its first instruction, and start is
 ///     the barrier that makes a half-populated table unrepresentable without
 ///     any synchronization. Dynamic transfer is for IPC over pipes.
+///   - It must not be a claim a wakeable park holds: `BadState` (spec §2.1).
 ///   - The tag must be unused in the child's set: `DuplicateKey`. An identity
 ///     naming two handles would make the record a multimap and the lookup
 ///     ambiguous.
@@ -1851,6 +1853,11 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
     match process_records().at(ProcessIndex(child)).state {
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
+    }
+    // A claim a wakeable park holds cannot leave the parked thread's process:
+    // the park's answer would land on a handle another process now holds.
+    if parked_claim(entry.obj_type, entry.target) {
+        fault_process(p, FaultReason.BadState)
     }
     if boot_tag_used(ProcessIndex(child), tag) {
         fault_process(p, FaultReason.DuplicateKey)
@@ -2201,7 +2208,8 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     threads().at(slot) = ThreadSlot(state: ThreadState.Created, level: 0,
                                base_level: 0, process: owner, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
-                               call_pipe: 0, call_claim: 0, call_src: 0,
+                               call_pipe: 0, call_claim: 0, call_word: 0,
+                               call_src: 0,
                                call_len: 0, latency_irq: 0, latency_from: 0,
                                lock_at: 0, lock_holder: 0, wait_word: 0,
                                wait_clock: false, wake_latched: false,
@@ -2623,15 +2631,26 @@ static WAIT_WORD_BYTES: UInt = 8
 ///
 /// A word the copy-in door refuses now is that door's fault, and a finite
 /// deadline from a thread registered with no Clock is `AccessDenied`. Then,
-/// on a wakeable word, a latched wake is cleared and answers `Woken`, and
-/// failing that a deadline at or before the clock's reading answers
-/// `TimedOut`: both in the error channel, since neither is a park, and the
-/// op answers the status without parking. Otherwise the park.
+/// on a wakeable word, the park's at-once answers (`answer_at_once`), both in
+/// the error channel, since neither is a park, and the op answers the status
+/// without parking. Otherwise the park.
 ///
 /// `unsafe` though it names nothing unsafe: `p` must be the calling process
 /// and `me` its running thread.
 func park_plan(p: Int, me: ThreadIndex,
                bare: Bool) unsafe -> Result<Park, SosStatus> {
+    let park = read_wait_word(p, me, bare)
+    if park.wakeable {
+        try answer_at_once(me, park)
+    }
+    park
+}
+
+/// The word half of `park_plan`: read `me`'s wait word once, and answer the
+/// park it asks for, or fault. A `Call` whose ring has room reads its word
+/// here before it stages, because a wakeable one mints its claim at the stage,
+/// and asks the at-once answers only once the message is staged.
+func read_wait_word(p: Int, me: ThreadIndex, bare: Bool) unsafe -> Park {
     let (addr, clock) = borrow var thread = threads().at(me) {
         (thread.wait_word, thread.wait_clock)
     }
@@ -2650,6 +2669,13 @@ func park_plan(p: Int, me: ThreadIndex,
         return Park(wakeable: false, deadline: NEVER_NS)
     }
     let deadline = if word == 0 { NEVER_NS } else { word }
+    Park(wakeable: true, deadline: deadline)
+}
+
+/// A wakeable `park`'s at-once answers, in their order: a latched wake is
+/// cleared and answers `Woken`, and failing that a deadline at or before the
+/// clock's reading answers `TimedOut`.
+func answer_at_once(me: ThreadIndex, park: Park) unsafe -> Result<Void, SosStatus> {
     let latched = borrow var thread = threads().at(me) {
         let latched = thread.wake_latched
         thread.wake_latched = false
@@ -2658,10 +2684,10 @@ func park_plan(p: Int, me: ThreadIndex,
     if latched {
         return SosStatus.Woken
     }
-    if deadline != NEVER_NS && deadline <= hal.timer_now_ns() {
+    if park.deadline != NEVER_NS && park.deadline <= hal.timer_now_ns() {
         return SosStatus.TimedOut
     }
-    Park(wakeable: true, deadline: deadline)
+    return
 }
 
 /// Record `park` in parked thread `t`'s slot, and bring the comparator's
@@ -3346,6 +3372,12 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
         return op_status(SosStatus.Revoked)
     }
     if waitable_attachment(target.kind, target.slot) != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+    // A claim a wakeable park holds is the parked thread's: its answer lands
+    // on the handle it borrows, so the claim cannot be watched meanwhile,
+    // borrowing or consuming (spec §2.1).
+    if parked_claim(waitable_obj_of(target.kind), target.slot) {
         fault_process(p, FaultReason.BadState)
     }
     // Keys are unique per waiter. A duplicate would make two questions
@@ -4951,10 +4983,11 @@ func pipe_inlet_op_decoded(op: PipeInletOp, obj: &PipeInletObject, arg0: UInt,
 /// record of the wrong size, a body longer than `PIPE_BODY_BYTES`, a handle
 /// word that names nothing, one whose entry lacks the universal `Transfer`
 /// right, one naming a kind no `BootHandleKind` spells, one equal to
-/// `invoking` and an outlet of `pipe` are all mistakes only the caller could
-/// have made. Raising them above the ring, the exchange and every mint makes
-/// "refuses the whole post, atomic, nothing staged" true by construction rather
-/// than by an unwind.
+/// `invoking`, an outlet of `pipe` and a claim a wakeable park holds
+/// (`BadState`, spec §2.1) are all mistakes only the caller could have made.
+/// Raising them above the ring, the exchange and every mint makes "refuses the
+/// whole post, atomic, nothing staged" true by construction rather than by an
+/// unwind.
 ///
 /// It validates and does not unbind. The entries leave the sender (take at
 /// post) in `hold_staged`, which runs after the last refusal that leaves them
@@ -5024,6 +5057,10 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt, kept: UInt,
             // An outlet of the connection the message enters.
             if is_outlet_of(entry.obj_type, entry.target, pipe) {
                 fault_process(p, FaultReason.BadArg)
+            }
+            // A claim a wakeable park holds, which `give` refuses too.
+            if parked_claim(entry.obj_type, entry.target) {
+                fault_process(p, FaultReason.BadState)
             }
         }
         i = i + 1
@@ -5139,11 +5176,11 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 ///
 /// Three differences, all consequences of not returning:
 ///
-///   - No claim is minted. The exchange's reply column starts at one for the
-///     parked thread, not for a handle entry, so a fused RPC spends no table
-///     row and no handle traffic, which matters for a client that meets
-///     its handle table before it meets the ring. `Exchange.caller` is the tie;
-///     `kcore.refs`' one wake arm reads it.
+///   - On a plain word no claim is minted. The exchange's reply column starts
+///     at one for the parked thread, not for a handle entry, so a fused RPC
+///     spends no table row and no handle traffic, which matters for a client
+///     that meets its handle table before it meets the ring. `Exchange.caller`
+///     is the tie; `kcore.refs`' one wake arm reads it.
 ///   - A full ring parks rather than answering `WouldBlock`. `post` surfaces
 ///     the refusal because it never suspends; this op does, so it waits for the
 ///     room a settle makes, as the composed send's room leg does with two more
@@ -5156,12 +5193,20 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 /// As at `pipe_post`, a carried outlet of this connection is a `BadArg` fault
 /// on the caller (`check_send`), raised before anything is staged.
 ///
-/// The call's own refusal is never transient: a full ring parks it and no claim
-/// is minted. Its refusal, `PeerClosed`, is terminal, so the carried handles
-/// are released whether the outlet closed before the call or while it waited
-/// for room (`resume_call_room`). A `NoResource` or `QuotaExceeded` at the
-/// reply's delivery comes after the message was staged, so it consumes them
+/// A plain call's own refusal is never transient: a full ring parks it and no
+/// claim is minted. Its refusal, `PeerClosed`, is terminal, so the carried
+/// handles are released whether the outlet closed before the call or while it
+/// waited for room (`resume_call_room`). A `NoResource` or `QuotaExceeded` at
+/// the reply's delivery comes after the message was staged, so it consumes them
 /// like every later outcome.
+///
+/// The caller's wait word is read once, at the op's first park (spec §2.1,
+/// §7). A wakeable call is a `Post` and a wakeable `Resolve` in one trap: it
+/// mints its claim at the stage, so its one transient refusal is a table with
+/// no row for it (`QuotaExceeded`, `NoResource`), answered before anything is
+/// staged, and its reply park borrows the claim's handle, so a `TimedOut` or
+/// `Woken` hands the claim back in the value register. An early end of the
+/// room park has staged nothing and answers `NO_HANDLE` there (`end_park`).
 ///
 /// The reply buffer takes no capacity argument: the three argument registers
 /// are spent, so the buffer is checked against `pipe_msg_record_bytes()` of the
@@ -5199,8 +5244,15 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         release_carried(ProcessIndex(p), &args)
         return op_status(SosStatus.PeerClosed)
     }
+    let me = CURRENT_THREAD
     let x = alloc_exchange(slot)
     if x == NO_EXCHANGE {
+        // The room park is the op's first park, so the word is read here. Its
+        // at-once answers have staged nothing, and the value register is
+        // `NO_HANDLE`, as at a room park that ends early.
+        let park = try park_plan(p, me, false) catch {
+            return op_status_value(error, NO_HANDLE)
+        }
         // The park remembers the args record, not the body, which keeps
         // `ThreadSlot` small: a message is four handle words plus a body
         // address plus a length, and re-reading the one record the caller
@@ -5209,8 +5261,22 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         // (a mapping unmapped by the launcher that made it, or by a sibling),
         // so the resume checks again and ends the process if the record or the
         // body is gone (`resume_call_room`).
-        block_on_call_room(CURRENT_THREAD, slot, args_src, args_bytes, reply_dst)
+        block_on_call_room(me, slot, args_src, args_bytes, reply_dst)
+        // A plain park records nothing: `ready_push` cleared the slot's flag
+        // when this thread last became runnable. A wakeable one is recorded,
+        // and the resume carries it over to the reply park.
+        if park.wakeable {
+            record_park(me, park)
+        }
         return op_blocked()
+    }
+    // The reply park is the first park, and its word is read before the stage:
+    // a wakeable call mints its claim there, as a `Post` does, so the table is
+    // asked before anything is staged. With no row for the claim nothing is
+    // staged and the carried handles stay the caller's, on `Post`'s terms.
+    let park = read_wait_word(p, me, false)
+    if park.wakeable && not table_room(ProcessIndex(p), 1) {
+        return op_status_value(mint_refusal(ProcessIndex(p)), NO_HANDLE)
     }
     if len != 0 {
         if let why = copy_in(ProcessIndex(p), exchange_body_addr(x), args.body, len) {
@@ -5219,21 +5285,45 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
             fault_process(p, why)
         }
     }
+    var claim = NO_HANDLE
+    if park.wakeable {
+        claim = mint_capped(ProcessIndex(p), ObjType.PipeReply,
+                            pipe_reply_rights(), x)
+        if claim == NO_HANDLE {
+            fatal_kernel("a call's claim was refused after its pre-flight",
+                         x as UInt)
+        }
+    }
     EXCHANGES[x].len = len as UInt16
     stamp_sender(x, ProcessIndex(p))
     hold_staged(ProcessIndex(p), x, &args, slot)
     // One column at one for a thread rather than for a handle: the only line
     // here that is not `pipe_post`'s. The asymmetry with the request column
     // means what it means there: the claim exists from the call, the obligation
-    // does not exist until somebody takes.
-    EXCHANGES[x].reply_refs = 1
+    // does not exist until somebody takes. A wakeable call's handle counts one
+    // more.
+    EXCHANGES[x].reply_refs = if park.wakeable { 2 } else { 1 }
     EXCHANGES[x].request_refs = 0
     EXCHANGES[x].state = ExchangeState.Staged
     stage_push(slot, x)
+    if park.wakeable {
+        // Readiness came first, so a ring with room staged the message, and
+        // the at-once answers come where the reply park would begin. Neither
+        // is a park: the claim is the caller's, as after a `Post`, so its
+        // handle is the only reference and the thread holds none.
+        try answer_at_once(me, park) catch {
+            EXCHANGES[x].reply_refs = 1
+            notify_ready(WaitableKind.PipeOutlet, slot)
+            return op_status_value(error, claim)
+        }
+    }
     // Park before notifying, so a server woken by the staging can never find
     // this thread runnable with its answer already owed. The wake only queues,
     // so the order costs nothing and buys the invariant.
-    block_on_call_reply(CURRENT_THREAD, x, reply_dst)
+    block_on_call_reply(me, x, reply_dst, claim)
+    if park.wakeable {
+        record_park(me, park)
+    }
     notify_ready(WaitableKind.PipeOutlet, slot)
     op_blocked()
 }
@@ -5455,6 +5545,12 @@ func pipe_reply_op_decoded(op: PipeReplyOp, obj: &PipeReplyObject, arg0: UInt,
 /// `unref_object`, the two calls `RELEASE_OP` makes), so a second resolve
 /// through the same word is the ordinary `BadHandle` fault. A one-shot has one
 /// name, so there is no minted sibling to reach that fault from either.
+///
+/// The pending arm reads the caller's wait word (spec §2.1, §7). A wakeable
+/// `Resolve` borrows its claim instead of spending it at the park, and is the
+/// one end of this op that consumes nothing: a `TimedOut` or `Woken` leaves the
+/// claim bound under the same word (`park_resolve`). While that park holds it,
+/// another thread's `Resolve` of it is the `BadState` fault.
 func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
                   cap: UInt) unsafe -> SyscallResult {
     if cap < (pipe_msg_record_bytes() as UInt) {
@@ -5462,6 +5558,11 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
     }
     if let why = copy_out_check(ProcessIndex(p), dst, pipe_msg_record_bytes() as UInt) {
         fault_process(p, why)
+    }
+    // A claim a wakeable park holds is that thread's: a claim has one
+    // resolver.
+    if parked_claim(ObjType.PipeReply, x) {
+        fault_process(p, FaultReason.BadState)
     }
 
     match EXCHANGES[x].state {
@@ -5570,13 +5671,33 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
 /// `dst` went through `copy_out_check` at the top of `pipe_resolve`, while the
 /// caller was the running process. The wake asks again (`wake_call_reply`),
 /// since a mapped row can go while the caller is parked.
+///
+/// This is the op's first park, so it reads the caller's wait word (spec §2.1,
+/// §7). Its at-once answers touch nothing: no park was made, so the claim is
+/// neither detached nor spent. A wakeable park borrows the claim rather than
+/// spending it: the detach is the same, but the handle stays bound and the
+/// parked thread takes a reference of its own, recording the word
+/// (`ThreadSlot.call_word`). The answer that ends the park spends the handle
+/// (`wake_call_reply`); an early end leaves it bound, and detached
+/// (`end_park`). Every `TimedOut` and `Woken`, at once or by an early end,
+/// carries the claim's word in the value register, as a `Call`'s does.
 func park_resolve(p: Int, word: UInt, x: Int, dst: UInt) unsafe -> SyscallResult {
-    if CURRENT_THREAD == NO_THREAD {
+    let me = CURRENT_THREAD
+    if me == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
+    let park = try park_plan(p, me, false) catch {
+        return op_status_value(error, word)
+    }
     detach_consumed(ObjType.PipeReply, x)
+    if park.wakeable {
+        ref_object(ObjType.PipeReply, x)
+        block_on_call_reply(me, x, dst, word)
+        record_park(me, park)
+        return op_blocked()
+    }
     unbind_handle(ProcessIndex(p), handle_word_index(word))
-    block_on_call_reply(CURRENT_THREAD, x, dst)
+    block_on_call_reply(me, x, dst, NO_HANDLE)
     op_blocked()
 }
 
@@ -5835,14 +5956,18 @@ func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
 /// this op is not the one that runs there, and the obligation the delivery
 /// minted has to be released instead (spec §2.1).
 ///
-/// Every fault is raised before the obligation is discharged; this is the
-/// function's one real ordering decision. A bad args record, a waiter handle
-/// that names nothing or lacks `Wait`, an oversized body, the request handle
-/// itself or the waiter's word among the carried handles, a record buffer
-/// outside the caller's memory all end the process, and all are asked while the
-/// request is still live, so a caller that faults leaves an exchange its client
-/// can still be told about rather than one discharged into a process that no
-/// longer exists.
+/// Every fault of the call's arguments is raised before the obligation is
+/// discharged; this is the function's one real ordering decision. A bad args
+/// record, a waiter handle that names nothing or lacks `Wait`, an oversized
+/// body, the request handle itself or the waiter's word among the carried
+/// handles, a record buffer outside the caller's memory all end the process,
+/// and all are asked while the request is still live, so a caller that faults
+/// leaves an exchange its client can still be told about rather than one
+/// discharged into a process that no longer exists. The wait word's faults are
+/// the exception (spec §7): the word is read at the wait leg's park, after the
+/// reply landed, so a word the copy-in door refuses, or a finite deadline from
+/// a thread registered with no Clock, ends the process with the reply already
+/// delivered.
 ///
 /// A refused reply returns without parking. The request is consumed either way
 /// (§2.1), but a `PeerClosed` comes straight back with `ReplyWaitLeg.Reply` in
@@ -5912,7 +6037,16 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
     }
+    // The wait leg is a `Wait` park, so it reads the caller's wait word as
+    // one, and ends early as one (`end_park`). Either way the reply landed,
+    // and the value register reads `ReplyWaitLeg.Wait`, which is zero.
+    let park = try park_plan(p, CURRENT_THREAD, false) catch {
+        return op_status(error)
+    }
     block_on_wait(CURRENT_THREAD, w, rec_dst)
+    if park.wakeable {
+        record_park(CURRENT_THREAD, park)
+    }
     op_blocked()
 }
 

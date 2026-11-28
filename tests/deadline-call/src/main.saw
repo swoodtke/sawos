@@ -1,0 +1,702 @@
+// The pipe parks' deadlines and wakes (spec §2.1, §7): `Call`'s room park and
+// reply park, `Resolve` and `ReplyWait`'s wait leg, at the C altitude. The
+// main thread is the client of a connection whose both ends it holds, and H,
+// a thread at its level, acts for it: the main thread signals H's Event with
+// what H is to do, then makes the op under test, and H does it once the main
+// thread has parked, since the image arms no tick and a signal at one level
+// preempts nothing. Each line is one op:
+//
+//   room           the ring filled with tells, a `Call` parks for room and
+//                  ends at its deadline, at H's wake, at a wake latched
+//                  before it and at a deadline already passed, each with
+//                  `NO_HANDLE` in the value register; the Event it carried is
+//                  still the main thread's, and the ring holds the tells
+//                  alone. Then a call parked for room has its word written
+//                  to 0 by H, which then makes room and wakes it: the stage
+//                  in H's trap carried the room park's wakeability over, so
+//                  the reply park ends `Woken` with the claim. Last, one
+//                  parked for room with a deadline and resumed by H, with no
+//                  wake: the reply park carried the deadline over too, and
+//                  ends `TimedOut` with the claim
+//   reply          with room, a `Call` stages and its reply park ends at its
+//                  deadline, at H's wake, and at a deadline already passed,
+//                  each handing back its claim, which then resolves; one
+//                  answered spends its claim
+//   resolve        a `Resolve` of an attached claim answers at once on a
+//                  passed deadline and on a latched wake, each with the
+//                  claim's word in the value register and the claim still
+//                  attached, since neither is a park; a `Resolve` ends at its
+//                  deadline and at H's wake with the claim still under its
+//                  word; an attached claim parked on comes back
+//                  detached; a claim H released while it was parked is still
+//                  answered, and one released and then woken is abandoned;
+//                  the server's letting go spends it
+//   replywait      the wait leg ends at its deadline and at H's wake, and
+//                  answers at once on a passed deadline and on a latched
+//                  wake, each after the reply landed
+//   stale          a wakeable park ended by its answer leaves no wakeable
+//                  park behind: the plain call after a wakeable call is not
+//                  ended by H's wake, which latches, and the plain call after
+//                  a bounded wait is not ended by that wait's deadline, which
+//                  the clock passes while it is parked
+//
+// A deadline's line says only that the clock read after the park is at or
+// past the deadline. "spent" compares the main thread's Handle row before and
+// after.
+
+import sos.{System, ClockType, SosStatus, QuotaKind, ALL_RIGHTS,
+            PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_system_clock_get, sos_clock_now,
+            sos_wait_word, sos_thread_wake, sos_thread_id, sos_park,
+            sos_process_event_create, sos_process_waiter_create,
+            sos_process_pipe_create, sos_process_quota_get,
+            sos_waiter_add, sos_waiter_remove, sos_waiter_wait,
+            sos_event_signal, sos_handle_release,
+            sos_pipe_inlet_post, sos_pipe_inlet_call, sos_pipe_outlet_take,
+            sos_pipe_reply_resolve, sos_pipe_request_reply,
+            sos_pipe_request_reply_wait}
+
+static NONE: UInt = 0
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+static KEY_EVENT: UInt = 1
+static KEY_CLAIM: UInt = 2
+
+/// How far past the clock's reading a deadline is.
+static DELAY_NS: UInt64 = 20_000_000
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// What H does when its Event is signalled, in this order.
+static DO_PARK_PAST: UInt = 1
+static DO_RELEASE: UInt = 2
+static DO_WAKE: UInt = 4
+static DO_TAKE_REPLY: UInt = 8
+static DO_TAKE_DROP: UInt = 16
+static DO_SIGNAL: UInt = 32
+/// Write the main thread's word to 0, then take a message and let it go,
+/// which makes room.
+static DO_ROOM: UInt = 64
+
+/// How a `ReplyWait` round's wait leg ends: at its deadline, at H's wake,
+/// at once on a passed deadline, or at once on a latched wake.
+static RW_DEADLINE: UInt = 0
+static RW_WAKE: UInt = 1
+static RW_PASSED: UInt = 2
+static RW_LATCHED: UInt = 3
+
+/// The most tells the fill posts before it gives up.
+static MAX_FILL: Int = 64
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+/// A reply-wait record's words: the Waiter, then a send record.
+static REPLY_WAIT_WORDS: Int = 3 + PIPE_MSG_HANDLES
+
+/// Room for a take, reply or wait record on every profile.
+static REC_WORDS: Int = 128
+
+/// Where a wait record carries an Event's bits.
+static PAYLOAD_WORD: Int = 2
+
+/// The wait words, the main thread's and H's.
+unsafe static var WORD: UInt64 = 0
+unsafe static var WORD_H: UInt64 = 0
+
+unsafe static var PROC: UInt = 0
+unsafe static var CLOCK: UInt = 0
+unsafe static var MAIN_ID: UInt = 0
+unsafe static var INLET: UInt = 0
+unsafe static var OUTLET: UInt = 0
+unsafe static var EVENT_H: UInt = 0
+unsafe static var WAITER_H: UInt = 0
+/// The main thread's own Event, which H signals, and its Waiter.
+unsafe static var EVENT_M: UInt = 0
+unsafe static var WAITER_M: UInt = 0
+
+/// The word H releases, and the deadline H parks until.
+unsafe static var RELEASE_WORD: UInt = 0
+unsafe static var PARK_UNTIL: UInt64 = 0
+/// Set when one of H's acts was refused.
+unsafe static var H_FAILED: Bool = false
+
+/// The message the main thread sends, and what H replies with.
+unsafe static var BODY: [UInt8; 8] = [0x51, 0x31, 0, 0, 0, 0, 0, 0]
+unsafe static var ANSWER: [UInt8; 8] = [0x52, 0x31, 0, 0, 0, 0, 0, 0]
+
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var RW_ARGS: [UInt; REPLY_WAIT_WORDS] = [0; REPLY_WAIT_WORDS]
+unsafe static var REC: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var REC_H: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var BUF_H: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+/// H's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+// The statics' addresses, each taken in a function of its own, so that a
+// loop that passes one holds no borrow of the static across its iterations.
+
+func rec() unsafe -> UnsafePointer<UInt> {
+    (&var REC) as UnsafePointer<UInt>
+}
+
+func rec_h() unsafe -> UnsafePointer<UInt> {
+    (&var REC_H) as UnsafePointer<UInt>
+}
+
+func buf_h() unsafe -> UnsafePointer<UInt> {
+    (&var BUF_H) as UnsafePointer<UInt>
+}
+
+func args() unsafe -> UnsafePointer<UInt> {
+    (&var ARGS) as UnsafePointer<UInt>
+}
+
+func answer_at() unsafe -> UInt {
+    ((&var ANSWER) as UnsafePointer<UInt8>) as UInt
+}
+
+func body_at() unsafe -> UInt {
+    ((&var BODY) as UnsafePointer<UInt8>) as UInt
+}
+
+func rec_bytes() -> UInt {
+    (REC_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func send_bytes() -> UInt {
+    (SEND_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func word_main() unsafe -> UInt {
+    ((&var WORD) as UnsafePointer<UInt64>) as UInt
+}
+
+func word_h() unsafe -> UInt {
+    ((&var WORD_H) as UnsafePointer<UInt64>) as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+/// A status word's name, for the lines this case prints.
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.TimedOut) {
+        return "TimedOut"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    if status == code(SosStatus.PeerClosed) {
+        return "PeerClosed"
+    }
+    if status == code(SosStatus.WouldBlock) {
+        return "WouldBlock"
+    }
+    "unexpected"
+}
+
+/// The Monotonic clock's reading.
+func now() unsafe -> UInt64 {
+    var rec: [UInt64; 1] = [0; 1]
+    let _ = sos_clock_now(CLOCK, (&var rec) as UnsafePointer<UInt64>, 8)
+    rec[0]
+}
+
+/// How many handles this process holds.
+func handles_used() unsafe -> UInt {
+    var row: UInt = 0
+    let _ = sos_process_quota_get(PROC, QuotaKind.Handle as UInt,
+                                  (&var row) as UnsafePointer<UInt>)
+    (row >> 16) & 0xFFFF
+}
+
+/// Where a message record's body starts: the packed meta padded to a word,
+/// the handle words, then the sender's pid on a doubleword.
+func body_offset() -> Int {
+    let word = sizeof<UInt>()
+    let meta = ((1 + PIPE_MSG_HANDLES + word - 1) / word) * word
+    let words = meta + PIPE_MSG_HANDLES * word
+    ((words + 7) / 8) * 8 + 8
+}
+
+/// The first two body bytes of the reply record in `REC`. The body starts on
+/// a doubleword, and every board is little-endian.
+func answer_bytes() unsafe -> (UInt, UInt) {
+    let word = REC[body_offset() / sizeof<UInt>()]
+    (word & 0xFF, (word >> 8) & 0xFF)
+}
+
+/// Point `ARGS` at the main thread's two-byte message, carrying `carried`.
+func set_args(carried: UInt) unsafe {
+    ARGS = [0; SEND_WORDS]
+    ARGS[0] = body_at()
+    ARGS[1] = 2
+    ARGS[2] = carried
+}
+
+/// A `Call` of the main thread's message: the status, and the value register.
+func call() unsafe -> (UInt, UInt) {
+    var value: UInt = 0
+    let status = sos_pipe_inlet_call(INLET, args(),
+                                     send_bytes(),
+                                     rec(),
+                                     (&var value) as UnsafePointer<UInt>)
+    (status, value)
+}
+
+/// A `Post` of the main thread's message, answering its claim.
+func post() unsafe -> UInt {
+    var claim: UInt = NONE
+    set_args(NONE)
+    let status = sos_pipe_inlet_post(INLET, args(),
+                                     send_bytes(),
+                                     (&var claim) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        print("SOS deadlinecall: a post answered {}", named(status))
+    }
+    claim
+}
+
+/// A `Resolve` of `claim`: the status, and the value register.
+func resolve(claim: UInt) unsafe -> (UInt, UInt) {
+    var value: UInt = 0
+    let status = sos_pipe_reply_resolve(claim, rec(),
+                                        rec_bytes(),
+                                        (&var value) as UnsafePointer<UInt>)
+    (status, value)
+}
+
+/// Resolve `claim` plain, with H taking and answering the message, and print
+/// what it answered under `round`.
+func resolve_answered(round: String, claim: UInt) unsafe {
+    let _ = sos_event_signal(EVENT_H, DO_TAKE_REPLY)
+    WORD = 0
+    let (status, len) = resolve(claim)
+    let (a, b) = answer_bytes()
+    print("SOS deadlinecall: {}: {} len={} body={},{}", round, named(status),
+          len, a, b)
+}
+
+/// Post tells until the ring is full, dropping each claim. Answers how many
+/// were staged.
+func fill() unsafe -> Int {
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        var claim: UInt = NONE
+        set_args(NONE)
+        let status = sos_pipe_inlet_post(INLET, args(),
+                                         send_bytes(),
+                                         (&var claim) as UnsafePointer<UInt>)
+        if status != STATUS_OK {
+            return staged
+        }
+        let _ = sos_handle_release(claim)
+        staged = staged + 1
+    }
+    staged
+}
+
+/// Take every staged message and let each go. Answers how many there were.
+func drain() unsafe -> Int {
+    var taken: Int = 0
+    while sos_pipe_outlet_take(OUTLET, rec(),
+                               rec_bytes()) == STATUS_OK {
+        let _ = sos_handle_release(REC[0])
+        taken = taken + 1
+    }
+    taken
+}
+
+func h_entry(arg: UInt) sync -> UInt {
+    h_run()
+}
+
+/// H: wait for its Event, do what its bits say, and wait again.
+func h_run() unsafe sync -> UInt {
+    let _ = sos_wait_word(word_h(), CLOCK)
+    var going = true
+    while going {
+        WORD_H = 0
+        if sos_waiter_wait(WAITER_H, buf_h(),
+                           rec_bytes()) != STATUS_OK {
+            H_FAILED = true
+            going = false
+        }
+        let bits = BUF_H[PAYLOAD_WORD]
+        if (bits & DO_PARK_PAST) != 0 {
+            WORD_H = PARK_UNTIL
+            let _ = sos_park()
+            WORD_H = 0
+        }
+        if (bits & DO_ROOM) != 0 {
+            WORD = 0
+            if sos_pipe_outlet_take(OUTLET, rec_h(),
+                                    rec_bytes()) != STATUS_OK {
+                H_FAILED = true
+            } else {
+                let _ = sos_handle_release(REC_H[0])
+            }
+        }
+        if (bits & DO_RELEASE) != 0 {
+            let _ = sos_handle_release(RELEASE_WORD)
+        }
+        if (bits & DO_WAKE) != 0 {
+            if sos_thread_wake(MAIN_ID) != STATUS_OK {
+                H_FAILED = true
+            }
+        }
+        if (bits & DO_SIGNAL) != 0 {
+            let _ = sos_event_signal(EVENT_M, 1)
+        }
+        if (bits & (DO_TAKE_REPLY | DO_TAKE_DROP)) != 0 {
+            if sos_pipe_outlet_take(OUTLET, rec_h(),
+                                    rec_bytes()) != STATUS_OK {
+                H_FAILED = true
+            } else if (bits & DO_TAKE_REPLY) != 0 {
+                var answer: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+                answer[0] = answer_at()
+                answer[1] = 2
+                let _ = sos_pipe_request_reply(REC_H[0],
+                                               (&var answer) as UnsafePointer<UInt>,
+                                               send_bytes())
+            } else {
+                let _ = sos_handle_release(REC_H[0])
+            }
+        }
+    }
+    0
+}
+
+/// The room park's rounds.
+func room(carried: UInt) unsafe {
+    let depth = fill()
+    set_args(carried)
+
+    let deadline = now() + DELAY_NS
+    WORD = deadline
+    let (timed, timed_value) = call()
+    print("SOS deadlinecall: room, deadline: {} value={} at or past it: {}",
+          named(timed), timed_value, now() >= deadline)
+
+    let _ = sos_event_signal(EVENT_H, DO_WAKE)
+    WORD = NEVER
+    let (woken, woken_value) = call()
+    print("SOS deadlinecall: room, woken: {} value={}", named(woken),
+          woken_value)
+
+    let _ = sos_thread_wake(MAIN_ID)
+    let (latched, latched_value) = call()
+    print("SOS deadlinecall: room, latched: {} value={}", named(latched),
+          latched_value)
+
+    WORD = 1
+    let (passed, passed_value) = call()
+    print("SOS deadlinecall: room, passed: {} value={}", named(passed),
+          passed_value)
+    WORD = 0
+
+    print("SOS deadlinecall: room, the carried Event is still ours: {}",
+          named(sos_event_signal(carried, 1)))
+    print("SOS deadlinecall: room, the ring held the tells alone: {}",
+          drain() == depth)
+
+    // A room park recorded wakeable: H writes the word to 0 while the call is
+    // parked, which changes nothing for it, then makes room, which stages the
+    // call in H's trap, and wakes it in its reply park.
+    let refill = fill()
+    set_args(NONE)
+    let _ = sos_event_signal(EVENT_H, DO_ROOM | DO_WAKE)
+    WORD = NEVER
+    let (resumed, claim) = call()
+    WORD = 0
+    let _ = sos_handle_release(claim)
+    print("SOS deadlinecall: room, resumed and woken: {} claim: {} ring: {}",
+          named(resumed), claim != NONE, drain() == refill)
+
+    // The same, with a deadline and no wake: the reply park the stage made
+    // carries the room park's deadline, and ends at it.
+    let carried_fill = fill()
+    set_args(NONE)
+    let _ = sos_event_signal(EVENT_H, DO_ROOM)
+    let room_deadline = now() + DELAY_NS
+    WORD = room_deadline
+    let (expired, expired_claim) = call()
+    WORD = 0
+    let past = now() >= room_deadline
+    let _ = sos_handle_release(expired_claim)
+    print("SOS deadlinecall: room, resumed, deadline: {} claim: {} past: {} ring: {}",
+          named(expired), expired_claim != NONE, past, drain() == carried_fill)
+}
+
+/// The reply park's rounds.
+func reply() unsafe {
+    set_args(NONE)
+    let deadline = now() + DELAY_NS
+    WORD = deadline
+    let (timed, timed_claim) = call()
+    print("SOS deadlinecall: reply, deadline: {} claim: {} at or past it: {}",
+          named(timed), timed_claim != NONE, now() >= deadline)
+    resolve_answered("reply, the claim resolves", timed_claim)
+
+    let _ = sos_event_signal(EVENT_H, DO_WAKE)
+    WORD = NEVER
+    let (woken, woken_claim) = call()
+    print("SOS deadlinecall: reply, woken: {} claim: {}", named(woken),
+          woken_claim != NONE)
+    resolve_answered("reply, the claim resolves", woken_claim)
+
+    WORD = 1
+    let (passed, passed_claim) = call()
+    print("SOS deadlinecall: reply, passed: {} claim: {}", named(passed),
+          passed_claim != NONE)
+    resolve_answered("reply, the claim resolves", passed_claim)
+
+    let before = handles_used()
+    let _ = sos_event_signal(EVENT_H, DO_TAKE_REPLY)
+    WORD = NEVER
+    let (answered, len) = call()
+    WORD = 0
+    print("SOS deadlinecall: reply, answered: {} len={} claim spent: {}",
+          named(answered), len, handles_used() == before)
+}
+
+/// The borrowing `Resolve`'s rounds.
+func resolves(waiter: UInt, other: UInt) unsafe {
+    let passed_claim = post()
+    let _ = sos_waiter_add(waiter, passed_claim, KEY_CLAIM, 0)
+    WORD = 1
+    let (passed, passed_value) = resolve(passed_claim)
+    let _ = sos_thread_wake(MAIN_ID)
+    WORD = NEVER
+    let (latched, latched_value) = resolve(passed_claim)
+    WORD = 0
+    print("SOS deadlinecall: resolve, passed: {} value is the claim: {}",
+          named(passed), passed_value == passed_claim)
+    print("SOS deadlinecall: resolve, latched: {} value is the claim: {}",
+          named(latched), latched_value == passed_claim)
+    // Neither answer was a park, so the claim is still attached: the Waiter's
+    // key still names it.
+    print("SOS deadlinecall: resolve, still attached: {}",
+          named(sos_waiter_remove(waiter, KEY_CLAIM)))
+    resolve_answered("resolve, the same word resolves", passed_claim)
+
+    let timed_claim = post()
+    let deadline = now() + DELAY_NS
+    WORD = deadline
+    let (timed, _) = resolve(timed_claim)
+    print("SOS deadlinecall: resolve, deadline: {} at or past it: {}",
+          named(timed), now() >= deadline)
+    resolve_answered("resolve, the same word resolves", timed_claim)
+
+    let woken_claim = post()
+    let _ = sos_event_signal(EVENT_H, DO_WAKE)
+    WORD = NEVER
+    let (woken, _) = resolve(woken_claim)
+    print("SOS deadlinecall: resolve, woken: {}", named(woken))
+    resolve_answered("resolve, the same word resolves", woken_claim)
+
+    let attached = post()
+    let _ = sos_waiter_add(waiter, attached, KEY_CLAIM, 0)
+    let _ = sos_event_signal(EVENT_H, DO_WAKE)
+    WORD = NEVER
+    let (detached, _) = resolve(attached)
+    print("SOS deadlinecall: resolve, attached: {}, attaches again: {}",
+          named(detached), named(sos_waiter_add(other, attached, KEY_CLAIM, 0)))
+    let _ = sos_waiter_remove(other, KEY_CLAIM)
+    resolve_answered("resolve, the detached word resolves", attached)
+
+    let before = handles_used()
+    let released = post()
+    RELEASE_WORD = released
+    let _ = sos_event_signal(EVENT_H, DO_RELEASE | DO_TAKE_REPLY)
+    WORD = NEVER
+    let (answered, len) = resolve(released)
+    WORD = 0
+    print("SOS deadlinecall: resolve, released while parked: {} len={}",
+          named(answered), len)
+    print("SOS deadlinecall: resolve, released while parked, spent: {}",
+          handles_used() == before)
+
+    let abandoned = post()
+    RELEASE_WORD = abandoned
+    let _ = sos_event_signal(EVENT_H, DO_RELEASE | DO_WAKE)
+    WORD = NEVER
+    let (gone, _) = resolve(abandoned)
+    WORD = 0
+    var reply_status: UInt = 0xFFFF
+    if sos_pipe_outlet_take(OUTLET, rec_h(),
+                            rec_bytes()) == STATUS_OK {
+        var none: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+        reply_status = sos_pipe_request_reply(REC_H[0],
+                                              (&var none) as UnsafePointer<UInt>,
+                                              send_bytes())
+    }
+    print("SOS deadlinecall: resolve, released then woken: {}, the reply: {}",
+          named(gone), named(reply_status))
+
+    let dropped_before = handles_used()
+    let dropped = post()
+    let _ = sos_event_signal(EVENT_H, DO_TAKE_DROP)
+    WORD = NEVER
+    let (closed, _) = resolve(dropped)
+    WORD = 0
+    print("SOS deadlinecall: resolve, the server let go: {} spent: {}",
+          named(closed), handles_used() == dropped_before)
+}
+
+/// `ReplyWait`'s wait leg, on a Waiter with nothing attached.
+func reply_wait_round(round: String, empty: UInt, how: UInt) unsafe {
+    let claim = post()
+    if sos_pipe_outlet_take(OUTLET, rec_h(),
+                            rec_bytes()) != STATUS_OK {
+        print("SOS deadlinecall: {}: no message", round)
+        return
+    }
+    RW_ARGS = [0; REPLY_WAIT_WORDS]
+    RW_ARGS[0] = empty
+    RW_ARGS[1] = answer_at()
+    RW_ARGS[2] = 2
+    var value: UInt = 0xFFFF
+    let deadline = now() + DELAY_NS
+    if how == RW_WAKE {
+        let _ = sos_event_signal(EVENT_H, DO_WAKE)
+        WORD = NEVER
+    } else if how == RW_PASSED {
+        WORD = 1
+    } else if how == RW_LATCHED {
+        let _ = sos_thread_wake(MAIN_ID)
+        WORD = NEVER
+    } else {
+        WORD = deadline
+    }
+    let status = sos_pipe_request_reply_wait(
+        REC_H[0], (&var RW_ARGS) as UnsafePointer<UInt>,
+        (REPLY_WAIT_WORDS as UInt) * (sizeof<UInt>() as UInt),
+        rec(), (&var value) as UnsafePointer<UInt>)
+    WORD = 0
+    if how != RW_DEADLINE {
+        print("SOS deadlinecall: {}: {} leg={}", round, named(status), value)
+    } else {
+        print("SOS deadlinecall: {}: {} leg={} at or past it: {}", round,
+              named(status), value, now() >= deadline)
+    }
+    let (landed, len) = resolve(claim)
+    let (a, b) = answer_bytes()
+    print("SOS deadlinecall: {}, the reply landed: {} len={} body={},{}",
+          round, named(landed), len, a, b)
+}
+
+/// A wakeable park ended by its answer, then a plain park.
+func stale() unsafe {
+    // A wait bounded by a deadline, which H's signal answers. The deadline
+    // only bounds it: a clock that passes it first ends the wait `TimedOut`,
+    // and either way the wait ended and the thread was readied.
+    let deadline = now() + DELAY_NS
+    let _ = sos_event_signal(EVENT_H, DO_SIGNAL)
+    WORD = deadline
+    let bounded = sos_waiter_wait(WAITER_M, rec(), rec_bytes())
+    WORD = 0
+    print("SOS deadlinecall: stale, a bounded wait ended: {}",
+          bounded == code(SosStatus.Ok) ||
+          bounded == code(SosStatus.TimedOut))
+    // H parks past that deadline before it answers the plain call, so the
+    // clock passes it while the call is parked.
+    set_args(NONE)
+    PARK_UNTIL = deadline + 1_000_000
+    let _ = sos_event_signal(EVENT_H, DO_PARK_PAST | DO_TAKE_REPLY)
+    let (late, late_len) = call()
+    print("SOS deadlinecall: stale, a plain call past that deadline: {} len={}",
+          named(late), late_len)
+
+    // A wakeable call answered, then a plain one, which H wakes before it
+    // answers it: the wake latches.
+    let _ = sos_event_signal(EVENT_H, DO_TAKE_REPLY)
+    WORD = NEVER
+    let (first, _) = call()
+    WORD = 0
+    print("SOS deadlinecall: stale, a wakeable call: {}", named(first))
+    let _ = sos_event_signal(EVENT_H, DO_WAKE | DO_TAKE_REPLY)
+    let (plain, len) = call()
+    print("SOS deadlinecall: stale, a plain one woken meanwhile: {} len={}",
+          named(plain), len)
+    WORD = NEVER
+    let latched = sos_park()
+    WORD = 0
+    print("SOS deadlinecall: stale, then latched: {}", named(latched))
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS deadlinecall: no process handle: {}", error)
+        return
+    }
+    var ends: [UInt; 2] = [NONE; 2]
+    var carried: UInt = NONE
+    var waiter: UInt = NONE
+    var other: UInt = NONE
+    if sos_system_process_self(
+           boot_handle, ALL_RIGHTS as UInt,
+           (&var PROC) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_system_clock_get(boot_handle, ClockType.Monotonic as UInt,
+                            (&var CLOCK) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_event_create(PROC, 0,
+                                (&var EVENT_H) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(PROC,
+                                 (&var WAITER_H) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(WAITER_H, EVENT_H, KEY_EVENT, 0) != STATUS_OK ||
+       sos_process_event_create(PROC, 0,
+                                (&var EVENT_M) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(PROC,
+                                 (&var WAITER_M) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_waiter_add(WAITER_M, EVENT_M, KEY_EVENT, 0) != STATUS_OK ||
+       sos_process_event_create(PROC, 0,
+                                (&var carried) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(PROC, (&var waiter) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_waiter_create(PROC, (&var other) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_pipe_create(PROC, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        print("SOS deadlinecall: setup refused")
+        return
+    }
+    INLET = ends[0]
+    OUTLET = ends[1]
+    MAIN_ID = sos_thread_id()
+    print("SOS deadlinecall: register: {}",
+          named(sos_wait_word(word_main(), CLOCK)))
+
+    let stack_top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+                    (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    let h = try proc.thread_create(run: h_entry, arg: 0,
+                                   stack_top: stack_top) catch {
+        print("SOS deadlinecall: no thread: {}", error)
+        return
+    }
+    try h.start() catch {
+        print("SOS deadlinecall: H did not start: {}", error)
+        return
+    }
+
+    room(carried)
+    reply()
+    resolves(waiter, other)
+    // `other` holds nothing again once the resolve rounds are done.
+    reply_wait_round("replywait, deadline", other, RW_DEADLINE)
+    reply_wait_round("replywait, woken", other, RW_WAKE)
+    reply_wait_round("replywait, passed", other, RW_PASSED)
+    reply_wait_round("replywait, latched", other, RW_LATCHED)
+    stale()
+
+    print("SOS deadlinecall: H refused nothing: {}", not H_FAILED)
+    print("SOS deadlinecall: done")
+    let _ = proc.exit(EXIT_OK)
+}

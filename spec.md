@@ -451,10 +451,15 @@ would, and leaves the exchange as follows.
     later `Resolve` on that word is the `BadHandle` fault, since the word
     names nothing.
 
-  A wakeable `Resolve` of a claim that is attached detaches it first, as a plain
-  `Resolve` does (§2.2). If it then ends early, the handle stays bound (unless
-  another thread released it, above) and stays detached. All of this holds as
-  well for the claim a wakeable `Call` parks on.
+  A wakeable `Resolve` of a claim that is attached detaches it at the park, as
+  a plain `Resolve` does (§2.2). If it then ends early, the handle stays bound
+  (unless another thread released it, above) and stays detached. Its at-once
+  answers (§7: a latched wake, a deadline already passed) are not a park and
+  change nothing, so a claim attached before them is attached after. Every
+  `TimedOut` or `Woken` of a `Resolve`, at once or by an early end, carries
+  the claim's handle word in the value register, as a wakeable `Call`'s does,
+  so either op hands its caller the word it may resolve, wait on or drop
+  later. All of this holds as well for the claim a wakeable `Call` parks on.
 - **`ReplyWait`.** Its reply leg never parks, so the word changes nothing
   there. Its wait leg is a `WaiterOp.Wait` park and ends early as one does
   (§2.2): the reply was delivered, no record is written, and the value
@@ -5714,11 +5719,6 @@ included, beside the build-emitted region table and its kind column (§5.6,
   to protect.
 - **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
   by hand.
-- **Deadlines and wakes on the pipe parks** (§2.1, §7): `Call`'s room and
-  reply parks, `Resolve`, and `ReplyWait`'s wait leg read no wait word yet,
-  so each parks plain whatever the word holds, and a wakeable `Call` mints no
-  claim. The other parks (`Wait`, `Join`, `LOCK_WAIT_OP`, `PARK_OP`) are
-  built.
 - **The task executor** (§10.1): `sos.exec`'s seams, the drive in the typed
   wrappers, `send`'s fallback, the one-word lock (§7) and the close at a
   thread's end (§8). Specified, not built yet; until it is, nothing in `sos`

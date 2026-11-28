@@ -1,0 +1,275 @@
+// Test child for `deadline_claim_refusals`, at the C altitude. It posts a
+// message on a connection of its own, and its thread A parks in a wakeable
+// `Resolve` of the claim (its wait word `UInt64.max`, wakeable with no
+// deadline). Nobody takes the message, so A stays parked, and the claim is
+// A's (spec §2.1). The main thread, which yielded until A parked, then makes
+// the call its role names; each ends this process:
+//
+//   ADD         attaches the claim to a Waiter under a key the Waiter
+//               already uses: the claim's `BadState` comes before the key's
+//               `DuplicateKey`
+//   GIVE        attaches it consuming (`Waiter.give`): `BadState`
+//   CARRY       posts a message that carries it: `BadState`
+//   RESOLVE     resolves it itself: `BadState`, a claim has one resolver
+//   RELEASED    releases it, which is allowed, and wakes A, whose park ends
+//               `Woken` with the exchange abandoned; A's second `Resolve` of
+//               the word is the `BadHandle` fault
+//
+// A role with `ROLE_CALL` set makes A's park a wakeable `Call` instead, whose
+// claim the call mints at the stage, so no post is made first. The main
+// thread knows the claim's word before A makes it: a mint takes the lowest
+// free slot at its next generation, so two siblings minted and released show
+// the slot and the step between generations, and the claim is the next.
+// Each of the first four roles is then made on that word.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_event_receive, sos_process_event_create,
+            sos_process_waiter_create, sos_process_pipe_create,
+            sos_waiter_add, sos_handle_release, sos_wait_word,
+            sos_thread_wake, sos_thread_id, sos_handle_mint,
+            sos_pipe_inlet_post, sos_pipe_inlet_call,
+            sos_pipe_reply_resolve}
+
+static TAG_ROLE: UInt = 40
+
+static ROLE_ADD: UInt = 1
+static ROLE_GIVE: UInt = 2
+static ROLE_CARRY: UInt = 3
+static ROLE_RESOLVE: UInt = 4
+static ROLE_RELEASED: UInt = 5
+/// Set beside a role: A parks in a wakeable `Call` rather than a `Resolve`.
+static ROLE_CALL: UInt = 16
+
+/// A call came back where it was to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// A step before the one under test was refused, or no role was given.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static KEY: UInt = 3
+
+/// `Waiter.add`'s flag that hands the target to the attachment
+/// (`Waiter.give`).
+static CONSUMING: UInt = 2
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a reply record on every profile.
+static REC_WORDS: Int = 128
+
+unsafe static var ROLE: UInt = 0
+unsafe static var CLAIM: UInt = 0
+unsafe static var A_ID: UInt = 0
+unsafe static var INLET: UInt = 0
+
+/// A's wait word.
+unsafe static var WORD_A: UInt64 = 0
+
+unsafe static var REC_A: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+/// A's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.Woken) {
+        return "Woken"
+    }
+    "unexpected"
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep the role.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        if rec[0] == TAG_ROLE {
+            ROLE = event_word(rec[2])
+        }
+    }
+}
+
+/// A sibling of `handle` minted and released at once: the word the slot
+/// held.
+func sibling(handle: UInt) unsafe -> UInt {
+    var word: UInt = NONE
+    let _ = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                            (&var word) as UnsafePointer<UInt>)
+    let _ = sos_handle_release(word)
+    word
+}
+
+/// A `Resolve` of the claim into A's record.
+func resolve_claim() unsafe -> UInt {
+    var value: UInt = 0
+    sos_pipe_reply_resolve(CLAIM, (&var REC_A) as UnsafePointer<UInt>,
+                           (REC_WORDS as UInt) * word_bytes(),
+                           (&var value) as UnsafePointer<UInt>)
+}
+
+func a_entry(arg: UInt) sync -> UInt {
+    a_run()
+}
+
+/// A: park in a wakeable `Resolve` of the claim. A park that ends (only the
+/// released round wakes it) is followed by a second `Resolve` of the word.
+func a_run() unsafe sync -> UInt {
+    A_ID = sos_thread_id()
+    let _ = sos_wait_word(((&var WORD_A) as UnsafePointer<UInt64>) as UInt,
+                          NONE)
+    WORD_A = NEVER
+    if (ROLE & ROLE_CALL) != 0 {
+        var args: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+        var value: UInt = 0
+        let _ = sos_pipe_inlet_call(INLET, (&var args) as UnsafePointer<UInt>,
+                                    (SEND_WORDS as UInt) * word_bytes(),
+                                    (&var REC_A) as UnsafePointer<UInt>,
+                                    (&var value) as UnsafePointer<UInt>)
+        print("SOS deadlineclaim: A's call came back")
+        return EXIT_SURVIVED
+    }
+    let first = resolve_claim()
+    WORD_A = 0
+    print("SOS deadlineclaim: A's resolve: {}", named(first))
+    print("SOS deadlineclaim: A resolves the word again")
+    let _ = resolve_claim()
+    EXIT_SURVIVED
+}
+
+/// Make the role's call on the parked claim, and answer the exit code a
+/// survivor ends with.
+func run_role(proc: UInt, inlet: UInt) unsafe -> UInt {
+    let role = ROLE & ~ROLE_CALL
+    if role == ROLE_ADD {
+        var waiter: UInt = NONE
+        var event: UInt = NONE
+        if sos_process_waiter_create(proc,
+                                     (&var waiter) as UnsafePointer<UInt>) != STATUS_OK ||
+           sos_process_event_create(proc, 0,
+                                    (&var event) as UnsafePointer<UInt>) != STATUS_OK ||
+           sos_waiter_add(waiter, event, KEY, 0) != STATUS_OK {
+            return EXIT_SETUP
+        }
+        print("SOS deadlineclaim: add: the parked claim, under a used key")
+        let _ = sos_waiter_add(waiter, CLAIM, KEY, 0)
+    } else if role == ROLE_GIVE {
+        var waiter: UInt = NONE
+        if sos_process_waiter_create(proc,
+                                     (&var waiter) as UnsafePointer<UInt>) != STATUS_OK {
+            return EXIT_SETUP
+        }
+        print("SOS deadlineclaim: give: the parked claim, consuming")
+        let _ = sos_waiter_add(waiter, CLAIM, KEY, CONSUMING)
+    } else if role == ROLE_CARRY {
+        print("SOS deadlineclaim: carry: a post carrying the parked claim")
+        var args: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+        args[2] = CLAIM
+        var claim: UInt = NONE
+        let _ = sos_pipe_inlet_post(inlet, (&var args) as UnsafePointer<UInt>,
+                                    (SEND_WORDS as UInt) * word_bytes(),
+                                    (&var claim) as UnsafePointer<UInt>)
+    } else if role == ROLE_RESOLVE {
+        print("SOS deadlineclaim: resolve: the main thread resolves it")
+        let _ = resolve_claim()
+    } else if role == ROLE_RELEASED {
+        print("SOS deadlineclaim: released: release {}, wake A {}",
+              named(sos_handle_release(CLAIM)), named(sos_thread_wake(A_ID)))
+        // A runs at the next switch, which is this process's exit if A does
+        // not end it first.
+        return EXIT_SURVIVED
+    } else {
+        return EXIT_SETUP
+    }
+    EXIT_SURVIVED
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    var raw: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var raw) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS deadlineclaim: no process handle\n")
+        return
+    }
+    drain(raw)
+    let proc = try system.process_self() catch {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    var ends: [UInt; 2] = [NONE; 2]
+    var args: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+    if sos_process_pipe_create(raw, (&var ends) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    INLET = ends[0]
+    if (ROLE & ROLE_CALL) == 0 &&
+       sos_pipe_inlet_post(ends[0], (&var args) as UnsafePointer<UInt>,
+                           (SEND_WORDS as UInt) * word_bytes(),
+                           (&var CLAIM) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    let stack_top = ((&var STACK) as UnsafePointer<UInt>) as UInt +
+                    (STACK_WORDS as UInt) * word_bytes()
+    let a = try proc.thread_create(run: a_entry, arg: 0,
+                                   stack_top: stack_top) catch {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    try a.start() catch {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    if (ROLE & ROLE_CALL) != 0 {
+        let first = sibling(ends[0])
+        let second = sibling(ends[0])
+        CLAIM = second + (second - first)
+    }
+    // A runs at the yield until it parks on the claim.
+    try me.yield_now() catch {
+        let _ = sos_process_exit(raw, EXIT_SETUP)
+        return
+    }
+    let survived = run_role(raw, ends[0])
+    if survived == EXIT_SURVIVED && ROLE == ROLE_RELEASED {
+        // A is readied by the wake; the yield lets it end the process.
+        let _ = me.yield_now()
+    }
+    let _ = sos_process_exit(raw, survived)
+}

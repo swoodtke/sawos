@@ -1,0 +1,150 @@
+// Test child for `deadline_call_quota`, at the C altitude: a client at its
+// Handle quota. It mints siblings of the inlet `deadline-quota-root` gave it
+// until a mint answers `QuotaExceeded`, so its table has no row for a claim,
+// and registers a wait word with no Clock. Then three calls of one message:
+//
+//   room       wakeable (`UInt64.max`), into the ring root filled: the call
+//              parks for room, and the room root makes resumes it, where its
+//              claim finds no row: `QuotaExceeded`, `NO_HANDLE` in the value
+//              register
+//   op         wakeable again, now with room: `QuotaExceeded` at the op;
+//              both carry the last sibling minted, which the refusals leave
+//              in this table, so asking its kind answers `Ok` where a word
+//              naming nothing would end this process
+//   plain      a word of 0: the call mints no claim, so it is staged and
+//              answered
+//
+// Root counts the messages it took: a refused call staged nothing.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_handle_mint, sos_handle_info,
+            sos_wait_word,
+            sos_pipe_inlet_call}
+
+static TAG_INLET: UInt = 42
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// `HandleInfo.Kind`: a selector whose answer needs the word to name a
+/// handle, and nothing more.
+static HANDLE_KIND: UInt = 1
+
+/// A step before the one under test was refused.
+static EXIT_SETUP: UInt = 97
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The most siblings the fill of the table mints.
+static MAX_MINTS: Int = 256
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a reply record on every profile.
+static REC_WORDS: Int = 128
+
+unsafe static var WORD: UInt64 = 0
+unsafe static var BODY: [UInt8; 8] = [0x51, 0x31, 0, 0, 0, 0, 0, 0]
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REC: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func code(status: SosStatus) -> UInt {
+    (status as UInt8) as UInt
+}
+
+func named(status: UInt) -> String {
+    if status == code(SosStatus.Ok) {
+        return "Ok"
+    }
+    if status == code(SosStatus.QuotaExceeded) {
+        return "QuotaExceeded"
+    }
+    if status == code(SosStatus.NoResource) {
+        return "NoResource"
+    }
+    "unexpected"
+}
+
+/// The inlet root gave, as a raw word.
+func inlet(proc: UInt) unsafe -> UInt {
+    var found: UInt = NONE
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        if rec[0] == TAG_INLET {
+            found = rec[2]
+        }
+    }
+    found
+}
+
+/// A `Call` of the message through `through`: the status and the value.
+func call(through: UInt) unsafe -> (UInt, UInt) {
+    var value: UInt = 0
+    let status = sos_pipe_inlet_call(through, (&var ARGS) as UnsafePointer<UInt>,
+                                     (SEND_WORDS as UInt) * word_bytes(),
+                                     (&var REC) as UnsafePointer<UInt>,
+                                     (&var value) as UnsafePointer<UInt>)
+    (status, value)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS quotachild: no process handle\n")
+        return
+    }
+    let through = inlet(proc)
+    if through == NONE {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    var refused: UInt = STATUS_OK
+    var minted: Int = 0
+    var carried: UInt = NONE
+    while refused == STATUS_OK && minted < MAX_MINTS {
+        var sibling: UInt = NONE
+        refused = sos_handle_mint(through, ALL_RIGHTS as UInt,
+                                  (&var sibling) as UnsafePointer<UInt>)
+        if refused == STATUS_OK {
+            carried = sibling
+        }
+        minted = minted + 1
+    }
+    print("SOS quotachild: at its quota: {}", named(refused))
+    let _ = sos_wait_word(((&var WORD) as UnsafePointer<UInt64>) as UInt, NONE)
+    ARGS[0] = ((&var BODY) as UnsafePointer<UInt8>) as UInt
+    ARGS[1] = 2
+    // The refused calls carry the last sibling, which a refusal for the
+    // claim's row leaves in this table.
+    ARGS[2] = carried
+
+    WORD = NEVER
+    let (room, room_value) = call(through)
+    print("SOS quotachild: room: {} value={}", named(room), room_value)
+    let (op, op_value) = call(through)
+    print("SOS quotachild: op: {} value={}", named(op), op_value)
+    var kind: UInt = 0
+    print("SOS quotachild: the carried sibling is still ours: {}",
+          named(sos_handle_info(carried, HANDLE_KIND,
+                                (&var kind) as UnsafePointer<UInt>)))
+    ARGS[2] = NONE
+    WORD = 0
+    let (plain, len) = call(through)
+    print("SOS quotachild: plain: {} len={}", named(plain), len)
+    let _ = sos_process_exit(proc, 0)
+}

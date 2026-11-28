@@ -1,0 +1,390 @@
+// A parked call's record rewritten to carry a claim a wakeable park holds
+// (spec §2.1, §5.7), at the C altitude. Expected outcome:
+//
+//   SOS claimrewrite: the call and the resolve are parked
+//   SOS claimrewrite: the message arrived without the claim: true
+//   SOS claimrewrite: A's resolve: Ok len=2
+//   SOS claimrewrite: B's call: Ok
+//   SOS claimrewrite: W's call is parked
+//   SOS claimrewrite: W's message arrived without its claim: true
+//   SOS claimrewrite: W's call: Woken, handed the predicted claim: true
+//   SOS claimrewrite: W's resolve of it: Ok len=2
+//
+// Thread A parks in a wakeable `Resolve` of a claim on one connection (its
+// wait word `UInt64.max`, wakeable with no deadline), and thread B in a plain
+// `Call` on another whose ring is full. The main thread, which yielded until
+// both parked, rewrites B's args record to carry A's claim, then takes a tell,
+// which makes room and resumes B's call. The resume re-reads the record, and
+// there is no running caller to fault, so the slot naming the claim arrives
+// empty: the claim is A's while its park holds it, and A's park still ends
+// with the reply.
+//
+// Then thread W parks in a wakeable `Call` on the full ring (its wait word
+// `UInt64.max`). A wakeable call mints its claim at the stage, here at the
+// resume, and the word it will get is known beforehand: a mint takes the
+// lowest free slot at its next generation, so two siblings minted and
+// released show the slot and the step, and the take that makes room mints
+// and releases one more there first. The main thread writes that word into
+// W's record, then makes room. The claim is W's from the moment it exists, so
+// its slot arrives empty, W's wake hands back that very word, and W resolves
+// it.
+//
+// The image arms no tick, so each yield returns once A, B or W has parked.
+
+import sos.{System, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_process_pipe_create,
+            sos_pipe_inlet_post, sos_pipe_inlet_call, sos_pipe_outlet_take,
+            sos_pipe_reply_resolve, sos_pipe_request_reply,
+            sos_handle_release, sos_handle_mint, sos_wait_word,
+            sos_thread_wake, sos_thread_id}
+
+static STATUS_OK: UInt = 0
+static EXIT_OK: UInt = 0
+
+/// The word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A word that names no instant and parks wakeable.
+static NEVER: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// Room for a take record and for a reply record on every profile.
+static REC_WORDS: Int = 128
+
+/// The most tells the fill posts before it gives up.
+static MAX_FILL: Int = 64
+
+unsafe static var FULL_INLET: UInt = 0
+unsafe static var CLAIM: UInt = 0
+
+/// B's args record, which the main thread rewrites.
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+
+/// W's args record, which the main thread rewrites, and what W's ops
+/// answered.
+unsafe static var W_ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var W_STATUS: UInt = 0xFFFF
+unsafe static var W_ID: UInt = 0
+unsafe static var W_CLAIM: UInt = 0
+unsafe static var W_RESOLVE: UInt = 0xFFFF
+unsafe static var W_LEN: UInt = 0
+unsafe static var WORD_W: UInt64 = 0
+unsafe static var REC_W: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var STACK_W: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+/// What each thread's op answered.
+unsafe static var A_STATUS: UInt = 0xFFFF
+unsafe static var A_LEN: UInt = 0
+unsafe static var B_STATUS: UInt = 0xFFFF
+
+/// A's wait word.
+unsafe static var WORD_A: UInt64 = 0
+
+unsafe static var REC_A: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var REC_B: [UInt; REC_WORDS] = [0; REC_WORDS]
+unsafe static var REC: [UInt; REC_WORDS] = [0; REC_WORDS]
+
+/// A's stack and B's.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+/// The message A's claim is for, and what the main thread answers.
+unsafe static var ANSWER: [UInt8; 8] = [0x52, 0x31, 0, 0, 0, 0, 0, 0]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func send_bytes() -> UInt {
+    (SEND_WORDS as UInt) * word_bytes()
+}
+
+func rec_bytes() -> UInt {
+    (REC_WORDS as UInt) * word_bytes()
+}
+
+func a_entry(arg: UInt) sync -> UInt {
+    a_run()
+}
+
+/// A: a wakeable `Resolve` of the claim.
+func a_run() unsafe sync -> UInt {
+    let _ = sos_wait_word(((&var WORD_A) as UnsafePointer<UInt64>) as UInt,
+                          NONE)
+    WORD_A = NEVER
+    var value: UInt = 0
+    A_STATUS = sos_pipe_reply_resolve(CLAIM, (&var REC_A) as UnsafePointer<UInt>,
+                                      rec_bytes(),
+                                      (&var value) as UnsafePointer<UInt>)
+    A_LEN = value
+    WORD_A = 0
+    0
+}
+
+func b_entry(arg: UInt) sync -> UInt {
+    b_run()
+}
+
+/// B: a plain `Call` into the full ring, through the record the main thread
+/// rewrites.
+func b_run() unsafe sync -> UInt {
+    var value: UInt = 0
+    B_STATUS = sos_pipe_inlet_call(FULL_INLET, (&var ARGS) as UnsafePointer<UInt>,
+                                   send_bytes(),
+                                   (&var REC_B) as UnsafePointer<UInt>,
+                                   (&var value) as UnsafePointer<UInt>)
+    0
+}
+
+func w_entry(arg: UInt) sync -> UInt {
+    w_run()
+}
+
+/// W: a wakeable `Call` into the full ring, through the record the main
+/// thread rewrites, then a plain `Resolve` of the claim its early end hands
+/// back.
+func w_run() unsafe sync -> UInt {
+    W_ID = sos_thread_id()
+    let _ = sos_wait_word(((&var WORD_W) as UnsafePointer<UInt64>) as UInt,
+                          NONE)
+    WORD_W = NEVER
+    var value: UInt = 0
+    W_STATUS = sos_pipe_inlet_call(FULL_INLET, (&var W_ARGS) as UnsafePointer<UInt>,
+                                   send_bytes(),
+                                   (&var REC_W) as UnsafePointer<UInt>,
+                                   (&var value) as UnsafePointer<UInt>)
+    WORD_W = 0
+    W_CLAIM = value
+    var len: UInt = 0
+    W_RESOLVE = sos_pipe_reply_resolve(W_CLAIM, (&var REC_W) as UnsafePointer<UInt>,
+                                       rec_bytes(),
+                                       (&var len) as UnsafePointer<UInt>)
+    W_LEN = len
+    0
+}
+
+/// A sibling of `handle` minted and released at once: the word the slot
+/// held.
+func sibling(handle: UInt) unsafe -> UInt {
+    var word: UInt = NONE
+    let _ = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                            (&var word) as UnsafePointer<UInt>)
+    let _ = sos_handle_release(word)
+    word
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim. Answers how many were staged.
+func fill(inlet: UInt) unsafe -> Int {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        var claim: UInt = NONE
+        if sos_pipe_inlet_post(inlet, (&var msg) as UnsafePointer<UInt>,
+                               send_bytes(),
+                               (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+            return staged
+        }
+        let _ = sos_handle_release(claim)
+        staged = staged + 1
+    }
+    staged
+}
+
+/// Take the oldest message on `outlet` into `REC`, answering the status.
+func take(outlet: UInt) unsafe -> UInt {
+    sos_pipe_outlet_take(outlet, (&var REC) as UnsafePointer<UInt>, rec_bytes())
+}
+
+/// Where the sender's pid sits in a take record, in bytes. The message record
+/// starts on a doubleword after the request word, its packed meta pads to a
+/// word, then come the handle words and then the pid.
+static MSG_OFFSET: Int = 8
+static SENDER_BYTES: Int = 8
+
+func sender_offset() -> Int {
+    let word = sizeof<UInt>()
+    let meta = ((1 + PIPE_MSG_HANDLES + word - 1) / word) * word
+    MSG_OFFSET + meta + PIPE_MSG_HANDLES * word
+}
+
+/// Whether every word of the take record in `REC` after the request handle
+/// is zero, the sender's pid excepted: a data-free message with no handle
+/// kinds and no handle words.
+func bare() unsafe -> Bool {
+    let word = sizeof<UInt>()
+    let from = sender_offset()
+    var i: Int = 1
+    while i < REC_WORDS {
+        let at = i * word
+        let in_sender = at >= from && at < from + SENDER_BYTES
+        if REC[i] != NONE && not in_sender {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Reply to the obligation in `REC` with `len` bytes of `ANSWER`.
+func answer(len: UInt) unsafe -> UInt {
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    msg[0] = ((&var ANSWER) as UnsafePointer<UInt8>) as UInt
+    msg[1] = len
+    sos_pipe_request_reply(REC[0], (&var msg) as UnsafePointer<UInt>,
+                           send_bytes())
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS claimrewrite: no process handle: {}", error)
+        return
+    }
+    var raw: UInt = NONE
+    var full: [UInt; 2] = [NONE; 2]
+    var other: [UInt; 2] = [NONE; 2]
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var raw) as UnsafePointer<UInt>) != STATUS_OK ||
+       sos_process_pipe_create(raw, (&var full) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK ||
+       sos_process_pipe_create(raw, (&var other) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK ||
+       sos_pipe_inlet_post(other[0], (&var msg) as UnsafePointer<UInt>,
+                           send_bytes(),
+                           (&var CLAIM) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS claimrewrite: setup refused")
+        return
+    }
+    FULL_INLET = full[0]
+    let depth = fill(full[0])
+    let me = try proc.thread_self() catch {
+        print("SOS claimrewrite: no thread handle: {}", error)
+        return
+    }
+    let top_a = ((&var STACK_A) as UnsafePointer<UInt>) as UInt +
+                (STACK_WORDS as UInt) * word_bytes()
+    let top_b = ((&var STACK_B) as UnsafePointer<UInt>) as UInt +
+                (STACK_WORDS as UInt) * word_bytes()
+    let a = try proc.thread_create(run: a_entry, arg: 0,
+                                   stack_top: top_a) catch {
+        print("SOS claimrewrite: no thread A: {}", error)
+        return
+    }
+    let b = try proc.thread_create(run: b_entry, arg: 0,
+                                   stack_top: top_b) catch {
+        print("SOS claimrewrite: no thread B: {}", error)
+        return
+    }
+    try a.start() catch {
+        print("SOS claimrewrite: A did not start: {}", error)
+        return
+    }
+    try b.start() catch {
+        print("SOS claimrewrite: B did not start: {}", error)
+        return
+    }
+    try me.yield_now() catch {
+        print("SOS claimrewrite: no yield: {}", error)
+        return
+    }
+    print("SOS claimrewrite: the call and the resolve are parked")
+
+    // The rewrite, then room: taking and dropping one tell settles it, which
+    // resumes B's call.
+    ARGS[2] = CLAIM
+    if take(full[1]) != STATUS_OK {
+        print("SOS claimrewrite: the first take was refused")
+        return
+    }
+    let _ = sos_handle_release(REC[0])
+    var taken: Int = 1
+    while taken < depth {
+        if take(full[1]) != STATUS_OK {
+            print("SOS claimrewrite: a tell was missing")
+            return
+        }
+        let _ = sos_handle_release(REC[0])
+        taken = taken + 1
+    }
+    REC = [NONE; REC_WORDS]
+    if take(full[1]) != STATUS_OK {
+        print("SOS claimrewrite: B's message was missing")
+        return
+    }
+    print("SOS claimrewrite: the message arrived without the claim: {}", bare())
+    let _ = answer(0)
+
+    // The claim is still A's: its message, answered, ends A's park.
+    if take(other[1]) != STATUS_OK {
+        print("SOS claimrewrite: A's message was missing")
+        return
+    }
+    let _ = answer(2)
+    let _ = try a.join() catch { 0 }
+    let _ = try b.join() catch { 0 }
+    print("SOS claimrewrite: A's resolve: {} len={}",
+          if A_STATUS == STATUS_OK { "Ok" } else { "not Ok" }, A_LEN)
+    print("SOS claimrewrite: B's call: {}",
+          if B_STATUS == STATUS_OK { "Ok" } else { "not Ok" })
+
+    let refill = fill(full[0])
+    let top_w = ((&var STACK_W) as UnsafePointer<UInt>) as UInt +
+                (STACK_WORDS as UInt) * word_bytes()
+    let w = try proc.thread_create(run: w_entry, arg: 0,
+                                   stack_top: top_w) catch {
+        print("SOS claimrewrite: no thread W: {}", error)
+        return
+    }
+    try w.start() catch {
+        print("SOS claimrewrite: W did not start: {}", error)
+        return
+    }
+    try me.yield_now() catch {
+        print("SOS claimrewrite: no yield: {}", error)
+        return
+    }
+    print("SOS claimrewrite: W's call is parked")
+    // The slot's word now, one generation on, and the step: the take below
+    // mints its obligation there and releases it, and the claim follows.
+    let first = sibling(full[0])
+    let second = sibling(full[0])
+    let predicted = second + 2 * (second - first)
+    W_ARGS[2] = predicted
+    if take(full[1]) != STATUS_OK {
+        print("SOS claimrewrite: the take for W was refused")
+        return
+    }
+    let _ = sos_handle_release(REC[0])
+    var tells: Int = 1
+    while tells < refill {
+        if take(full[1]) != STATUS_OK {
+            print("SOS claimrewrite: a tell for W was missing")
+            return
+        }
+        let _ = sos_handle_release(REC[0])
+        tells = tells + 1
+    }
+    REC = [NONE; REC_WORDS]
+    if take(full[1]) != STATUS_OK {
+        print("SOS claimrewrite: W's message was missing")
+        return
+    }
+    print("SOS claimrewrite: W's message arrived without its claim: {}",
+          bare())
+    // Woken, W hands back its claim, then resolves it once it is answered.
+    let _ = sos_thread_wake(W_ID)
+    let _ = answer(2)
+    let _ = try w.join() catch { 0 }
+    let woken = W_STATUS == (SosStatus.Woken as UInt8) as UInt
+    print("SOS claimrewrite: W's call: {}, handed the predicted claim: {}",
+          if woken { "Woken" } else { "not Woken" }, W_CLAIM == predicted)
+    print("SOS claimrewrite: W's resolve of it: {} len={}",
+          if W_RESOLVE == STATUS_OK { "Ok" } else { "not Ok" }, W_LEN)
+    let _ = proc.exit(EXIT_OK)
+}

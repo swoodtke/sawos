@@ -16,8 +16,8 @@
 //! `process` imports nothing from here, so there is no cycle.
 
 import hal
-import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
-               process_status_word}
+import sosabi.{EventMode, InletLevel, NO_HANDLE, OutletLevel, ReplyLevel,
+               WaitTag, process_status_word}
 import kcore.limits.{
     ProcessIndex,
     ThreadIndex,
@@ -906,21 +906,25 @@ public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
 }
 
 /// Tie thread `slot` to exchange `x` and stop it: the fused `Call`'s second
-/// park, the one that holds the claim.
+/// park, the one that holds the claim, and a parked `Resolve`'s.
 ///
-/// The caller has already taken the exchange's reply reference; this records
-/// the tie in both directions and marks the thread blocked.
+/// The caller has already taken the exchange's reply reference for the thread;
+/// this records the tie in both directions and marks the thread blocked.
+/// `word` is the claim handle a wakeable park borrows, or `NO_HANDLE` for a
+/// plain one (`ThreadSlot.call_word`).
 ///
 /// It does not request a reschedule, which is why it is split from
 /// `block_on_call_reply`. It is reached by the op, which is the thread being
 /// parked and wants one, and by the room resume, which runs in whichever thread
 /// freed the slot and must not preempt itself for somebody else's park.
-public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
+public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt,
+                                    word: UInt) unsafe {
     borrow var thread = threads().at(ThreadIndex(slot)) {
         thread.state = ThreadState.Blocked
         thread.wait_buf = dst
         thread.call_pipe = 0
         thread.call_claim = x + 1
+        thread.call_word = word
         thread.call_src = 0
         thread.call_len = 0
     }
@@ -928,14 +932,16 @@ public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
 }
 
 /// The running thread's version: tie, and request the switch it now needs.
-public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
-    tie_call_reply(slot, x, dst)
+public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt,
+                                         word: UInt) unsafe {
+    tie_call_reply(slot, x, dst, word)
     NEED_RESCHED = true
 }
 
-/// Forget everything about a thread's fused call: the state, both directions of
-/// the tie, and the buffer. It does not touch the reference the claim held;
-/// each caller owns that decision.
+/// Forget everything about a thread's fused call or parked `Resolve`: the
+/// state, both directions of the tie, the borrowed word and the buffer. It
+/// does not touch the reference the claim held, nor a borrowed handle; each
+/// caller owns those decisions.
 public(package) func clear_pending_call(slot: Int) unsafe {
     borrow var thread = threads().at(ThreadIndex(slot)) {
         if thread.call_claim != 0 {
@@ -943,6 +949,7 @@ public(package) func clear_pending_call(slot: Int) unsafe {
         }
         thread.call_pipe = 0
         thread.call_claim = 0
+        thread.call_word = NO_HANDLE
         thread.call_src = 0
         thread.call_len = 0
         thread.wait_buf = 0
