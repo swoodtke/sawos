@@ -15,8 +15,11 @@
 //!     can rewrite every special register (../ABI.md §5e). The kernel's checks
 //!     on the syscall path are real; memory protection is not, and the tier
 //!     word says so;
-//!   * no FPU use: every image is built without it, and CPENABLE stays 0
-//!     (`boot.S`'s `_start` writes it), so an FP instruction is a fault;
+//!   * an FPU, coprocessor 0, that a thread gets on its first FP instruction:
+//!     CPENABLE is 0 until then, so that instruction traps, and its state is
+//!     saved and loaded at a switch from then on (`fp_trap`). The kernel
+//!     executes no FP instruction. BR, MAC16's registers and MISC0..3 are no
+//!     coprocessor's and travel in the trap frame;
 //!   * interrupts through the interrupt matrix onto level-1 CPU interrupts,
 //!     taken at the user vector with EXCCAUSE 4. The kernel runs at INTLEVEL
 //!     15 and takes one only to end its idle `waiti`, at the kernel vector,
@@ -626,7 +629,7 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 // The trap frame
 // =============================================================================
 
-/// The context `boot.S` saves on a trap from user mode: 76 words. Declaration
+/// The context `boot.S` saves on a trap from user mode: 87 words. Declaration
 /// order is the layout, so these fields and `boot.S`'s `F_*` offsets are one
 /// description.
 ///
@@ -638,6 +641,13 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 /// LEND and LCOUNT because user code built elsewhere may use the zero-overhead
 /// loop, and THREADPTR because it is per-thread by definition. EXCCAUSE and
 /// EXCVADDR are what the trap was.
+///
+/// BR (the Boolean option's register, which the FP compares write), MAC16's
+/// ACCLO, ACCHI and M0..M3, and MISC0..MISC3 follow: no coprocessor gates
+/// them, so any thread can read and write them, and a frame that left them
+/// out would hand each thread the last thread's values and lose its own at a
+/// switch. They are the words ESP-IDF's frame keeps beside SCOMPARE1 and
+/// THREADPTR, and the four MISC registers, which it keeps nowhere.
 struct TrapFrame {
     pc: UInt,               // EPC1: where the context resumes
     ps: UInt,               // PS, with EXCM set; `rfe` clears it
@@ -668,18 +678,51 @@ struct TrapFrame {
     windowbase: UInt,
     windowstart: UInt,
     ar: [UInt; 48],         // panes WINDOWBASE + 4 to + 15
+    br: UInt,
+    acclo: UInt,
+    acchi: UInt,
+    mac16_m: [UInt; 4],     // M0..M3
+    misc: [UInt; 4],        // MISC0..MISC3
 }
 
-/// Bytes in one saved context. Public because the kernel reserves a slot per
-/// thread: the kernel owns the storage and the HAL owns the layout.
-public static FRAME_BYTES: Int = 304
+/// Bytes in the register half of a saved context: the layout `TrapFrame`
+/// describes and `boot.S` saves and restores on every trap.
+static TRAP_FRAME_BYTES: Int = 348
 
-/// Words in a frame, for `frame_init`'s zeroing loop.
-static FRAME_WORDS: UInt = 76
+/// Bytes in a thread's floating-point area, which follows the trap frame in
+/// the same slot at offset `TRAP_FRAME_BYTES`.
+///
+/// f0..f15 at 4 bytes each (offset 0), then FCR (64), FSR (68) and the active
+/// word (72: nonzero once the thread has used the FPU). `sos_fp_save` and
+/// `sos_fp_load` in `boot.S` read and write the first three fields by these
+/// offsets.
+///
+/// It lives beside the trap frame rather than inside it: a frame is saved and
+/// restored on every trap, and only a thread that has used the FPU needs these
+/// words saved at all, at a switch and not at a trap. The slot is the
+/// thread's, so the area travels with it and the HAL needs no table indexed by
+/// thread.
+static FP_AREA_BYTES: Int = 76
+static FP_ACTIVE_OFFSET: UInt = 72
+
+/// Bytes in one saved context, floating-point area included.
+///
+/// Public because the kernel reserves a slot per thread and has to know this
+/// fits: the kernel owns the storage and the HAL owns the layout. The kernel
+/// rounds its stride up to a multiple of 512 bytes; this context is kept
+/// within one, which the assert below holds.
+public static FRAME_BYTES: Int = TRAP_FRAME_BYTES + FP_AREA_BYTES
+
+/// Words in a whole context, for `frame_init`'s zeroing loop.
+static FRAME_WORDS: UInt = 106
 static WORD_BYTES: UInt = 4
 
-static_assert(sizeof<TrapFrame>() == FRAME_BYTES,
-              "the Xtensa trap frame is 76 words, as boot.S lays it out")
+static_assert(sizeof<TrapFrame>() == TRAP_FRAME_BYTES,
+              "the Xtensa trap frame is 87 words, as boot.S lays it out")
+static_assert(FRAME_WORDS * WORD_BYTES == (FRAME_BYTES as UInt),
+              "frame_init zeroes the whole context")
+static_assert(FRAME_BYTES <= 512,
+              "the frame and its FP area fit one 512-byte thread stride")
 
 /// PS for a context's first entry: UM = 1 so its traps arrive at the user
 /// vector, EXCM = 1 so `rfe` is what clears it, INTLEVEL = 0 so interrupts
@@ -717,6 +760,10 @@ func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
 /// purpose: an entry that returns jumps to address zero and takes an
 /// instruction fault, which spec §8 turns into the death of its process.
 ///
+/// The floating-point area is zeroed with the frame, so a new thread is not
+/// FP-active and its first use loads zeros (`fp_trap`). A slot's previous
+/// occupant leaves nothing in it.
+///
 /// No preemption point: a fixed count of word stores, and a half-built
 /// context is an in-flight invariant the trap path can reach.
 public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
@@ -746,19 +793,138 @@ public func resume_frame(frame_addr: UInt) -> Never {
     while { }
 }
 
-/// Claim a trap as a floating-point first use: never. No thread may use the
-/// FPU on this profile (CPENABLE stays 0), so an FP instruction is a
-/// coprocessor-disabled fault and its process dies of it.
+// =============================================================================
+// User floating-point state
+// =============================================================================
+//
+// The FPU is coprocessor 0, and CPENABLE bit 0 lets code use it, the kernel's
+// code included: the core has no privilege, so the bit is the same for every
+// mode. The kernel executes no FP instruction (sawc emits none for this
+// target, the kernel's C is built with the `-fp` target feature, and the
+// runner disassembles every kernel image and fails on one outside
+// `sos_fp_save` and `sos_fp_load`), so a trap never disturbs f0..f15, FCR or
+// FSR, and a trap that resumes the thread it interrupted saves none of them.
+// BR is no coprocessor's and travels in the trap frame.
+//
+// A thread's state moves only at a switch, and only for a thread that has used
+// the FPU:
+//
+//   - CPENABLE is 0 for a thread that has not (`_start` clears it, and a
+//     switch to such a thread clears it again). Its first FP instruction traps
+//     with EXCCAUSE 32, `fp_trap` marks it active, loads its area into the
+//     registers and leaves the coprocessor on, and the thread runs the
+//     instruction again. Enabling always loads: the registers hold whatever
+//     the last active thread left, possibly another process's, and an enable
+//     that did not overwrite them would hand that state to this thread. Its
+//     area is zero until its first switch-out, so the load is the zeroed state
+//     a new thread is promised.
+//   - At a switch `fp_switch_out` saves the outgoing thread's state if it is
+//     active, and `fp_switch_in` loads the incoming thread's if it is, leaving
+//     the coprocessor on, or turns the coprocessor off if it is not. A thread
+//     that never uses the FPU pays one compare per switch, and a write of
+//     CPENABLE when it comes in.
+//
+// CPENABLE is written at every switch to a thread that is not active, never
+// skipped by a copy of what the kernel last wrote: a process can write the
+// register itself (../ABI.md §5e), so no copy could be trusted. The save and
+// the load set bit 0 themselves before their first FP instruction for the same
+// reason: they run in the kernel, under whatever the outgoing thread left.
+//
+// What the FPU holds is the kernel's to know, not CPENABLE's: `sos_fp_load`
+// records whose area it loaded (`sos_fp_owner`), and no other kernel code
+// writes the FP registers. A thread that writes CPENABLE itself is answered
+// by that record:
+//
+//   - An active thread that clears bit 0 traps at its next FP instruction
+//     with the cause of a first use. The FPU still holds its own state, so
+//     `fp_trap` sets the bit again and loads nothing, which is what a switch
+//     in between would have come to as well.
+//   - An active thread whose state the FPU does not hold cannot trap that way
+//     on a correct kernel, since every switch to an active thread loads its
+//     area: `fp_trap` stops the machine as a kernel bug.
+//   - A thread that sets bit 0 before its first use runs FP instructions
+//     without being active: it reads what the last active thread left, which
+//     may be another process's, and keeps none of its own state across a
+//     switch. The Flat tier cannot deny the write, as it denies no other
+//     special register, and disclaims what follows from it.
+
+extern "C" {
+    func sos_fp_save(area: UInt)
+    func sos_fp_load(area: UInt)
+    func sos_fp_enable(on: UInt)
+    func sos_fp_owner() -> UInt
+}
+
+/// The status the machine stops with when an active thread whose state the
+/// FPU does not hold takes the coprocessor-disabled trap: the core's
+/// `ExitCode.KernelBug`, as `WINDOWED_CALL_REFUSED_STATUS` is.
+static FP_NOT_HELD_STATUS: UInt = 6
+
+/// Where the thread whose trap frame is `frame_addr` keeps its floating-point
+/// area.
+func fp_area(frame_addr: UInt) -> UInt {
+    frame_addr + (TRAP_FRAME_BYTES as UInt)
+}
+
+func fp_active(area: UInt) unsafe -> Bool {
+    UnsafeMemory<UInt, Normal>(area + FP_ACTIVE_OFFSET).read() != 0
+}
+
+/// Claim a coprocessor-disabled trap, EXCCAUSE 32: a thread's first use of
+/// the FPU, or an active thread's next use after it cleared CPENABLE itself.
+///
+/// Answers false for any other trap, with nothing touched. A thread that is
+/// not active is marked active and its own area (zero until a switch saves
+/// into it) is loaded into f0..f15, FCR and FSR, which leaves the coprocessor
+/// enabled. An active thread whose area the FPU holds (`sos_fp_owner`) gets
+/// the coprocessor enabled again and nothing loaded. Either way the saved
+/// program counter is still the trapping instruction, which runs again. The
+/// load is not optional: see the section header.
+///
+/// An active thread whose area the FPU does not hold stops the machine.
 public func fp_trap(frame_addr: UInt, cause: UInt) unsafe -> Bool {
-    false
+    if cause != (TrapCause.Coprocessor0Disabled as UInt) {
+        return false
+    }
+    let area = fp_area(frame_addr)
+    if fp_active(area) {
+        if sos_fp_owner() == area {
+            sos_fp_enable(1)
+            return true
+        }
+        console_str("SOS-S3: kernel bug: coprocessor 0 disabled for an active")
+        console_str(" thread whose state the FPU does not hold, pc=0x")
+        console_hex(trap_pc(frame_addr))
+        console_byte(10)
+        exit_fail(FP_NOT_HELD_STATUS)
+    }
+    UnsafeMemory<UInt, Normal>(area + FP_ACTIVE_OFFSET).write(1)
+    sos_fp_load(area)
+    true
 }
 
-/// No floating-point state to save at a switch.
+/// Save the outgoing thread's floating-point state if it has any.
+///
+/// Called by the scheduler while the thread's slot is still live: before the
+/// idle wait, whose deliveries can end the thread's process, and before a
+/// deferred free can release the slot.
 public func fp_switch_out(frame_addr: UInt) unsafe {
+    let area = fp_area(frame_addr)
+    if fp_active(area) {
+        sos_fp_save(area)
+    }
 }
 
-/// No floating-point state to install at a switch.
+/// Install the incoming thread's floating-point state: load it, which leaves
+/// the coprocessor on, if the thread is active, and turn the coprocessor off
+/// if it is not.
 public func fp_switch_in(frame_addr: UInt) unsafe {
+    let area = fp_area(frame_addr)
+    if fp_active(area) {
+        sos_fp_load(area)
+    } else {
+        sos_fp_enable(0)
+    }
 }
 
 // =============================================================================

@@ -70,6 +70,7 @@ path), `_run_qemu`'s own stdin, and `main`'s eager `tc()`.
 
 import argparse
 import ast
+import bisect
 import concurrent.futures
 import glob
 import json
@@ -1478,10 +1479,13 @@ ESP32S3_ARCH = {
     # The core has no privilege at all (hal/xtensa-esp32s3/ABI.md §5e).
     "tier": TIER_FLAT,
     # Espressif's clang, after `--target=<triple>`: the chip, and the two cc1
-    # features that make C and assembly call0 and FPU-free like sawc's objects
-    # (ABI.md §1a; the driver has no `-mabi`). `-fintegrated-as` keeps `.S`
-    # files off the external assembler, whose compressed debug sections this
-    # board's ld.lld refuses.
+    # features that make C call0 and FPU-free like sawc's objects (ABI.md
+    # §1a; the driver has no `-mabi`). The assembler takes FP instructions
+    # under either feature, which `boot.S`'s save and load of a thread's FP
+    # state spell; the image's disassembly holds every other kernel
+    # instruction to the rule (`_check_s3_kernel_fp_free`). `-fintegrated-as`
+    # keeps `.S` files off the external assembler, whose compressed debug
+    # sections this board's ld.lld refuses.
     "cc_args": ["-mcpu=esp32s3",
                 "-Xclang", "-target-feature", "-Xclang", "-windowed",
                 "-Xclang", "-target-feature", "-Xclang", "-fp",
@@ -18731,10 +18735,11 @@ def _fp_instructions(disassembly):
             yield symbol, line.strip()
 
 
-def _disassemble(elf, clang, what):
-    """`elf`'s disassembly, by the llvm-objdump that goes with `clang`;
-    `what` names the check that needs it, for the refusal when there is
-    none."""
+def _disassemble(elf, clang, what, raw=False, mcpu=None):
+    """`elf`'s disassembly, by the llvm-objdump that goes with `clang`, with
+    each instruction's bytes when `raw` is true and for the CPU `mcpu` when
+    one is named; `what` names the check that needs it, for the refusal when
+    there is none."""
     # Where `_find_clang` looks for an LLVM, in the same order: beside the
     # clang in use, on PATH, then the Homebrew prefixes (Apple's clang ships
     # without one).
@@ -18749,7 +18754,9 @@ def _disassemble(elf, clang, what):
     if not objdump:
         raise ToolError(f"{what} needs llvm-objdump (next to clang, on PATH, "
                         "or in the Homebrew llvm)")
-    result = subprocess.run([objdump, "-d", "--no-show-raw-insn", elf],
+    shown = [] if raw else ["--no-show-raw-insn"]
+    cpu = [f"--mcpu={mcpu}"] if mcpu else []
+    result = subprocess.run([objdump, "-d", *shown, *cpu, elf],
                             capture_output=True, text=True)
     if result.returncode != 0:
         raise ToolError(f"llvm-objdump failed on {elf}: {result.stderr}")
@@ -18769,6 +18776,223 @@ def _check_kernel_fp_free(elf, clang):
         raise ToolError(f"{os.path.basename(elf)}: the kernel executes "
                         f"FP/SIMD instructions outside "
                         f"{', '.join(FP_ALLOWED_SYMBOLS)}:\n{shown}")
+
+
+# The ESP32-S3 kernel's own FP instructions are exactly these two routines: the
+# user-state save and load that run at a thread switch and at a thread's first
+# FP use (`hal/xtensa-esp32s3/kernel/boot.S`). Anything else that touched
+# f0..f15, FCR or FSR would clobber a thread's FP state at a trap, where
+# nothing saves it. The check allows them by their sized ranges.
+S3_FP_ALLOWED_SYMBOLS = ("sos_fp_save", "sos_fp_load")
+
+# An FP register operand (`f0`..`f15`), or FCR or FSR named as a user register;
+# matched as whole tokens once branch targets are stripped, so an address
+# cannot match. BR and the Boolean ops are not FP state: the trap frame carries
+# BR, and the trap entry reads it.
+_S3_FP_OPERAND = re.compile(r"(?<![\w.])(?:f(?:1[0-5]|[0-9])|fcr|fsr)(?![\w])")
+# A mnemonic of the FP option (`add.s`, `oeq.s`, `float.s`), one that names FCR
+# or FSR itself (`wur.fcr`), or a PIE op (`ee.zero.q`), whose coprocessor the
+# kernel never enables either.
+_S3_FP_MNEMONIC = re.compile(r"\.s$|(?:^|\.)(?:fcr|fsr)$|^ee\.")
+# An instruction line of `llvm-objdump -d`, raw bytes shown.
+_S3_DISASM_INSN = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(\S+)"
+                             r"\s*(.*)$")
+# A PC-relative target as the disassembler prints one, `. +12` or `. -3`.
+_S3_PC_RELATIVE = re.compile(r"\.\s*([+-])\s*(\d+)")
+# The instructions after which execution never falls through to the next one.
+_S3_NO_FALL_THROUGH = frozenset((
+    "ret", "ret.n", "retw", "retw.n", "j", "jx", "rfe", "rfde", "rfwo",
+    "rfwu", "rfi", "rfme", "ill", "ill.n"))
+
+
+def _s3_disasm_lines(disassembly):
+    """`llvm-objdump -d`'s instruction lines from the executable sections of
+    an S3 kernel image, but `.payload*`, which holds a harness's user code,
+    which the kernel never runs; the root image and the child images ride in
+    data sections. Each is (address, bytes, mnemonic, operands, symbol, text,
+    root), `root` true for the first line after a symbol that names no data.
+    `data` is the set of data symbols' names."""
+    def parse(data):
+        lines = []
+        section, symbol, root = None, None, False
+        for text in disassembly.splitlines():
+            m = _DISASM_SECTION.match(text)
+            if m:
+                section, symbol = m.group(1), None
+                continue
+            if section is None or section.startswith(".payload"):
+                continue
+            m = _DISASM_SYMBOL.match(text)
+            if m:
+                symbol, root = m.group(1), m.group(1) not in data
+                continue
+            m = _S3_DISASM_INSN.match(text)
+            if not m:
+                continue
+            raw = bytes(int(b, 16) for b in m.group(2).split())
+            lines.append((int(m.group(1), 16), raw, m.group(3), m.group(4),
+                          symbol, text.strip(), root))
+            root = False
+        return lines
+    return parse
+
+
+def _s3_kernel_fp_findings(disassembly, esp32s3, symbols):
+    """Each line of an S3 kernel image's code that executes an FP or PIE
+    instruction outside `S3_FP_ALLOWED_SYMBOLS`, that cannot be decoded, or
+    that the check cannot place, as (symbol, finding, line). `disassembly` is
+    the image's by the disassembler's generic Xtensa table and `esp32s3` by
+    its table for this core; `symbols` is `_elf32_code_symbols`' answer.
+
+    The generic table is the one read, because the core's table lacks
+    special registers the kernel uses (CCOUNT, MISC0..MISC3): it prints
+    `rsr a8, ccount` as a two-byte `<unknown>` and decodes on out of step.
+    The generic table lacks the PIE ops instead, so a line it cannot decode
+    is read again in the core's table, at the same address.
+
+    Xtensa code carries its constants in literal pools that the linker places
+    in the same output section as the code, just below the function that
+    loads them, and nothing in the linked image marks where a pool is. The
+    disassembler decodes a pool as instructions, and a constant can decode as
+    an FP one, or as an `l32r` that seems to load something else. So the
+    check first decides which lines are code, and only then which words are
+    literals:
+
+      * a line inside a sized function is code: a compiled function's symbol
+        covers its instructions and not the pool below it;
+      * so is a line reached from a symbol that names no data, through
+        instructions that fall through to the next and through the
+        PC-relative targets of branches, jumps and calls; hand-written
+        assembly is not always sized, and a pool is never reached this way,
+        since it lies below the function that loads it, past an instruction
+        that does not fall through;
+      * a literal is a word an `l32r` of that code loads (the word at
+        ((PC + 3) & ~3) + (imm16 - 65536) * 4, from the encoding);
+      * a line that runs past where the next line starts is not code: the
+        disassembler starts afresh at every symbol, so it was decoded out of
+        the padding or pool before the symbol, and nothing reaches past it;
+      * a line inside a sized data symbol is data.
+
+    Code is refused when it executes an FP or PIE instruction outside the
+    allowed routines' ranges, or when neither table decodes it. Zero bytes
+    are padding wherever they are. A line that is not code is passed over
+    when it overlaps a literal or lies in a data symbol, when it is a `nop`
+    or `nop.n` (the assembler's alignment fill), or when it runs past the
+    next line; anything else is refused as bytes the check cannot place."""
+    functions, allowed, objects, data = symbols
+    lines = _s3_disasm_lines(disassembly)(data)
+    core = {ln[0]: ln for ln in _s3_disasm_lines(esp32s3)(data)}
+
+    def within(ranges, at, raw):
+        i = bisect.bisect_right(ranges, (at, float("inf"))) - 1
+        return i >= 0 and ranges[i][0] <= at and at + len(raw) <= ranges[i][1]
+
+    starts = {ln[0]: i for i, ln in enumerate(lines)}
+    straddles = [i + 1 < len(lines)
+                 and ln[0] < lines[i + 1][0] < ln[0] + len(ln[1])
+                 for i, ln in enumerate(lines)]
+    held = [within(objects, ln[0], ln[1]) for ln in lines]
+    sized = [within(functions, ln[0], ln[1]) and not straddles[i]
+             for i, ln in enumerate(lines)]
+    code = list(sized)
+    work = [i for i, ln in enumerate(lines)
+            if (ln[6] or sized[i]) and not straddles[i] and not held[i]]
+    seen = set()
+    while work:
+        i = work.pop()
+        if i in seen or straddles[i] or held[i]:
+            continue
+        seen.add(i)
+        code[i] = True
+        at, raw, mnemonic, ops = lines[i][:4]
+        if (mnemonic not in _S3_NO_FALL_THROUGH and i + 1 < len(lines)
+                and lines[i + 1][0] == at + len(raw)):
+            work.append(i + 1)
+        m = _S3_PC_RELATIVE.search(ops)
+        if m and mnemonic != "l32r":
+            target = at + int(m.group(2)) * (1 if m.group(1) == "+" else -1)
+            if target in starts:
+                work.append(starts[target])
+
+    literals = set()
+    for i, (at, raw, mnemonic, _ops, _sym, _text, _root) in enumerate(lines):
+        if code[i] and mnemonic == "l32r" and len(raw) == 3:
+            imm16 = raw[1] | (raw[2] << 8)
+            literals.add((((at + 3) & ~3) + ((imm16 - 0x10000) << 2))
+                         & 0xFFFFFFFF)
+
+    def overlaps(at, raw):
+        return any(((at + k) & ~3) in literals for k in range(len(raw)))
+
+    for i, (at, raw, mnemonic, ops, sym, text, _root) in enumerate(lines):
+        if within(allowed, at, raw) or not any(raw):
+            continue
+        # Code, unless it is an unsized line over a word that code loads:
+        # data in a text section, under a label of its own.
+        if code[i] and (sized[i] or not overlaps(at, raw)):
+            if mnemonic == "<unknown>":
+                again = core.get(at)
+                if again is None or again[2] == "<unknown>":
+                    yield sym, "an instruction that cannot be decoded", text
+                    continue
+                mnemonic, ops, text = again[2], again[3], again[5]
+            operands = re.sub(r"<[^>]*>|\.\s*[+-]\s*\d+", "", ops)
+            if (_S3_FP_MNEMONIC.search(mnemonic)
+                    or _S3_FP_OPERAND.search(operands)):
+                yield sym, "an FP or PIE instruction", text
+            continue
+        if (overlaps(at, raw) or held[i] or straddles[i]
+                or mnemonic in ("nop", "nop.n")):
+            continue
+        yield sym, "bytes that are neither code nor a literal", text
+
+
+def _elf32_code_symbols(path):
+    """What `_s3_kernel_fp_findings` reads of the ELF32 at `path`'s symbols:
+    its sized function symbols as sorted (start, end) pairs, the ranges of
+    `S3_FP_ALLOWED_SYMBOLS` among them, its sized data symbols' ranges, and
+    the names of its data symbols, which name no code."""
+    with open(path, "rb") as f:
+        data = f.read()
+    sections = _elf32_sections(data)
+    functions, allowed, held, objects = [], [], [], set()
+    for _name, kind, _flags, offset, size, link, entsize in sections:
+        if kind != 2:                           # SHT_SYMTAB
+            continue
+        strtab = sections[link][3]
+        for at in range(offset, offset + size, entsize):
+            st_name, value, length, info, _other, shndx = \
+                struct.unpack_from("<IIIBBH", data, at)
+            name = data[strtab + st_name:data.index(b"\0", strtab + st_name)]
+            name = name.decode()
+            if info & 15 == 1:                  # STT_OBJECT
+                objects.add(name)
+                if length and shndx:
+                    held.append((value, value + length))
+            if info & 15 == 2 and length and shndx:     # STT_FUNC
+                functions.append((value, value + length))
+                if name in S3_FP_ALLOWED_SYMBOLS:
+                    allowed.append((value, value + length))
+    return sorted(functions), sorted(allowed), sorted(held), objects
+
+
+def _check_s3_kernel_fp_free(elf, clang, name):
+    """Fail the build if an S3 kernel image executes an FP or PIE
+    instruction outside the two user-state routines, or holds code the
+    check cannot read (`_s3_kernel_fp_findings`). The kernel is free of them
+    so that a trap never disturbs a thread's FP state; see
+    `hal/xtensa-esp32s3/ABI.md` §7c."""
+    what = "the S3 kernel's FP-free check"
+    bad = list(_s3_kernel_fp_findings(
+        _disassemble(elf, clang, what, raw=True),
+        _disassemble(elf, clang, what, raw=True, mcpu="esp32s3"),
+        _elf32_code_symbols(elf)))
+    allowed = ", ".join(S3_FP_ALLOWED_SYMBOLS)
+    if bad:
+        shown = "\n".join(f"  in {sym}: {what}: {line}"
+                          for sym, what, line in bad[:8])
+        raise ToolError(f"{name}: the kernel executes FP instructions outside "
+                        f"{allowed}, or code the check cannot read:\n{shown}")
 
 
 # The start-up of a program written with `main` (`rt/main`), from its image:
@@ -22766,6 +22990,51 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_clean_exit": False,
             "expect_status": 6,
         },
+        # A kernel with an FP or PIE instruction outside the FP state's save
+        # and load, in `ktest_fp_planted`, which `kmain` calls: the
+        # disassembly of the linked image finds it
+        # (`_check_s3_kernel_fp_free`), and the build is refused. One kernel
+        # per kind: an FP move (`fp_planted.S`), an FP-option op (`add.s`),
+        # a write of FCR (`wur.fcr`), a PIE op (`ee.zero.q`), and an FP move
+        # in code with no symbol size.
+        *[{
+            "name": name,
+            "src": os.path.join(s3_tests, "fp_planted.saw"),
+            "asm": f"{name}.S",
+            "expect_build_error": "the kernel executes FP instructions "
+                                  "outside sos_fp_save, sos_fp_load, or code "
+                                  "the check cannot read:\n  in "
+                                  "ktest_fp_planted: an FP or PIE "
+                                  "instruction:",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        } for name in ("fp_planted", "fp_planted_add_s",
+                       "fp_planted_wur_fcr", "fp_planted_pie",
+                       "fp_planted_unsized")],
+        {
+            # The coprocessor-disabled trap against the record of whose area
+            # the FPU holds, driven through `hal.fp_trap` with two contexts and
+            # no process (`fp_owner.saw`): two first uses, then the trap from
+            # the thread whose area the FPU holds, which is claimed with
+            # nothing loaded, then another cause, which is not claimed, then
+            # the trap from an active thread whose area it does not hold,
+            # which stops the machine as a kernel bug.
+            "name": "fp_owner",
+            "src": os.path.join(s3_tests, "fp_owner.saw"),
+            "expect_out": [rom,
+                           "SOS fpowner: A's first use: claimed\n"
+                           "SOS fpowner: B's first use: claimed\n"
+                           "SOS fpowner: B again, the FPU holding B's state: "
+                           "claimed\n"
+                           "SOS fpowner: B with another cause: not claimed\n"
+                           "SOS-S3: kernel bug: coprocessor 0 disabled for an "
+                           "active thread whose state the FPU does not hold, "
+                           "pc=0x00000000\n",
+                           "SOS-S3: halt fail code=0x00000006"],
+            "expect_tail": "SOS-S3: halt fail code=0x00000006",
+            "expect_clean_exit": False,
+            "expect_status": 6,
+        },
         {
             # The BBPLL's bring-up (ABI.md §14d): its ROM calls go through
             # the stub and return; the emulator has no analog block, so the
@@ -25190,6 +25459,170 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_clean_exit": True,
         },
         {
+            # FP state is per thread (ABI.md §7c). Two workers of one
+            # process fill f0..f15, FCR and FSR with their own patterns
+            # and yield to each other three times each, counting the
+            # registers that stop matching; the initial thread uses none of
+            # it. The kernel's `SOS: fp first use` line is the observable for
+            # the first-use trap, and the expectations are adjacent runs so
+            # an extra trap anywhere in them breaks the match, as
+            # `fp_threads` reads them on arm64. With no save at a switch, B's
+            # fill overwrites A's registers and A reports every one wrong.
+            "name": "s3_fp_threads",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-threads"),
+            "expect_out": ["{banner}",
+                           "SOS fp: initial begin\nSOS fp: initial created\n",
+                           "SOS fp: A begin\nSOS: fp first use\n"
+                           "SOS fp: A filled\n",
+                           "SOS fp: B begin\nSOS: fp first use\n"
+                           "SOS fp: B filled\nSOS fp: A bad=0\n",
+                           "SOS fp: B bad=0\n",
+                           "SOS fp: joined a=0 b=0\nSOS fp: initial done\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A first FP use never sees another process's state. Root fills
+            # every FP register and parks on its child; the child's first FP
+            # instruction begins its read of them all, and it exits with the
+            # number that were not zero. The FPU still holds root's pattern
+            # when the child starts, so a first use that did not load the
+            # child's own zeroed state would report every register.
+            # `status=65536` is `Exited`(1) << 16 | 0.
+            "name": "s3_fp_leak",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-leak"),
+            "children": [os.path.join(TESTS_DIR, "xtensa-child-fp-leak")],
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={two}",
+                           "SOS: fp first use\nSOS fpleak: filled\n",
+                           "SOS fpleak: started\n",
+                           "SOS fpleak child: begin\nSOS: fp first use\n"
+                           "SOS fpleak child: nonzero=0\n",
+                           "SOS fpleak: woke key=44 status=65536\n",
+                           "SOS fpleak: done\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A thread that has not used the FPU costs no save. Worker C
+            # yields to worker A three times while the FPU holds A's
+            # pattern, then makes its first FP use and counts the registers
+            # that are not zero. Only a save of C's could write A's values
+            # into C's area, so a kernel that saved every outgoing thread
+            # would have C's first use load them, and `nonzero` would count
+            # every register. One run of lines: neither of C's turns takes a
+            # trap, and A's checks between them find its pattern.
+            "name": "s3_fp_inactive",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-inactive"),
+            "expect_out": ["{banner}",
+                           "SOS fpinactive: A begin\nSOS: fp first use\n"
+                           "SOS fpinactive: A filled\n"
+                           "SOS fpinactive: C begin\n"
+                           "SOS fpinactive: A bad=0\n"
+                           "SOS: fp first use\n"
+                           "SOS fpinactive: C nonzero=0\n",
+                           "SOS fpinactive: joined a=0 c=0\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The outgoing thread's FP state is saved before the idle wait,
+            # as `fp_idle_teardown` holds it on arm64. A child's second
+            # thread fills the FP registers, takes the memory its first
+            # thread's wait record lies in out of the child, arms a Timer and
+            # parks, the last thread to block: the kernel idles with it
+            # outgoing, and the fire ends the child during the idle wait. That
+            # half is a liveness check (`tests/xtensa-fp-idle` says why).
+            # Root then runs a thread of its own whose first FP use must see
+            # zeros, and which fills its own pattern and parks on a Timer,
+            # the last thread to block, and finds its pattern when the fire
+            # brings it back: a kernel that skipped the save when the switch
+            # idles would load the thread's area, never written, and `bad`
+            # would count every register.
+            "name": "s3_fp_idle_teardown",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-idle"),
+            "children": [os.path.join(TESTS_DIR, "xtensa-child-fp-idle")],
+            "pool": True,
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={three}",
+                           "SOS fpidle: the child ended with BadBuffer\n",
+                           "SOS: fp first use\n"
+                           "SOS fpidle: new thread nonzero=0\n"
+                           "SOS fpidle: new thread bad=0\n",
+                           "SOS fpidle: done\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A thread already using the FPU that clears CPENABLE itself, which
+            # the Flat tier cannot deny, runs on with its own values: with no
+            # switch before its next FP instruction, which takes the
+            # coprocessor-disabled trap and is given the coprocessor again
+            # with nothing loaded (the kernel's `SOS: fp first use` line is
+            # printed for every FP trap it claims), and with a yield to a
+            # helper thread between, whose switch away saves the state with
+            # CPENABLE clear and whose switch back loads it, so no trap. A
+            # kernel that loaded at the first would hand the thread its area,
+            # never saved, and `bad` would count every register; a save that
+            # trusted CPENABLE would fault in the kernel at the yield.
+            "name": "s3_fp_cpenable_cleared",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-cleared"),
+            "expect_out": ["{banner}",
+                           "SOS: fp first use\nSOS fpcleared: filled\n"
+                           "SOS: fp first use\n"
+                           "SOS fpcleared: cleared, no switch, bad=0\n"
+                           "SOS fpcleared: cleared, a switch, bad=0\n",
+                           "SOS fpcleared: done\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A thread slot whose last thread used the FPU comes back with
+            # its FP area zeroed. T1 fills the FP registers and exits, its
+            # state saved into its slot's area; T2 takes the slot and its
+            # first use must count no register nonzero. A `frame_init` that
+            # stopped short of the area would leave T1's state there, and its
+            # active word: T2 would take no first-use trap and read T1's.
+            "name": "s3_fp_reuse",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-fp-reuse"),
+            "expect_out": ["{banner}",
+                           "SOS: fp first use\nSOS fpreuse: T1 filled\n"
+                           "SOS: fp first use\nSOS fpreuse: T2 nonzero=0\n",
+                           "SOS fpreuse: joined t2=0\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # BR, MAC16's ACCLO, ACCHI and M0..M3, and MISC0..MISC3 travel
+            # in the trap frame (ABI.md §7c), so a new thread finds them zero
+            # although the thread before it filled them, as
+            # `register_file_clean` holds the address registers to it. A
+            # resume that did not load them would leave the new thread the
+            # filler's values.
+            "name": "s3_xregs_clean",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-xregs-clean"),
+            "expect_out": ["{banner}",
+                           "SOS xregsclean: C nonzero=0\n"
+                           "SOS xregsclean: initial bad=0\n"],
+            "expect_clean_exit": True,
+        },
+        {
+            # And each thread keeps its own across switches: two workers fill
+            # the eleven registers with their own patterns and yield to each
+            # other three times each, checking after every turn. A trap entry
+            # that did not save them would resume each worker with what its
+            # frame held before.
+            "name": "s3_xregs_hold",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-xregs-hold"),
+            "expect_out": ["{banner}",
+                           "SOS xregshold: A filled\nSOS xregshold: B filled\n"
+                           "SOS xregshold: A bad=0\nSOS xregshold: B bad=0\n",
+                           "SOS xregshold: joined a=0 b=0\n"],
+            "expect_clean_exit": True,
+        },
+        {
             # A windowed C root (ABI.md §7d): the start state its `_start`
             # reads; overflow and underflow at each call size, 40 frames
             # deep; a system call from 30 frames deep; `movsp` with its call8
@@ -26351,7 +26784,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     print(f"{BOLD}SOS ESP32-S3 board smoke{RESET}")
     print(f"  qemu   {qemu}")
     print(f"  clang  {clang}")
-    print(f"  target {s3_triple} (call0, no FPU; the Flat tier)")
+    print(f"  target {s3_triple} (a call0 kernel; the Flat tier)")
     print(f"  esp32s3-r8 runs every process case but {', '.join(s3_only)}, "
           "which read the esp32s3 board's pool base, and those built from "
           "a hand-written image, which names its board, or refused at "
@@ -26516,10 +26949,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         # The memory-SPI command layer is linked into every image and kept
         # only where it is called; where it is, none of it may be in flash,
         # and its fault record only in a fault harness's emulator image. No
-        # kernel may refer to a ROM routine that can write the flash. A
-        # refused image is deleted, so nothing refused can be written to a
-        # board from the build directory.
+        # kernel may refer to a ROM routine that can write the flash, and
+        # none may execute an FP or boolean instruction outside the FP
+        # state's save and load. A refused image is deleted, so nothing
+        # refused can be written to a board from the build directory.
         try:
+            _check_s3_kernel_fp_free(elf, clang, case["name"])
             check_iram(mspi_object(variant(case)), elf)
             with open(elf, "rb") as f:
                 check_psram_fault(case["name"], elf_symbols(f.read()),

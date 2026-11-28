@@ -74,6 +74,11 @@ probe_state:
 
 /* ---- the probe's vector table (IRAM) ------------------------------------ */
 
+/* Every vector has a label, as in `boot.S`: the runner's FP check
+ * disassembles the image, and the disassembler decodes from each label
+ * afresh rather than from wherever the zero fill before it left the
+ * decoding. */
+
     .section .text.vectors, "ax"
     .literal .Lv_state, probe_state
     .literal .Lv_kstack, _stack_top
@@ -83,47 +88,62 @@ probe_state:
     .global probe_vector_base
 probe_vector_base:
     .org    0x000
+probe_vector_000:
     movi    a2, 0x000               /* WindowOverflow4 */
     j       probe_fatal
     .org    0x040
+probe_vector_040:
     movi    a2, 0x040               /* WindowUnderflow4 */
     j       probe_fatal
     .org    0x080
+probe_vector_080:
     movi    a2, 0x080               /* WindowOverflow8 */
     j       probe_fatal
     .org    0x0C0
+probe_vector_0c0:
     movi    a2, 0x0C0               /* WindowUnderflow8 */
     j       probe_fatal
     .org    0x100
+probe_vector_100:
     movi    a2, 0x100               /* WindowOverflow12 */
     j       probe_fatal
     .org    0x140
+probe_vector_140:
     movi    a2, 0x140               /* WindowUnderflow12 */
     j       probe_fatal
     .org    0x180
+probe_vector_180:
     movi    a2, 0x180               /* Level 2 */
     j       probe_fatal
     .org    0x1C0
+probe_vector_1c0:
     movi    a2, 0x1C0               /* Level 3 */
     j       probe_fatal
     .org    0x200
+probe_vector_200:
     movi    a2, 0x200               /* Level 4 */
     j       probe_fatal
     .org    0x240
+probe_vector_240:
     movi    a2, 0x240               /* Level 5 */
     j       probe_fatal
     .org    0x280
+probe_vector_280:
     movi    a2, 0x280               /* Debug */
     j       probe_fatal
     .org    0x2C0
+probe_vector_2c0:
     movi    a2, 0x2C0               /* NMI */
     j       probe_fatal
     .org    0x300
+probe_vector_300:
     j       probe_kernel_exception  /* Kernel: a trap taken with PS.UM = 0 */
     .org    0x340
+probe_vector_340:
     movi    a2, 0x340               /* User: the probe never runs user code */
     j       probe_fatal             /* with this table installed */
     .org    0x3C0
+probe_vector_3c0:
     movi    a2, 0x3C0               /* Double: a trap taken with PS.EXCM = 1 */
     j       probe_fatal
     .org    0x400

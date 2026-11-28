@@ -4091,14 +4091,28 @@ profile of §5b.1 — three gate runs — and any run failing is red.
 - **The ESP32-S3's trap entry** (Xtensa, a call0 kernel, call0 or windowed
   images) is the user vector: `syscall` and level-1 interrupts taken with
   PS.UM = 1 arrive there, and `EXCSAVE1` holds the running thread's frame
-  address. A 76-word frame saves PC, PS, the whole 64-register file (the
+  address. An 87-word frame saves PC, PS, the whole 64-register file (the
   current window and the other 48 by their position from `WINDOWBASE`),
-  `WINDOWBASE`, `WINDOWSTART`, `SAR`, the loop registers, `SCOMPARE1` and
-  `THREADPTR`; a windowed thread's window spill and fill handlers run in its
+  `WINDOWBASE`, `WINDOWSTART`, `SAR`, the loop registers, `SCOMPARE1`,
+  `THREADPTR`, and the registers no coprocessor gates: `BR`, MAC16's
+  `ACCLO`, `ACCHI` and `M0..M3`, and `MISC0..3`; so each thread keeps its own
+  and a new thread finds them zero. A windowed thread's window spill and fill
+  handlers run in its
   own context without entering the kernel. The kernel runs with PS.UM = 0 and
   INTLEVEL 15, so a trap it
   takes arrives at another vector, which is `kernel_fault`, and no interrupt
   is ever delivered to it. Semihosting `SYS_exit` stops the machine.
+- **The ESP32-S3's FP contract** is Profile B's, on coprocessor 0: the kernel
+  executes no FP or PIE instruction (sawc emits none for the triple, the
+  kernel's C is built with the `-fp` target feature, and the runner
+  disassembles every S3 kernel image and rejects one outside the two
+  user-state save and load routines), so a trap never disturbs a thread's
+  f0..f15, `FCR` or `FSR`, and the trap frame carries `BR`. `CPENABLE` is 0
+  for a thread until its first FP instruction, which traps with EXCCAUSE 32
+  and loads the thread's zeroed state (never the previous thread's, whichever
+  process it belonged to) and enables the coprocessor; a switch saves the
+  outgoing thread's state and installs the incoming one's. §7 has the switch
+  path, and what a process that writes `CPENABLE` itself gets.
 - **Profile B's FP/SIMD contract:** the kernel executes no FP/SIMD instruction
   (sawc builds without them, the kernel's C is built with
   `-mgeneral-regs-only`, and the runner disassembles every arm64 kernel image
@@ -4309,14 +4323,11 @@ arm their own.
   `resume_after_death`, after a teardown. Every thread belongs to a Process: a
   kernel that could enter user mode without a Process would have syscalls no
   handle table answers.
-- **User FP/SIMD state travels with the thread, on Profile B.** Profile A has no
-  FPU, so there is none to carry, and the ESP32-S3 profile leaves its FPU
-  disabled (`CPENABLE` = 0), so an FP instruction there is a fault for a process
-  that leaves `CPENABLE` alone. That tier is `Flat` and cannot stop a process
-  setting it; one that does runs FP instructions with nothing to carry its FP
-  state across a switch, which the tier disclaims. The trap frame holds general
-  registers only, and the kernel executes no FP/SIMD instruction, so a trap that
-  resumes the same thread (an interrupt included) saves nothing. Each thread's
+- **User FP/SIMD state travels with the thread, on Profile B and the
+  ESP32-S3.** Profile A has no FPU, so there is none to carry. On Profile B
+  the trap frame holds general registers only, and the kernel executes no
+  FP/SIMD instruction, so a trap that resumes the same thread (an interrupt
+  included) saves nothing. Each thread's
   V0-V31, `FPCR` and `FPSR` live in an area after its frame, in its own slot,
   and a new thread's area is zero. The area also holds the thread's `TPIDR_EL0`,
   which the kernel never uses: every switch saves the outgoing thread's and
@@ -4331,6 +4342,28 @@ arm their own.
   thread that never uses FP/SIMD pays only the thread register's word, which
   every switch saves and loads. The first-use trap is not a
   syscall, interrupt or fault and no `Stats` column counts it.
+
+  The ESP32-S3 keeps the same scheme for its FPU, coprocessor 0: a thread's
+  f0..f15, `FCR` and `FSR` live in an area after its trap frame, within its
+  512-byte slot, zero for a new thread; `BR`, which the FP compares write, is
+  no coprocessor's and is in the trap frame. `CPENABLE` is 0 for a thread that has not used the FPU, so its
+  first FP instruction traps (EXCCAUSE 32), and the kernel marks it active,
+  loads its area and enables the coprocessor, and the thread resumes at that
+  instruction. A switch saves an active outgoing thread's state, at the same
+  point Profile B's does, and loads an active incoming thread's, or writes
+  `CPENABLE` = 0 for an inactive one; a thread that never uses the FPU pays one
+  compare and that write. The thread register is `THREADPTR`, in the trap
+  frame. The tier is `Flat` and cannot stop a process writing `CPENABLE`. An
+  active thread that clears it takes EXCCAUSE 32 at its next FP instruction;
+  the kernel records whose state it last loaded into the FPU, finds it the
+  thread's own, and enables the coprocessor again with nothing loaded, so
+  the thread runs on with its values, as it would after a switch. The same
+  trap from an active thread whose state the FPU does not hold is a kernel
+  bug, which no switch leaves, and stops the machine. A thread that sets
+  `CPENABLE` before its first use runs FP instructions without being active:
+  it reads the last active thread's f0..f15, `FCR` and `FSR`, possibly
+  another process's, and keeps none of its own across a switch, which the
+  tier disclaims.
 - **Protection is installed at the switch.** A process's rows are data in its
   body. On a replay tier (`hal.prot_replay_at_switch()` true: Profile A, which
   has a small fixed budget of numbered regions) the scheduler replays them when

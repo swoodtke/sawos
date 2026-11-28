@@ -740,6 +740,19 @@ The numbers are what the probes read on the emulator. The names are the
 Xtensa ISA's, as esp-idf's `xtensa/corebits.h` spells them; `StoreProhibited`
 is 29 there and was not seen.
 
+Cause 32 is not a fault. Every thread runs with `CPENABLE = 0` until its first
+FP instruction, which raises it, and the kernel claims it as that thread's
+first use (§7c): `lib.saw`'s `fp_trap` loads the thread's FP state, enables
+coprocessor 0 and resumes at the same instruction, and the kernel prints
+`SOS: fp first use`, as it does for every FP trap it claims. Cause 32 from a
+thread that has already used the FPU comes from a process that cleared
+`CPENABLE` itself: the FPU still holds the thread's state, which the kernel
+knows from its record of whose area it last loaded, so `fp_trap` enables
+coprocessor 0 again, loads nothing, and the thread runs on. From an active
+thread whose state the FPU does not hold, which no switch leaves, it is a
+kernel bug and stops the machine, status 6 (`SOS-S3: kernel bug: coprocessor
+0 disabled for an active thread whose state the FPU does not hold`).
+
 On silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`), `bus_probe`'s
 refusals (§3c):
 
@@ -1118,7 +1131,9 @@ F_EXCCAUSE 88   F_EXCVADDR 92   F_SCOMPARE1 96   F_THREADPTR 100
 F_WINDOWBASE 104   F_WINDOWSTART 108
 F_AR 112..300      48 words: word k is AR[(4 * WINDOWBASE + 16 + k) mod 64],
                    panes WINDOWBASE + 4 to + 15
-FRAME_BYTES 304    (76 words; the kernel's per-thread stride stays 512)
+F_BR 304   F_ACCLO 308   F_ACCHI 312   F_M0..F_M3 316..328
+F_MISC0..F_MISC3 332..344
+TRAP_FRAME_BYTES 348  (87 words; the thread's FP area follows it, below)
 ```
 
 The minimum a switch must save for a call0 thread with `-fp` is `a0..a15`,
@@ -1131,10 +1146,87 @@ kernel needs no idea of a thread's convention, and every resume loads all
 readable (the smoke's `register_file_clean` reads all 64 at a thread's
 first instruction). `LBEG`/`LEND`/`LCOUNT` are saved because user code built
 elsewhere may loop, and `THREADPTR` because it is per-thread by definition.
-MAC16, `BR`, `MISC0..3` and the FPU need saving only if a thread is allowed
-to use them; with `CPENABLE = 0` an FP instruction traps (cause 32), which is
-where a lazy FP switch would hook in. The trap path never writes a user
-stack; the window vectors (§7d) do, through the thread's own registers.
+`BR` (the Boolean option's, which the FP compares write), MAC16's `ACCLO`,
+`ACCHI` and `M0..M3`, and `MISC0..3` are no coprocessor's, so any thread can
+read and write them without a trap: the frame carries them, so each thread
+keeps its own across a switch and a new thread finds them zero (the smoke's
+`s3_xregs_hold` and `s3_xregs_clean`). They are the words ESP-IDF's frame
+keeps beside `SCOMPARE1` and `THREADPTR` (`XT_STK_EXTRA`), and the four MISC
+registers, which it keeps nowhere. The FPU's state lives in the FP area
+below, which a switch moves and a trap does not. The trap path never writes
+a user stack; the window vectors (§7d) do, through the thread's own
+registers.
+
+**The FP area.** A thread's slot holds its frame and, after it, its FP area:
+
+```
+TRAP_FRAME_BYTES 348   the frame above
+FP area at 348:  f0..f15 0..60   FCR 64   FSR 68   active 72
+FP_AREA_BYTES 76
+FRAME_BYTES 424        frame and area: within the kernel's 512-byte stride
+```
+
+`lib.saw` states the offsets once and `boot.S`'s `sos_fp_save` and
+`sos_fp_load` use them; a `static_assert` there holds `FRAME_BYTES` within
+512, the kernel's stride unit (`kcore.limits`' `THREAD_FRAME_STRIDE` is
+`FRAME_BYTES` rounded up to it). Whose area the FPU holds is one word for the
+machine, not one per area: `sos_fp_load` writes the area's address into
+`boot.S`'s `sos_fp_owner_area`, and nothing else writes it or the FP
+registers.
+
+**The first-use rule.** The FPU is coprocessor 0, and `CPENABLE` bit 0 gates
+it for every mode alike, there being no privilege (§5e). The kernel executes
+no FP instruction outside `sos_fp_save` and `sos_fp_load`: sawc emits none
+for this triple, the kernel's C is built with the `-fp` target feature
+(§1a), and the runner disassembles every S3 kernel image and refuses one
+with an FP or PIE instruction anywhere else (`_check_s3_kernel_fp_free`).
+The check decides which bytes are code before it decides which are literal
+pools: a sized function's bytes, and whatever is reached from a symbol
+through fall-through and PC-relative targets, are code, and a literal is a
+word an `l32r` of that code loads. It reads the generic Xtensa table, which
+decodes every special register the kernel uses, and reads a line that table
+cannot decode again in the ESP32-S3's, which knows the PIE ops; a line
+neither decodes, or bytes that are neither code, a literal nor padding, are
+refused too. The smoke's `fp_planted` cases plant an FP move, an `add.s`, a
+`wur.fcr`, a PIE `ee.zero.q` and an FP move in unsized code, and each is
+refused. So a trap never disturbs a thread's FP state, and a trap that
+resumes the same thread saves and loads none of it.
+
+- `frame_init` zeroes the area with the frame, so a new thread is not
+  active. `_start` writes `CPENABLE = 0`.
+- A thread's first FP instruction raises cause 32 (§5c). `fp_trap` marks it
+  active and loads its area into f0..f15, `FCR` and `FSR`, which leaves
+  coprocessor 0 enabled, and the thread resumes at that instruction.
+  Enabling always loads: the FPU holds the last active thread's values,
+  possibly another process's, and the area is zero until the thread's first
+  switch-out, so a first use reads zeros.
+- At a switch `kcore.sched.pick_next` calls `fp_switch_out`, which saves the
+  outgoing thread's state if it is active, before the idle wait and before an
+  exited thread's slot is freed; `run_thread` calls `fp_switch_in`, which
+  loads the incoming thread's state if it is active and otherwise writes
+  `CPENABLE = 0`. A thread that never uses the FPU costs one compare at a
+  switch-out and a `CPENABLE` write at a switch-in.
+- The save and the load set `CPENABLE` bit 0 themselves before their first FP
+  instruction, and a switch to an inactive thread writes the register
+  whatever the kernel last wrote: a process can write `CPENABLE` (§5e), so
+  the kernel trusts no copy of it. An active thread that clears it takes
+  cause 32 at its next FP instruction, and `fp_trap` sets it again with
+  nothing loaded, the FPU holding that thread's state (§5c); a switch in
+  between saves and loads as for any active thread. A thread that sets it
+  before its first use runs FP instructions without being active: it reads
+  the last active thread's f0..f15, `FCR` and `FSR`, possibly another
+  process's, and keeps none of its own across a switch. That is within the
+  Flat tier's disclaimer, which cannot deny the write.
+
+The smoke's cases: `s3_fp_threads` (two threads keep their values),
+`s3_fp_leak` (a child's first use reads zeros with root's values in the
+FPU), `s3_fp_inactive` (a thread switched out before its first use is not
+saved), `s3_fp_idle_teardown` (the save before the idle wait), `s3_fp_reuse`
+(a slot whose last thread used the FPU comes back zeroed),
+`s3_fp_cpenable_cleared` (an active thread that clears `CPENABLE`, with and
+without a switch before its next use), `fp_owner` (the trap against the
+record of whose area the FPU holds, the kernel bug included) and the
+`fp_planted` refusals.
 
 The entry and exit:
 
@@ -1143,7 +1235,8 @@ user vector:  xsr a1, excsave1         ; a1 = this thread's frame
               s32i a0 -> F_A0 ; EXCCAUSE 5 -> the Alloca path (§7d)
 trap entry:   save a2..a15, then excsave1 -> F_A1, epc1, ps, sar,
                 lbeg, lend, lcount, exccause, excvaddr, scompare1,
-                threadptr, windowbase, windowstart
+                threadptr, windowbase, windowstart, br, acclo, acchi,
+                m0..m3, misc0..misc3
               wsr lcount <- 0          ; see below
               4 times: mov a13, a1 ; rotw 3 ; a4..a15 -> F_AR + 48 * i
               wsr ps <- 0x0F           ; the kernel, on window WINDOWBASE + 12
@@ -1184,11 +1277,11 @@ The cost, counted on the assembled code (straight-line, the user vector to
 `callx0 ktrap`, and `sos_resume_frame` to `rfe`):
 
 ```
-                         26-word frame   76-word frame
-vector to ktrap                50              112
-resume to rfe                  37              100
-round trip                     87              212
-.text.vectors (IRAM)        1303 B          1777 B
+                         26-word frame   87-word frame
+vector to ktrap                50              134
+resume to rfe                  37              122
+round trip                     87              256
+.text.vectors (IRAM)        1303 B          1960 B
 ```
 
 `sos_windowed_call` (§7g) is 144 bytes of IRAM and two literal words, in an
@@ -1899,6 +1992,22 @@ a board" is the order to find out in.
   exception. esp-idf's S3 `tie.h` makes PIE coprocessor 3 (`cop_ai`,
   `XCHAL_CP_MASK` 0x09), so expect `CPENABLE` bit 3 to gate it on silicon.
   Nothing this tree builds emits a PIE instruction.
+- **The FPU, `BR` and MAC16.** *Here:* `wfr` with `CPENABLE = 0` raises
+  cause 32 (§5c), at the user vector with EPC1 the instruction, and the
+  smoke's FP cases run the whole first-use path on it: f0..f15, `FCR`'s
+  rounding mode and `FSR`'s flags hold what is written and survive the save
+  and the load. `rsr br` executes with `CPENABLE = 0`, with no trap, and
+  reads the last value written, another process's included: probed by a
+  thread whose first instruction read `BR`, which found the value a thread
+  of another process had left and took the first-use trap only at its next
+  instruction, an `rfr`. That is why the trap frame carries `BR`, and
+  MAC16's registers and `MISC0..3` with it (§7c), which no coprocessor gates
+  either. *Prepared for:* that `BR` and MAC16 are outside coprocessor 0 on
+  the part too, as the ISA's Boolean and MAC16 options have them and
+  ESP-IDF's frame assumes. *Unprobed on silicon:* cause 32 itself, which of
+  `FCR`'s and `FSR`'s bits are writable, and whether `rur fcr` and `rur fsr`
+  trap with `CPENABLE = 0`; the save and the load set bit 0 before either,
+  so the answer changes nothing the kernel does.
 - **The CPU's configuration ID.** `CONFIGID1` reads `0x23090f1f` here, which
   is `XCHAL_HW_CONFIGID1` in esp-idf's S3 `core-isa.h`. The ROM ELF's
   `xthals_hw_configid1` is `0x23086d67`, the configuration that ROM was built

@@ -1,0 +1,84 @@
+// A new thread finds BR, MAC16's ACCLO, ACCHI and M0..M3, and MISC0..MISC3
+// zero, on the ESP32-S3, although the thread that ran before it filled them
+// (`../xtensa/extra_regs.S`), as `register_file_clean` holds the address
+// registers to it.
+//
+// No coprocessor gates these eleven registers, so they travel in the trap
+// frame, and `frame_init` zeroes a new thread's. The initial thread fills them
+// with its pattern, starts thread C and joins it; C's first act is to count
+// the eleven that are not zero. Then the initial thread checks its own
+// pattern, which C's run must not have disturbed:
+//
+//   SOS xregsclean: C nonzero=0
+//   SOS xregsclean: initial bad=0
+//
+// A resume that did not load the eleven would leave C the initial thread's
+// values, and `nonzero` would count every one.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func xregs_fill(seed: UInt)
+    func xregs_check(seed: UInt) -> UInt
+    func xregs_nonzero() -> UInt
+}
+
+/// The boot handle, parked by the initial thread for C; also the witness that
+/// a thread is C.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK_C: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// The initial thread's pattern: every register `xregs_fill` writes comes out
+/// nonzero.
+static SEED: UInt = 0x2B2B_1357
+
+static NO_VALUE: UInt = 0xFFFF
+
+func stack_c_top() unsafe -> UInt {
+    let base = ((&var STACK_C) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// C: count the registers that are not zero, and exit with the count.
+func thread_c() unsafe {
+    let nonzero = xregs_nonzero()
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    print("SOS xregsclean: C nonzero={}", nonzero)
+    let _ = (move me).exit(nonzero)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS xregsclean: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    xregs_fill(SEED)
+    let c = try proc.thread_create(stack_top: stack_c_top(), arg: 1) catch {
+        print("SOS xregsclean: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = c.start()
+    let rc: UInt = try c.join() catch { NO_VALUE }
+    print("SOS xregsclean: initial bad={}", xregs_check(SEED))
+    let _ = proc.exit(rc)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        initial(arg)
+    } else {
+        thread_c()
+    }
+}

@@ -1,0 +1,113 @@
+// Each thread keeps its own BR, MAC16's ACCLO, ACCHI and M0..M3, and
+// MISC0..MISC3 across switches, on the ESP32-S3.
+//
+// Two workers of one process each fill the eleven registers with their own
+// pattern (`xregs_fill`, `../xtensa/extra_regs.S`), yield to each other three
+// times, and count the registers that no longer hold it (`xregs_check`). The
+// kernel arms no timer, so every switch is a yield and every check runs after
+// the other worker has run with its own values:
+//
+//   SOS xregshold: A filled
+//   SOS xregshold: B filled
+//   SOS xregshold: A bad=0
+//   SOS xregshold: B bad=0
+//   SOS xregshold: joined a=0 b=0
+//
+// A trap entry that did not save the eleven would resume each worker with
+// what its frame held before, and `bad` would count them.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func xregs_fill(seed: UInt)
+    func xregs_check(seed: UInt) -> UInt
+}
+
+/// The boot handle, parked by the initial thread for the workers; also the
+/// witness that a thread is a worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+/// Distinct per worker in every register `xregs_fill` writes.
+static SEED_A: UInt = 0x1111_0001
+static SEED_B: UInt = 0x2222_0002
+
+static TURNS: Int = 3
+static NO_VALUE: UInt = 0xFFFF
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+/// A worker: fill, then yield and check `TURNS` times. Its exit value is the
+/// number of mismatching registers it saw, summed over the checks.
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let seed = if role == ROLE_A { SEED_A } else { SEED_B }
+    let tag = if role == ROLE_A { "A" } else { "B" }
+    xregs_fill(seed)
+    print("SOS xregshold: {} filled", tag)
+    var bad: UInt = 0
+    var turn = 0
+    while turn < TURNS {
+        let _ = me.yield_now()
+        bad = bad + xregs_check(seed)
+        turn = turn + 1
+    }
+    print("SOS xregshold: {} bad={}", tag, bad)
+    let _ = (move me).exit(bad)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS xregshold: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        print("SOS xregshold: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) catch {
+        print("SOS xregshold: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = a.start()
+    let _ = b.start()
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    print("SOS xregshold: joined a={} b={}", ra, rb)
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

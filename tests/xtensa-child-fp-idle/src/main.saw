@@ -1,0 +1,214 @@
+// Test child: its last thread to block has used the FPU, and the kernel idles
+// with that thread outgoing, on the ESP32-S3.
+//
+// The first thread maps the piece the launcher gave it, starts a second
+// thread, and parks on the launcher's Waiter with its wait record in the
+// piece. The second thread fills f0..f15, FCR and FSR (`fp_fill`), takes
+// the piece out of this process, arms the Timer the launcher gave it, and
+// parks on a Waiter of its own that nothing signals. It is the last thread to
+// block, so nothing is runnable and the kernel idles with it as the outgoing
+// thread. The Timer's fire is delivered there and finds the first thread's
+// record gone, which ends this process with `BadBuffer` while the second
+// thread's slot is the scheduler's outgoing one.
+//
+// It works at the C altitude because the wait record is an address this
+// program picks, which the typed tier never lets a caller name.
+
+import sos.{System, MapAccess, EventMode, ALL_RIGHTS,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_process_waiter_create,
+            sos_process_event_create, sos_waiter_add, sos_waiter_wait,
+            sos_event_receive, sos_memory_map, sos_mapping_unmap,
+            sos_timer_arm}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+}
+
+/// The tags the launcher gives things under.
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+static TAG_PIECE: UInt = 36
+static TAG_TIMER: UInt = 38
+
+/// The step before the wait that is under test was refused.
+static EXIT_SETUP: UInt = 97
+/// The wait came back where the kernel had to end this process.
+static EXIT_SURVIVED: UInt = 99
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// The words in a boot-handle record, and in the buffers a wait answers into.
+static BOOT_WORDS: Int = 3
+static REPLY_WORDS: Int = 64
+
+/// The Timer's arm record: the delay, then the interval, which is zero for a
+/// one-shot.
+static ARM_WORDS: Int = 2
+
+/// How soon the Timer fires. Nothing depends on how long it takes: the
+/// launcher waits for this process's death, whenever the fire comes.
+static DELAY_NS: UInt64 = 2_000_000
+
+/// The key the second thread's own Event is attached under.
+static KEY_SELF: UInt = 61
+
+static SEED: UInt = 0x3333_0007
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// What the launcher gave, and what the second thread needs.
+unsafe static var BOOT: UInt = 0
+unsafe static var PROC: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var WAITER: UInt = 0
+unsafe static var PIECE: UInt = 0
+unsafe static var TIMER: UInt = 0
+unsafe static var MAPPING: UInt = 0
+unsafe static var OWN_WAITER: UInt = 0
+unsafe static var OWN_EVENT: UInt = 0
+
+unsafe static var REPLY: [UInt; REPLY_WORDS] = [0; REPLY_WORDS]
+
+/// The second thread's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static STACK_ALIGN: UInt = 16
+
+/// Bytes in a `UInt` (the boot records and the reply buffer are made of them)
+/// and in a `UInt64` (the stack and the Timer's arm record).
+static BYTES_PER_WORD: UInt = 4
+static BYTES_PER_DOUBLEWORD: UInt = 8
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_DOUBLEWORD
+    top - (top % STACK_ALIGN)
+}
+
+/// This process's own Process handle as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * BYTES_PER_WORD
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_WAITER {
+            WAITER = word
+        } else if tag == TAG_PIECE {
+            PIECE = word
+        } else if tag == TAG_TIMER {
+            TIMER = word
+        }
+    }
+}
+
+func wait_at(waiter: UInt, at: UInt) unsafe -> UInt {
+    sos_waiter_wait(waiter, at as UnsafePointer<UInt>,
+                    (REPLY_WORDS as UInt) * BYTES_PER_WORD)
+}
+
+func reply_buffer() unsafe -> UInt {
+    ((&var REPLY) as UnsafePointer<UInt>) as UInt
+}
+
+/// A Waiter of this process's own with an Event attached that nothing signals.
+func make_own_waiter() unsafe -> Bool {
+    let waiter_out = (&var OWN_WAITER) as UnsafePointer<UInt>
+    if sos_process_waiter_create(PROC, waiter_out) != STATUS_OK {
+        return false
+    }
+    let event_out = (&var OWN_EVENT) as UnsafePointer<UInt>
+    let made = sos_process_event_create(PROC, EventMode.Or as UInt, event_out)
+    if made != STATUS_OK {
+        return false
+    }
+    sos_waiter_add(OWN_WAITER, OWN_EVENT, KEY_SELF, 0) == STATUS_OK
+}
+
+/// The second thread: use FP/SIMD, take the piece out of this process, arm the
+/// Timer, and park with nothing left to run.
+func worker() unsafe {
+    fp_fill(SEED)
+    let _ = sos_mapping_unmap(MAPPING)
+    var record: [UInt64; ARM_WORDS] = [DELAY_NS, 0]
+    let armed = sos_timer_arm(TIMER, (&var record) as UnsafePointer<UInt64>,
+                              (ARM_WORDS as UInt) * BYTES_PER_DOUBLEWORD)
+    if armed != STATUS_OK {
+        let _ = sos_process_exit(PROC, EXIT_SETUP)
+        return
+    }
+    let _ = wait_at(OWN_WAITER, reply_buffer())
+    let _ = sos_process_exit(PROC, EXIT_SURVIVED)
+}
+
+func first(boot_handle: UInt) unsafe {
+    BOOT = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    PROC = proc
+    drain(proc)
+    if sos_memory_map(PIECE, proc, RW as UInt, 0,
+                      (&var MAPPING) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    if not make_own_waiter() {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let me = try system.process_self() catch {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let second = try me.thread_create(stack_top: stack_top(), arg: 1) catch {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let _ = second.start()
+    // Parks here, with the record in the piece. The second thread runs next,
+    // since nothing else is runnable.
+    let _ = wait_at(WAITER, ADDR)
+    let _ = sos_process_exit(proc, EXIT_SURVIVED)
+}
+
+/// Whether this thread is the second one: the first parks the boot handle.
+func is_worker() unsafe -> Bool {
+    BOOT != 0
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if not is_worker() {
+        first(arg)
+    } else {
+        worker()
+    }
+}

@@ -45,6 +45,10 @@
  *      without a fetch through the flash cache (the `pll80` clock key).
  *   8. `sos_idle_wait`, the kernel's idle sleep: `waiti 0`, and the kernel
  *      vector's return from the interrupt that ends it.
+ *   9. `sos_fp_save` and `sos_fp_load`, which move a thread's FP state
+ *      between the FPU and its FP area at a switch, `sos_fp_enable` and
+ *      `sos_fp_owner`. The save and the load are the only kernel code that
+ *      executes an FP instruction.
  *
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
@@ -99,6 +103,13 @@
     /* The other 48 physical registers: word k is AR[(4 * WINDOWBASE + 16 + k)
      * mod 64], panes WINDOWBASE + 4 to + 15 in order. */
     .equ F_AR,          112
+    /* The registers no coprocessor gates: BR, MAC16's ACCLO, ACCHI and
+     * M0..M3, and MISC0..MISC3. */
+    .equ F_BR,          304
+    .equ F_ACCLO,       308
+    .equ F_ACCHI,       312
+    .equ F_M0,          316         /* M0..M3 at 316 + 4*n */
+    .equ F_MISC0,       332         /* MISC0..MISC3 at 332 + 4*n */
 
     /* The kernel's PS: INTLEVEL = 15, EXCM = 0, UM = 0, WOE = 0. */
     .equ PS_KERNEL,     0x0F
@@ -210,8 +221,9 @@ _start:
     wsr     a2, windowbase
     rsync
 
-    /* The FPU off, whatever the ROM left: no image on this profile is built
-     * to use it, so an FP instruction is a coprocessor-disabled fault. */
+    /* The FPU off, whatever the ROM left: no thread has used it yet, so a
+     * thread's first FP instruction is the coprocessor-disabled trap that
+     * gives it its own FP state (`lib.saw`'s `fp_trap`). */
     movi    a9, 0
     wsr     a9, cpenable
     rsync
@@ -336,7 +348,12 @@ _vector_base:
      * caller is always spilled before k, so its base save area holds it.
      * They store and load through the thread's own registers only, so a bad
      * stack is a fault inside a handler, which the double vector below
-     * reports as the thread's. */
+     * reports as the thread's.
+     *
+     * Every vector has a label. The runner's FP check disassembles the
+     * image, and the disassembler decodes from each label afresh, so each
+     * vector is read from its own first byte rather than from wherever the
+     * zero fill before it left the decoding. */
     .org    0x000
 _WindowOverflow4:
     s32e    a0, a5, -16
@@ -408,24 +425,31 @@ _WindowUnderflow12:
     l32e    a11, a11, -20
     rfwu
     .org    0x180
+_Level2Vector:
     movi    a2, 0x180               /* Level 2 */
     j       vec_fatal
     .org    0x1C0
+_Level3Vector:
     movi    a2, 0x1C0               /* Level 3 */
     j       vec_fatal
     .org    0x200
+_Level4Vector:
     movi    a2, 0x200               /* Level 4 */
     j       vec_fatal
     .org    0x240
+_Level5Vector:
     movi    a2, 0x240               /* Level 5 */
     j       vec_fatal
     .org    0x280
+_DebugVector:
     movi    a2, 0x280               /* Debug */
     j       vec_fatal
     .org    0x2C0
+_NMIVector:
     movi    a2, 0x2C0               /* NMI */
     j       vec_fatal
     .org    0x300
+_KernelExceptionVector:
     wsr     a0, excsave1            /* Kernel: a trap taken with PS.UM = 0 */
     rsr     a0, exccause
     bnei    a0, EXCCAUSE_ALLOCA, 1f
@@ -440,6 +464,7 @@ _UserExceptionVector:
     j       user_alloca
 1:  j       trap_entry
     .org    0x3C0
+_DoubleExceptionVector:
     rsr     a0, depc                /* Double: a trap taken with PS.EXCM = 1 */
     j       double_entry
     .org    0x400
@@ -623,6 +648,28 @@ trap_entry:
     s32i    a2, a1, F_WINDOWBASE
     rsr     a2, windowstart
     s32i    a2, a1, F_WINDOWSTART
+    rsr     a2, br
+    s32i    a2, a1, F_BR
+    rsr     a2, acclo
+    s32i    a2, a1, F_ACCLO
+    rsr     a2, acchi
+    s32i    a2, a1, F_ACCHI
+    rsr     a2, m0
+    s32i    a2, a1, F_M0
+    rsr     a2, m1
+    s32i    a2, a1, F_M0 + 4
+    rsr     a2, m2
+    s32i    a2, a1, F_M0 + 8
+    rsr     a2, m3
+    s32i    a2, a1, F_M0 + 12
+    rsr     a2, misc0
+    s32i    a2, a1, F_MISC0
+    rsr     a2, misc1
+    s32i    a2, a1, F_MISC0 + 4
+    rsr     a2, misc2
+    s32i    a2, a1, F_MISC0 + 8
+    rsr     a2, misc3
+    s32i    a2, a1, F_MISC0 + 12
 
     /* The zero-overhead loop is address-triggered: with LCOUNT non-zero,
      * kernel code reaching the user's LEND address (shared code in a flat
@@ -681,6 +728,28 @@ sos_resume_frame:
     mov     a1, a2
     l32i    a2, a1, F_SAR
     wsr     a2, sar
+    l32i    a2, a1, F_BR
+    wsr     a2, br
+    l32i    a2, a1, F_ACCLO
+    wsr     a2, acclo
+    l32i    a2, a1, F_ACCHI
+    wsr     a2, acchi
+    l32i    a2, a1, F_M0
+    wsr     a2, m0
+    l32i    a2, a1, F_M0 + 4
+    wsr     a2, m1
+    l32i    a2, a1, F_M0 + 8
+    wsr     a2, m2
+    l32i    a2, a1, F_M0 + 12
+    wsr     a2, m3
+    l32i    a2, a1, F_MISC0
+    wsr     a2, misc0
+    l32i    a2, a1, F_MISC0 + 4
+    wsr     a2, misc1
+    l32i    a2, a1, F_MISC0 + 8
+    wsr     a2, misc2
+    l32i    a2, a1, F_MISC0 + 12
+    wsr     a2, misc3
     l32i    a2, a1, F_LBEG
     wsr     a2, lbeg
     l32i    a2, a1, F_LEND
@@ -746,6 +815,108 @@ sos_resume_frame:
     l32i    a15, a1, F_A15
     l32i    a1, a1, F_A1            /* user a1 last: it retires the frame */
     rfe
+
+/* ---- a thread's FP state ------------------------------------------------ */
+
+/* The FPU is coprocessor 0. A thread's FP state is f0..f15, FCR and FSR, and
+ * it lives in the thread's FP area, after its trap frame (`lib.saw`'s
+ * `FP_AREA_BYTES` and the offsets below). These run at a switch and at a
+ * thread's first-use trap, called from `lib.saw`; the trap entry and the
+ * restore path save and restore none of it.
+ *
+ * The save and the load set CPENABLE bit 0 before their first FP instruction
+ * rather than trust what the register holds: a process can write CPENABLE
+ * itself, and these run in the kernel, whose FP instructions trap under the
+ * same bit. Both leave it set. The load records the area it loaded in
+ * `sos_fp_owner_area`, which only it writes: what the FPU holds, whatever
+ * CPENABLE says (`lib.saw`'s `fp_trap` reads it through `sos_fp_owner`).
+ * All four are call0 leaves; the save, the load and `sos_fp_enable` clobber
+ * a3, and the load and `sos_fp_enable` a4 too. f0..f15 hold a thread's
+ * state, never the kernel's. */
+    .equ FP_FCR,        64          /* after f0..f15, at 4 * n */
+    .equ FP_FSR,        68
+
+    .macro SAVEF n
+    ssi     f\n, a2, 4 * \n
+    .endm
+    .macro LOADF n
+    lsi     f\n, a2, 4 * \n
+    .endm
+
+/* void sos_fp_save(u32 area) */
+    .section .text.sos_fp_save, "ax"
+    .align  4
+    .global sos_fp_save
+    .type   sos_fp_save, @function
+sos_fp_save:
+    movi    a3, 1
+    wsr     a3, cpenable
+    rsync
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    SAVEF   \n
+    .endr
+    rur     a3, fcr
+    s32i    a3, a2, FP_FCR
+    rur     a3, fsr
+    s32i    a3, a2, FP_FSR
+    ret
+    .size   sos_fp_save, . - sos_fp_save
+
+/* void sos_fp_load(u32 area) */
+    .section .text.sos_fp_load, "ax"
+    .literal .Lfp_owner_area, sos_fp_owner_area
+    .align  4
+    .global sos_fp_load
+    .type   sos_fp_load, @function
+sos_fp_load:
+    movi    a3, 1
+    wsr     a3, cpenable
+    rsync
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    LOADF   \n
+    .endr
+    l32i    a3, a2, FP_FCR
+    wur     a3, fcr
+    l32i    a3, a2, FP_FSR
+    wur     a3, fsr
+    l32r    a4, .Lfp_owner_area
+    s32i    a2, a4, 0
+    ret
+    .size   sos_fp_load, . - sos_fp_load
+
+/* void sos_fp_enable(u32 on): CPENABLE bit 0 set if `on` is nonzero, clear
+ * otherwise, and every other bit clear. The other coprocessors are never
+ * enabled, so their instructions are faults. */
+    .section .text.sos_fp_enable, "ax"
+    .align  4
+    .global sos_fp_enable
+    .type   sos_fp_enable, @function
+sos_fp_enable:
+    movi    a3, 1
+    movi    a4, 0
+    moveqz  a3, a4, a2
+    wsr     a3, cpenable
+    rsync
+    ret
+    .size   sos_fp_enable, . - sos_fp_enable
+
+/* u32 sos_fp_owner(void): the area `sos_fp_load` last loaded, 0 before the
+ * first load. */
+    .section .text.sos_fp_owner, "ax"
+    .literal .Lfp_owner_read, sos_fp_owner_area
+    .align  4
+    .global sos_fp_owner
+    .type   sos_fp_owner, @function
+sos_fp_owner:
+    l32r    a2, .Lfp_owner_read
+    l32i    a2, a2, 0
+    ret
+    .size   sos_fp_owner, . - sos_fp_owner
+
+    .section .bss.sos_fp_owner_area, "aw", @nobits
+    .align  4
+sos_fp_owner_area:
+    .space  4
 
 /* ---- calling a windowed function from the kernel ------------------------- */
 

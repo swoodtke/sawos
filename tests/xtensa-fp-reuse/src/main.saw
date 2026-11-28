@@ -1,0 +1,98 @@
+// A thread slot whose last thread used the FPU comes back with its FP area
+// zeroed, on the ESP32-S3.
+//
+// T1 fills f0..f15, FCR and FSR (`fp_fill`, `../xtensa/fp_state.S`) and exits;
+// the switch away from it saves its state into its slot's FP area and marks
+// the area active. The initial thread joins it and then creates T2, which
+// takes the slot T1 left, and T2's first act counts the FP registers that are
+// not zero (`fp_zero_count`):
+//
+//   SOS: fp first use                 <- T1's fill
+//   SOS fpreuse: T1 filled
+//   SOS: fp first use                 <- T2's first FP instruction
+//   SOS fpreuse: T2 nonzero=0
+//
+// `frame_init` zeroes the whole context, the FP area included, so T2 is not
+// active and its first use loads zeros. One that stopped short of the area
+// would leave T1's active word and state there: T2 would take no first-use
+// trap, its switch-in would load T1's state, and `nonzero` would count it.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+    func fp_zero_count() -> UInt
+}
+
+/// The boot handle, parked by the initial thread for T1 and T2; also the
+/// witness that a thread is one of them.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// One stack, T1's and then T2's: T1 has exited when T2 starts.
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_T1: UInt = 1
+static ROLE_T2: UInt = 2
+
+/// T1's pattern: every field `fp_fill` writes is nonzero.
+static SEED: UInt = 0x5151_0013
+
+static NO_VALUE: UInt = 0xFFFF
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    if role == ROLE_T1 {
+        fp_fill(SEED)
+        print("SOS fpreuse: T1 filled")
+        let _ = (move me).exit(0)
+        return
+    }
+    let nonzero = fp_zero_count()
+    print("SOS fpreuse: T2 nonzero={}", nonzero)
+    let _ = (move me).exit(nonzero)
+}
+
+/// Start a thread in `role` and wait for its end.
+func run(system: &System, proc: &Process, role: UInt) unsafe -> UInt {
+    let t = try proc.thread_create(stack_top: stack_top(), arg: role) catch {
+        print("SOS fpreuse: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return NO_VALUE
+    }
+    let _ = t.start()
+    try t.join() catch { NO_VALUE }
+}
+
+func initial(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fpreuse: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = run(&system, &proc, ROLE_T1)
+    let r2 = run(&system, &proc, ROLE_T2)
+    print("SOS fpreuse: joined t2={}", r2)
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

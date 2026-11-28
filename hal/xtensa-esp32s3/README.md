@@ -79,8 +79,10 @@ The things most likely to surprise someone arriving here:
   `_start` resets the register window and turns window exceptions off, and
   the kernel's own code after it is call0 (it reaches the windowed ROM only
   through a stub, ABI.md §7g). The compiler's objects are call0 with no FPU
-  (the triple's default features), and so is every C and assembly file here
-  (`-Xclang -target-feature -Xclang -windowed`, the same for `-fp`).
+  (the triple's default features), and so is every C file here
+  (`-Xclang -target-feature -Xclang -windowed`, the same for `-fp`); the only
+  FP instructions in the kernel are `boot.S`'s save and load of a thread's FP
+  state, which the runner's disassembly of each image holds it to.
   No call0 libgcc, compiler-rt or ROM helper exists, so no call0 image may
   link one. A process, Saw or C, may be built windowed (ABI.md §7d).
 - **There is no privilege.** PS.UM selects which vector a trap takes, not what
@@ -95,15 +97,17 @@ The things most likely to surprise someone arriving here:
   (`vector=0x00000280`; compiled code traps with `ill`, so only hand-written
   assembly gets there), and `rsil` raises the process's own INTLEVEL, which
   turns the tick off for as long as it runs.
-- **What a switch does not carry, for whoever writes assembly here.** The
-  trap frame holds a0..a15, PC, PS, `SAR`, `LBEG`/`LEND`/`LCOUNT`,
-  `SCOMPARE1` and `THREADPTR` (ABI.md §7c). MAC16's accumulator and
-  registers (`ACCLO`, `ACCHI`, `M0..M3`), the boolean registers (`BR`),
-  `MISC0..3` and the FP state are not in it, so they do not survive a switch;
-  compiled code never touches them. And a process can write `CPENABLE`
-  itself, so "an FP instruction is a fault" holds only for a process that
-  leaves it alone: one that sets it runs FP instructions, and loses its FP
-  registers at the next switch.
+- **What a switch carries, for whoever writes assembly here.** The trap
+  frame holds a0..a15, PC, PS, `SAR`, `LBEG`/`LEND`/`LCOUNT`, `SCOMPARE1`,
+  `THREADPTR`, the boolean registers (`BR`), MAC16's accumulator and
+  registers (`ACCLO`, `ACCHI`, `M0..M3`) and `MISC0..3` (ABI.md §7c). The FP
+  state (f0..f15, `FCR`, `FSR`) is in the thread's FP area after the frame,
+  carried at a switch for a thread that has used the FPU: its first FP
+  instruction traps and the kernel gives it its own state, zero at first. A
+  process can write `CPENABLE` itself: one that clears it after its first use
+  is given the coprocessor back at its next FP instruction, with its values,
+  and one that sets it before its first use runs FP instructions on the last
+  active thread's values and keeps none of its own.
 - **Flash is two windows.** Code executes in place at 0x4200_0000 (IBUS);
   read-only data, the images and the region table are read at 0x3C00_0000
   (DBUS). `esp32s3.ld` lays the flash out in fixed parts: the kernel's

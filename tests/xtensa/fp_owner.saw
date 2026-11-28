@@ -1,0 +1,49 @@
+// The coprocessor-disabled trap, against the record of whose area the FPU
+// holds, on the ESP32-S3: this drives `hal.fp_trap` directly, with two
+// contexts `hal.frame_init` built, and no process.
+//
+//   A's first use                   claimed: A active, A's area loaded
+//   B's first use                   claimed: B active, B's area loaded
+//   B again, the FPU holding B's    claimed: the coprocessor enabled again
+//   B with another cause            not claimed
+//   A again, the FPU holding B's    a kernel bug: the machine stops
+//
+// On a running kernel the last cannot happen, since every switch to an active
+// thread loads its area; a thread reaches the third by clearing CPENABLE
+// itself. A check that took every cause 32 from an active thread as the
+// third would run A on with B's state: this kernel would print a fifth line
+// and pass.
+
+import kcore.{console}
+import hal
+
+/// Room for one context each, frame and FP area, in words.
+static CONTEXT_WORDS: Int = 128
+unsafe static var CONTEXT_A: [UInt; CONTEXT_WORDS] = [0; CONTEXT_WORDS]
+unsafe static var CONTEXT_B: [UInt; CONTEXT_WORDS] = [0; CONTEXT_WORDS]
+
+static COPROCESSOR0_DISABLED: UInt = 32
+static SYSCALL: UInt = 1
+
+func report(label: String, claimed: Bool) unsafe {
+    let out = console()
+    out.write_str("SOS fpowner: ")
+    out.write_str(label)
+    out.write_str(if claimed { ": claimed\n" } else { ": not claimed\n" })
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let a = ((&var CONTEXT_A) as UnsafePointer<UInt>) as UInt
+    let b = ((&var CONTEXT_B) as UnsafePointer<UInt>) as UInt
+    hal.frame_init(a, 0, 0, 0)
+    hal.frame_init(b, 0, 0, 0)
+    report("A's first use", hal.fp_trap(a, COPROCESSOR0_DISABLED))
+    report("B's first use", hal.fp_trap(b, COPROCESSOR0_DISABLED))
+    report("B again, the FPU holding B's state",
+           hal.fp_trap(b, COPROCESSOR0_DISABLED))
+    report("B with another cause", hal.fp_trap(b, SYSCALL))
+    report("A again, the FPU holding B's state",
+           hal.fp_trap(a, COPROCESSOR0_DISABLED))
+    hal.exit_pass()
+}

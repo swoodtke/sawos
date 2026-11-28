@@ -1,0 +1,111 @@
+// A thread already using the FPU that clears CPENABLE itself, which the Flat
+// tier cannot deny, runs on with its own values, on the ESP32-S3.
+//
+// The main thread fills the FP registers (`fp_fill`), its first use, then
+// clears CPENABLE (`fp_cpenable_clear`) and reads them back (`fp_check`),
+// twice:
+//
+//   - with no switch between: its next FP instruction takes the
+//     coprocessor-disabled trap from an active thread whose state the FPU
+//     holds, and the kernel sets CPENABLE again and loads nothing (the
+//     kernel prints its line for every FP trap it claims);
+//   - with a yield to a helper thread between: the switch away saves the
+//     thread's state with CPENABLE clear, which the save sets itself before
+//     its first FP instruction, and the switch back loads it, so the read
+//     takes no trap.
+//
+//   SOS: fp first use
+//   SOS fpcleared: filled
+//   SOS: fp first use
+//   SOS fpcleared: cleared, no switch, bad=0
+//   SOS fpcleared: cleared, a switch, bad=0
+//   SOS fpcleared: done
+//
+// A kernel that took the trap without a switch as a first use would load the
+// thread's area, never saved, and `bad` would count every register; one whose
+// save trusted CPENABLE would take a coprocessor-disabled trap in the kernel
+// at the yield and stop the machine.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+    func fp_check(seed: UInt) -> UInt
+    func fp_cpenable_clear()
+}
+
+/// The boot handle, parked by the main thread for the helper; also the
+/// witness that a thread is the helper.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Set by the main thread once it needs the helper no more.
+unsafe static var DONE: Bool = false
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static SEED: UInt = 0x7777_0011
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// The helper: something to switch to. It yields until the main thread is
+/// done, and touches no FP register.
+func helper() unsafe {
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    while not DONE {
+        let _ = me.yield_now()
+    }
+    let _ = (move me).exit(0)
+}
+
+func main_thread(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fpcleared: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = system.shutdown(1)
+        return
+    }
+    let h = try proc.thread_create(stack_top: stack_top(), arg: 1) catch {
+        print("SOS fpcleared: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = h.start()
+
+    fp_fill(SEED)
+    let _ = system.debug_print("SOS fpcleared: filled\n")
+
+    fp_cpenable_clear()
+    print("SOS fpcleared: cleared, no switch, bad={}", fp_check(SEED))
+
+    fp_cpenable_clear()
+    let _ = me.yield_now()
+    print("SOS fpcleared: cleared, a switch, bad={}", fp_check(SEED))
+
+    DONE = true
+    let _ = try h.join() catch { 0 }
+    let _ = system.debug_print("SOS fpcleared: done\n")
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        main_thread(arg)
+    } else {
+        helper()
+    }
+}

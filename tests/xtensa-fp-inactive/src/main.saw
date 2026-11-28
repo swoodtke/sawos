@@ -1,0 +1,147 @@
+// A thread that has not used the FPU costs no save at a switch, on the
+// ESP32-S3 (spec §7).
+//
+// Worker A fills f0..f15, FCR and FSR with its pattern (`fp_fill`); worker
+// C uses no floating point until its last step. The two yield to each other
+// three times, so C is switched in and out while the FPU holds A's values,
+// and A checks its pattern after each of C's turns. Then A exits, and C's
+// first FP use counts the registers that are not zero (`fp_zero_count`). The
+// kernel arms no timer, so every switch is a yield:
+//
+//   SOS fpinactive: A begin
+//   SOS: fp first use                    <- A's fill
+//   SOS fpinactive: A filled
+//   SOS fpinactive: C begin              <- C's three turns: no trap, no FP
+//   SOS fpinactive: A bad=0
+//   SOS: fp first use                    <- C's first FP instruction
+//   SOS fpinactive: C nonzero=0
+//   SOS fpinactive: joined a=0 c=0
+//
+// C's area is written only by a save, and nothing but a save of C's could
+// put A's values there. A kernel that saved every outgoing thread, active or
+// not, would store A's pattern into C's area at C's first switch-out, and C's
+// first use would load it back: `nonzero` would count every register. Zero
+// says C's switches saved nothing.
+//
+// Every thread enters at `_start`: the initial thread is the one that has not
+// yet parked the boot handle.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+    func fp_check(seed: UInt) -> UInt
+    func fp_zero_count() -> UInt
+}
+
+/// The boot handle, parked by the initial thread for the workers; also the
+/// witness that a thread is a worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_C: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_C: UInt = 2
+
+/// A's pattern: every field `fp_fill` writes is nonzero.
+static SEED_A: UInt = 0x3131_0017
+
+static TURNS: Int = 3
+static NO_VALUE: UInt = 0xFFFF
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_c_top() unsafe -> UInt {
+    stack_top(((&var STACK_C) as UnsafePointer<UInt64>) as UInt)
+}
+
+/// A: fill, then yield and check `TURNS` times. Its exit value is the number
+/// of mismatching registers it saw, summed over the checks.
+func worker_a(me: Thread) unsafe {
+    print("SOS fpinactive: A begin")
+    fp_fill(SEED_A)
+    print("SOS fpinactive: A filled")
+    var bad: UInt = 0
+    var turn = 0
+    while turn < TURNS {
+        let _ = me.yield_now()
+        bad = bad + fp_check(SEED_A)
+        turn = turn + 1
+    }
+    print("SOS fpinactive: A bad={}", bad)
+    let _ = (move me).exit(bad)
+}
+
+/// C: yield `TURNS` times with no FP use, then make its first. Its exit value
+/// is the number of registers that first use found nonzero.
+func worker_c(me: Thread) unsafe {
+    print("SOS fpinactive: C begin")
+    var turn = 0
+    while turn < TURNS {
+        let _ = me.yield_now()
+        turn = turn + 1
+    }
+    let nonzero = fp_zero_count()
+    print("SOS fpinactive: C nonzero={}", nonzero)
+    let _ = (move me).exit(nonzero)
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    if role == ROLE_A {
+        worker_a(move me)
+    } else {
+        worker_c(move me)
+    }
+}
+
+/// The initial thread touches no FP register: it creates and starts the
+/// workers, A first, and joins them.
+func initial(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fpinactive: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        print("SOS fpinactive: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let c = try proc.thread_create(stack_top: stack_c_top(), arg: ROLE_C) catch {
+        print("SOS fpinactive: create failed: {}", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = a.start()
+    let _ = c.start()
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rc: UInt = try c.join() catch { NO_VALUE }
+    print("SOS fpinactive: joined a={} c={}", ra, rc)
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}
